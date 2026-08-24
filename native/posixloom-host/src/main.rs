@@ -1600,14 +1600,49 @@ fn recovery_node_from_base(
     None
 }
 
+/// 只有 RunRoot 明确指向一个结构有效的 development Runtime 时，恢复命令才可
+/// 在捆绑 Node 缺失后使用开发机上的 Node。SHA256SUMS 仍负责校验应用代码；这里
+/// 只区分“带完整性清单的开发包”和必须坚持捆绑 Node 的 release 包。
+fn bundled_development_fallback_allowed(run_root: &std::path::Path) -> Result<bool, String> {
+    if release_pointer_present(run_root)? || release_runtime_present(run_root)? {
+        return Ok(false);
+    }
+    let Some(runtime) = runtime_from_pointer(run_root, true)? else {
+        return Ok(false);
+    };
+    if runtime.release {
+        return Ok(false);
+    }
+    let manifest_path = runtime.root.join("manifest.json");
+    if run_root.join("SHA256SUMS").is_file() {
+        verify_package_checksum(run_root, "runtime/current")?;
+        let relative_manifest = manifest_path
+            .strip_prefix(run_root)
+            .map_err(|_| "bundled development Runtime manifest escapes RunRoot".to_string())?
+            .to_string_lossy()
+            .replace('\\', "/");
+        verify_package_checksum(run_root, &relative_manifest)?;
+    }
+    let manifest: LauncherManifest = serde_json::from_slice(
+        &std::fs::read(&manifest_path)
+            .map_err(|error| format!("cannot read {}: {error}", manifest_path.display()))?,
+    )
+    .map_err(|error| format!("invalid {}: {error}", manifest_path.display()))?;
+    if manifest.runtime_id != runtime.id {
+        return Err("runtime/current does not match manifest runtimeId".to_string());
+    }
+    verify_launcher_mode(&runtime, &manifest)?;
+    Ok(true)
+}
+
 /// 恢复模式（runtime doctor/update/rollback）的 Node 选择入口。
 /// 与正常路径 select_launcher_node 的差异只在“如何挑运行时”：
 ///   - 完整性要求（SHA256SUMS 存在 / release 指针 / release 运行时目录）
 ///     仍然全额执行--恢复操作本身不能运行被篡改的应用包；
 ///   - Node 候选放宽为：先捆绑 RunRoot、再 data 根，各自按
 ///     recovery_node_from_base 的降级枚举策略尽力找一个通过校验的运行时；
-///   - 仍找不到时：需要完整性则直接失败，不回退 PATH；
-///     不需要完整性（纯开发布局）才允许 POSIXLOOM_NODE 或 PATH 上的 node。
+///   - 仍找不到时：release 包直接失败；明确的 development Runtime 则与普通
+///     启动路径一致，允许 POSIXLOOM_NODE 或 PATH 上的 node。
 fn select_recovery_launcher_node(root: &std::path::Path) -> Result<String, String> {
     let root_path = absolute_path(root.to_path_buf())?;
     let data_root = selected_data_root(&root_path)?;
@@ -1627,13 +1662,16 @@ fn select_recovery_launcher_node(root: &std::path::Path) -> Result<String, Strin
     {
         return Ok(node.to_string_lossy().into_owned());
     }
-    // fail-closed：需要完整性时绝不回退到 POSIXLOOM_NODE / PATH 上的 node。
-    if package_integrity_required {
+    // SHA256SUMS 要求应用代码通过校验，但 development 包按定义允许缺少第三方
+    // 组件。仅当 RunRoot 明确指向有效的 runtime-dev 时放行外部 Node；release
+    // 包、指针缺失或清单损坏仍然 fail-closed。
+    let development_fallback_allowed = bundled_development_fallback_allowed(&root_path)?;
+    if package_integrity_required && !development_fallback_allowed {
         return Err(
             "no validated bundled or previous Runtime Node is available for recovery".to_string(),
         );
     }
-    // 以下回退仅在完整性不要求（纯开发布局）时可达。
+    // 纯开发布局以及已校验应用代码的 development 包都可使用显式/系统 Node。
     if let Ok(node) = std::env::var("POSIXLOOM_NODE") {
         if std::path::Path::new(&node).is_file() {
             return Ok(node);
@@ -1738,6 +1776,43 @@ mod tests {
         std::env::temp_dir().join(format!("posixloom-{label}-{}-{nonce}", std::process::id()))
     }
 
+    /// 写入启动器完整性检查所需的最小应用树、Runtime 与对应 SHA256SUMS。
+    fn write_hashed_application(root: &std::path::Path, runtime_id: &str, mode: &str) {
+        let package = root.join("package.json");
+        let defaults = root.join("config").join("defaults.json");
+        let script = root.join("dist").join("src").join("cli").join("main.js");
+        let current = root.join("runtime").join("current");
+        let manifest = root
+            .join("runtime")
+            .join("versions")
+            .join(runtime_id)
+            .join("manifest.json");
+        std::fs::create_dir_all(defaults.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(script.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+        std::fs::write(&package, br#"{"type":"module"}"#).unwrap();
+        std::fs::write(&defaults, b"{}").unwrap();
+        std::fs::write(&script, b"// fixture").unwrap();
+        std::fs::write(&current, runtime_id).unwrap();
+        std::fs::write(
+            &manifest,
+            format!(r#"{{"manifestVersion":1,"runtimeId":"{runtime_id}","mode":"{mode}"}}"#),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("SHA256SUMS"),
+            format!(
+                "{}  config/defaults.json\n{}  dist/src/cli/main.js\n{}  package.json\n{}  runtime/current\n{}  runtime/versions/{runtime_id}/manifest.json\n",
+                sha256_file(&defaults).unwrap(),
+                sha256_file(&script).unwrap(),
+                sha256_file(&package).unwrap(),
+                sha256_file(&current).unwrap(),
+                sha256_file(&manifest).unwrap(),
+            ),
+        )
+        .unwrap();
+    }
+
     // hello 帧编码后应能无损读回，协议版本与类型字段保持不变。
     #[test]
     fn protocol_frame_round_trips() {
@@ -1829,6 +1904,28 @@ mod tests {
             select_recovery_launcher_node(&root).unwrap(),
             node.to_string_lossy()
         );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    // 带 SHA256SUMS 的 development 包仍应在缺少捆绑 Node 时使用开发机 Node；
+    // 这是开发包允许第三方组件回退的契约，也是打包 CI 的实际布局。
+    #[test]
+    fn recovery_allows_external_node_for_hashed_development_package() {
+        let root = temp_root("launcher-development-node-fallback");
+        write_hashed_application(&root, "runtime-dev", "development");
+
+        let selected = select_recovery_launcher_node(&root).unwrap();
+        assert!(selected == "node" || std::path::Path::new(&selected).is_file());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    // 同样缺少 Node 时，release 包不得借开发回退绕过捆绑组件要求。
+    #[test]
+    fn recovery_rejects_external_node_for_hashed_release_package() {
+        let root = temp_root("launcher-release-node-fallback");
+        write_hashed_application(&root, "runtime-release", "release");
+
+        assert!(select_recovery_launcher_node(&root).is_err());
         std::fs::remove_dir_all(root).unwrap();
     }
 
