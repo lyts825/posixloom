@@ -1,0 +1,66 @@
+{
+  "lockVersion": 2,
+  "platform": "win32-x64",
+  "updateSequence": 1,
+  "generatedAt": "2026-01-01T00:00:00.000Z",
+  "policySha256": "<64 lowercase hex characters>",
+  "components": {
+    "node": {
+      "version": "<Node LTS version>",
+      "upstreamTag": "<upstream tag>",
+      "archiveUrl": "<trusted HTTPS archive URL>",
+      "archiveSha256": "<64 lowercase hex characters>",
+      "archiveBytes": 1,
+      "archiveFormat": "zip",
+      "archiveRoot": "<archive root>",
+      "entrypoint": "node.exe",
+      "entrypointSha256": "<64 lowercase hex characters>",
+      "rootTreeSha256": "<64 lowercase hex characters>",
+      "fileCount": 1,
+      "licensePaths": ["LICENSE"]
+    },
+    "msys2": {
+      "version": "<MSYS2 release>",
+      "upstreamTag": "<upstream tag>",
+      "archiveUrl": "<trusted HTTPS archive URL>",
+      "archiveSha256": "<64 lowercase hex characters>",
+      "archiveBytes": 1,
+      "archiveFormat": "tar.xz",
+      "archiveRoot": "msys64",
+      "entrypoint": "usr/bin/bash.exe",
+      "entrypointSha256": "<64 lowercase hex characters>",
+      "rootTreeSha256": "<64 lowercase hex characters>",
+      "fileCount": 1,
+      "licensePaths": ["usr/share/licenses"]
+    },
+    "mingit": {
+      "version": "<MinGit version>",
+      "upstreamTag": "<upstream tag>",
+      "archiveUrl": "<trusted HTTPS archive URL>",
+      "archiveSha256": "<64 lowercase hex characters>",
+      "archiveBytes": 1,
+      "archiveFormat": "zip",
+      "archiveRoot": ".",
+      "entrypoint": "cmd/git.exe",
+      "entrypointSha256": "<64 lowercase hex characters>",
+      "rootTreeSha256": "<64 lowercase hex characters>",
+      "fileCount": 1,
+      "licensePaths": ["mingw64/share/licenses/git"]
+    },
+    "ripgrep": {
+      "version": "<ripgrep version>",
+      "upstreamTag": "<upstream tag>",
+      "archiveUrl": "<trusted HTTPS archive URL>",
+      "archiveSha256": "<64 lowercase hex characters>",
+      "archiveBytes": 1,
+      "archiveFormat": "zip",
+      "archiveRoot": "<archive root>",
+      "entrypoint": "rg.exe",
+      "entrypointSha256": "<64 lowercase hex characters>",
+      "rootTreeSha256": "<64 lowercase hex characters>",
+      "fileCount": 1,
+      "licensePaths": ["COPYING", "LICENSE-MIT", "UNLICENSE"],
+      "sha256": "<same value as entrypointSha256>"
+    }
+  }
+}

@@ -1,0 +1,77 @@
+{
+  "lockVersion": 2,
+  "platform": "win32-x64",
+  "updateSequence": 1787244537,
+  "generatedAt": "2026-08-20T16:48:57.387Z",
+  "policySha256": "924bdde524f535c89e16337b69064f79f74176292fe3b4d2862d16b41f5ac8a8",
+  "components": {
+    "node": {
+      "version": "22.23.2",
+      "upstreamTag": "v22.23.2",
+      "archiveUrl": "https://nodejs.org/dist/v22.23.2/node-v22.23.2-win-x64.zip",
+      "archiveSha256": "1177b4137ba5adaa56354ae40f1080c7450e8ae09cecb47da459d1c52ac99f97",
+      "archiveBytes": 35683585,
+      "archiveFormat": "zip",
+      "archiveRoot": "node-v22.23.2-win-x64",
+      "entrypoint": "node.exe",
+      "entrypointSha256": "0d0f5e39f9f3d9587bc19f73eab3c2c9c4903fd02d6dbf9c853dd81b3d95fad4",
+      "rootTreeSha256": "29309fe15e17d158ead58758308020a9c5a91123f66bfe873befb2894edcbc2f",
+      "fileCount": 2032,
+      "licensePaths": [
+        "LICENSE"
+      ]
+    },
+    "msys2": {
+      "version": "2026-06-11",
+      "upstreamTag": "2026-06-11",
+      "archiveUrl": "https://github.com/msys2/msys2-installer/releases/download/2026-06-11/msys2-base-x86_64-20260611.tar.xz",
+      "archiveSha256": "a2d047e8ee213c3c6a49a8de427eb1069df12207c0422ff1b3cbb5c905c34221",
+      "archiveBytes": 53555380,
+      "archiveFormat": "tar.xz",
+      "archiveRoot": "msys64",
+      "entrypoint": "usr/bin/bash.exe",
+      "entrypointSha256": "41b09f0a9c1c68fd65253a7e8087b3775f0af245b729ade74ca4425d14392c2d",
+      "rootTreeSha256": "382472c5a7e7e69a480c1c1ddc423975865a09b39059aa7d18b2cb28de6d7c99",
+      "fileCount": 15529,
+      "licensePaths": [
+        "usr/share/licenses"
+      ]
+    },
+    "mingit": {
+      "version": "2.55.0.windows.5",
+      "upstreamTag": "v2.55.0.windows.5",
+      "archiveUrl": "https://github.com/git-for-windows/git/releases/download/v2.55.0.windows.5/MinGit-2.55.0.5-64-bit.zip",
+      "archiveSha256": "56d7b226b7693196cfc71fef26568f536c4a021ab6c37ff2db4287bed908e96e",
+      "archiveBytes": 38989688,
+      "archiveFormat": "zip",
+      "archiveRoot": ".",
+      "entrypoint": "cmd/git.exe",
+      "entrypointSha256": "78211c7ed73988da93a6d8a33d47ec6187f464d7ea2a9a00c182bbd7a1ecf30f",
+      "rootTreeSha256": "69aa6511ae170a7571b61093db5e74d6203a1b00f3dc7ff1d9b6d5b8a6c39e4e",
+      "fileCount": 365,
+      "licensePaths": [
+        "mingw64/share/licenses/git",
+        "usr/share/licenses"
+      ]
+    },
+    "ripgrep": {
+      "version": "15.2.0",
+      "upstreamTag": "15.2.0",
+      "archiveUrl": "https://github.com/BurntSushi/ripgrep/releases/download/15.2.0/ripgrep-15.2.0-x86_64-pc-windows-msvc.zip",
+      "archiveSha256": "71b2fef860abe467217a538ff31de02f5258807c0129f771846f87bd029aafc5",
+      "archiveBytes": 1789611,
+      "archiveFormat": "zip",
+      "archiveRoot": "ripgrep-15.2.0-x86_64-pc-windows-msvc",
+      "entrypoint": "rg.exe",
+      "entrypointSha256": "14231169855ec5205cf5a1b6f1db358ff4aed4247c86b69ce8aae647c77f6680",
+      "rootTreeSha256": "5584af5a6f8ceadf287a08fdb4ab717ffbfabac33cb727c2ebeef7d868f66597",
+      "fileCount": 13,
+      "licensePaths": [
+        "COPYING",
+        "LICENSE-MIT",
+        "UNLICENSE"
+      ],
+      "sha256": "14231169855ec5205cf5a1b6f1db358ff4aed4247c86b69ce8aae647c77f6680"
+    }
+  }
+}

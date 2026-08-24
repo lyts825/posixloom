@@ -1,0 +1,56 @@
+{
+  "version": 1,
+  "runtime": {
+    "workspace": "${WORKSPACE}"
+  },
+  "mounts": {
+    "/workspace": "${runtime.workspace}",
+    "/home": "$DATA/home",
+    "/tmp": "$DATA/tmp",
+    "/cache": "$DATA/cache",
+    "/posixloom/bin": "$RUNTIME_ROOT/shims",
+    "/posixloom/tools": "$RUNTIME_ROOT/native",
+    "/posixloom/runtime": "$RUNTIME_ROOT"
+  },
+  "session": {
+    "defaultStatePolicy": "cwd-env",
+    "persistAcrossRestart": false
+  },
+  "process": {
+    "defaultTimeoutMs": 30000,
+    "cancelGraceMs": 2000,
+    "maxOutputBytes": 8388608
+  },
+  "policy": {
+    "defaultProfile": "workspace-guard",
+    "profiles": {
+      "trusted": {
+        "mode": "trusted",
+        "knownReadRoots": [],
+        "knownWriteRoots": [],
+        "runtimeReadOnly": false
+      },
+      "workspace-guard": {
+        "mode": "guardrail",
+        "knownReadRoots": ["/workspace", "/home", "/tmp", "/cache", "/posixloom"],
+        "knownWriteRoots": ["/workspace", "/home", "/tmp", "/cache"],
+        "runtimeReadOnly": true
+      }
+    }
+  },
+  "observability": {
+    "traceBufferSize": 5000,
+    "writeTraceFile": false
+  },
+  "updates": {
+    "enabled": true,
+    "autoApply": true,
+    "channel": "stable",
+    "feedUrl": "",
+    "checkIntervalMs": 86400000,
+    "requestTimeoutMs": 10000,
+    "maxDownloadBytes": 2147483648,
+    "requireSignature": true,
+    "trustedKeys": {}
+  }
+}

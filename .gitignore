@@ -1,0 +1,7 @@
+node_modules/
+dist/
+coverage/
+artifacts/
+data/
+native/posixloom-host/target/
+*.log

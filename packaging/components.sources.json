@@ -1,0 +1,45 @@
+{
+  "policyVersion": 1,
+  "platform": "win32-x64",
+  "components": {
+    "node": {
+      "provider": "nodejs-lts",
+      "major": 22,
+      "archiveFormat": "zip",
+      "archiveRoot": "node-{tag}-win-x64",
+      "entrypoint": "node.exe",
+      "licensePaths": ["LICENSE"]
+    },
+    "msys2": {
+      "provider": "github-release",
+      "repository": "msys2/msys2-installer",
+      "releaseTagPattern": "^\\d{4}-\\d{2}-\\d{2}$",
+      "assetPattern": "^msys2-base-x86_64-\\d{8}\\.tar\\.xz$",
+      "archiveFormat": "tar.xz",
+      "archiveRoot": "msys64",
+      "entrypoint": "usr/bin/bash.exe",
+      "licensePaths": ["usr/share/licenses"]
+    },
+    "mingit": {
+      "provider": "github-release",
+      "repository": "git-for-windows/git",
+      "releaseTagPattern": "^v\\d+\\.\\d+\\.\\d+\\.windows\\.\\d+$",
+      "assetPattern": "^MinGit-[0-9.]+-64-bit\\.zip$",
+      "archiveFormat": "zip",
+      "archiveRoot": ".",
+      "entrypoint": "cmd/git.exe",
+      "stripVersionPrefix": "v",
+      "licensePaths": ["mingw64/share/licenses/git", "usr/share/licenses"]
+    },
+    "ripgrep": {
+      "provider": "github-release",
+      "repository": "BurntSushi/ripgrep",
+      "releaseTagPattern": "^\\d+\\.\\d+\\.\\d+$",
+      "assetPattern": "^ripgrep-[0-9.]+-x86_64-pc-windows-msvc\\.zip$",
+      "archiveFormat": "zip",
+      "archiveRoot": "ripgrep-{version}-x86_64-pc-windows-msvc",
+      "entrypoint": "rg.exe",
+      "licensePaths": ["COPYING", "LICENSE-MIT", "UNLICENSE"]
+    }
+  }
+}

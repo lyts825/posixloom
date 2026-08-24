@@ -1,0 +1,8 @@
+{
+  "manifestVersion": 1,
+  "runtimeId": "runtime-dev",
+  "runtimeSemver": "0.1.0-dev",
+  "mode": "development",
+  "required": [],
+  "notes": "Development manifest. A release package must contain pinned Node, MSYS2, MinGit and ripgrep components."
+}
