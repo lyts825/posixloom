@@ -27,6 +27,14 @@ import type { PolicyProfile, RuntimeConfig, RuntimeSnapshot } from "./types.js";
 // 包内只读默认配置的相对路径（相对 runRoot）。
 const DEFAULT_CONFIG = "config/defaults.json";
 
+/** 配置诊断所需的路径集；它不要求当前 Runtime 清单有效。 */
+export interface ConfigPaths {
+  runRoot: string;
+  dataRoot: string;
+  defaultConfigPath: string;
+  userConfigPath: string;
+}
+
 /**
  * 递归深合并两个配置对象，右侧（用户配置）优先。
  * 嵌套普通对象逐层合并；数组与标量整体替换（数组语义是"覆盖"而非"拼接"，
@@ -82,6 +90,22 @@ async function chooseDataRoot(runRoot: string): Promise<string> {
     await probeWritableDirectory(fallback);
     return fallback;
   }
+}
+
+/**
+ * 解析当前进程实际使用的默认/用户配置路径。
+ * 只执行 DataRoot 的既有可写性探测，不读取配置、Runtime 指针或 manifest，
+ * 因此在配置损坏时仍可用于 `config path`。
+ */
+export async function resolveConfigPaths(runRoot: string): Promise<ConfigPaths> {
+  const root = resolve(runRoot);
+  const dataRoot = await chooseDataRoot(root);
+  return {
+    runRoot: root,
+    dataRoot,
+    defaultConfigPath: join(root, DEFAULT_CONFIG),
+    userConfigPath: join(dataRoot, "config", "config.json"),
+  };
 }
 
 /**
@@ -227,6 +251,22 @@ function positiveNumber(value: unknown, fallback: number, name: string, options:
   return number;
 }
 
+/** 严格布尔值校验；禁止把字符串 "false" 按 JavaScript 真值规则误解为 true。 */
+function booleanValue(value: unknown, fallback: boolean, name: string): boolean {
+  if (value === undefined || value === null) return fallback;
+  if (typeof value !== "boolean") throw new PosixLoomError("CONFIG_INVALID", `${name} must be a boolean`, { name, value });
+  return value;
+}
+
+/** 严格枚举校验；只有缺省时才使用 fallback。 */
+function enumValue<T extends string>(value: unknown, allowed: readonly T[], fallback: T, name: string): T {
+  if (value === undefined || value === null) return fallback;
+  if (typeof value !== "string" || !allowed.includes(value as T)) {
+    throw new PosixLoomError("CONFIG_INVALID", `${name} must be one of: ${allowed.join(", ")}`, { name, value });
+  }
+  return value as T;
+}
+
 /**
  * 策略根列表校验：每项必须是绝对虚拟路径（以 / 开头且不含反斜杠），
  * 否则抛 CONFIG_INVALID。结果去重，避免冗余根干扰后续前缀判定。
@@ -245,12 +285,12 @@ function virtualRoots(value: unknown, fallback: string[], name: string): string[
  * 防止脏值（如字符串）被真值判断误判。
  */
 function policyProfile(value: any, fallback: PolicyProfile, name: string): PolicyProfile {
-  const mode = value?.mode === "trusted" ? "trusted" : value?.mode === "guardrail" ? "guardrail" : fallback.mode;
+  const mode = enumValue(value?.mode, ["trusted", "guardrail"] as const, fallback.mode, `${name}.mode`);
   return {
     mode,
     knownReadRoots: virtualRoots(value?.knownReadRoots, fallback.knownReadRoots, `${name}.knownReadRoots`),
     knownWriteRoots: virtualRoots(value?.knownWriteRoots, fallback.knownWriteRoots, `${name}.knownWriteRoots`),
-    runtimeReadOnly: value?.runtimeReadOnly === undefined ? fallback.runtimeReadOnly : Boolean(value.runtimeReadOnly),
+    runtimeReadOnly: booleanValue(value?.runtimeReadOnly, fallback.runtimeReadOnly, `${name}.runtimeReadOnly`),
   };
 }
 
@@ -272,35 +312,60 @@ function policyProfile(value: any, fallback: PolicyProfile, name: string): Polic
  *         RUNTIME_ID_INVALID / RUNTIME_POINTER_INVALID 指针非法（未开启容错时）
  */
 export async function loadConfig(runRoot: string, options: { allowInvalidRuntimePointer?: boolean } = {}): Promise<LoadedConfig> {
-  const root = resolve(runRoot);
-  const dataRoot = await chooseDataRoot(root);
-  const defaults = await readJsonIfPresent(join(root, DEFAULT_CONFIG));
-  if (!defaults) throw new PosixLoomError("CONFIG_MISSING", `Missing default config: ${join(root, DEFAULT_CONFIG)}`);
+  const paths = await resolveConfigPaths(runRoot);
+  const root = paths.runRoot;
+  const dataRoot = paths.dataRoot;
+  const defaults = await readJsonIfPresent(paths.defaultConfigPath);
+  if (!defaults) throw new PosixLoomError("CONFIG_MISSING", `Missing default config: ${paths.defaultConfigPath}`);
 
   // 用户配置与默认配置深合并：嵌套对象逐层合并，数组与标量整体覆盖。
-  const userConfig = await readJsonIfPresent(join(dataRoot, "config", "config.json"));
+  const userConfig = await readJsonIfPresent(paths.userConfigPath);
+  // 0.1 曾经公开过但从未实现 persistAcrossRestart。对 true 必须显式拒绝，
+  // 不能继续静默地以内存会话运行；false 只表达当前已有的进程内语义，
+  // 为了兼容早期整份拷贝的配置而暂时接受，但不进入规范化配置。
+  const legacyPersistence = userConfig?.session?.persistAcrossRestart;
+  if (legacyPersistence !== undefined && legacyPersistence !== false) {
+    throw new PosixLoomError(
+      "CONFIG_UNSUPPORTED",
+      "session.persistAcrossRestart is not supported; sessions are process-local",
+      { path: paths.userConfigPath, name: "session.persistAcrossRestart", value: legacyPersistence },
+    );
+  }
   const merged = deepMerge(defaults, userConfig ?? {});
+  for (const section of ["runtime", "mounts", "session", "process", "policy", "observability", "updates"] as const) {
+    const value = merged[section];
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      throw new PosixLoomError("CONFIG_INVALID", `${section} must be an object`, { name: section, value });
+    }
+  }
   // workspace 优先级：POSIXLOOM_WORKSPACE 环境变量 > 配置 runtime.workspace > 启动 cwd；
   // 配置值中的 ${WORKSPACE} 占位符在此展开为当前 cwd。
-  const workspaceValue = process.env.POSIXLOOM_WORKSPACE ?? merged.runtime?.workspace ?? process.cwd();
+  const configuredWorkspace = merged.runtime?.workspace;
+  if (configuredWorkspace !== undefined && typeof configuredWorkspace !== "string") {
+    throw new PosixLoomError("CONFIG_INVALID", "runtime.workspace must be a string", { name: "runtime.workspace", value: configuredWorkspace });
+  }
+  const workspaceValue = process.env.POSIXLOOM_WORKSPACE ?? configuredWorkspace ?? process.cwd();
   const workspace = resolve(workspaceValue.replace("${WORKSPACE}", process.cwd()));
   const selected = await selectRuntime(root, dataRoot, Boolean(options.allowInvalidRuntimePointer));
   const runtimeRoot = selected.root;
   // 挂载模板可能引用 $DATA/$RUN/$RUNTIME_ROOT/${WORKSPACE}，
   // 必须等 workspace 与 runtimeRoot 都解析完成后才能展开。
+  if (!merged.mounts || typeof merged.mounts !== "object" || Array.isArray(merged.mounts)) {
+    throw new PosixLoomError("CONFIG_INVALID", "mounts must be an object", { name: "mounts", value: merged.mounts });
+  }
   const mounts: Record<string, string> = {};
   for (const [virtualPath, hostTemplate] of Object.entries(merged.mounts ?? {})) {
-    mounts[virtualPath] = replaceVariables(String(hostTemplate), root, dataRoot, workspace, runtimeRoot);
+    if (typeof hostTemplate !== "string") throw new PosixLoomError("CONFIG_INVALID", `mounts.${virtualPath} must be a string`, { name: `mounts.${virtualPath}`, value: hostTemplate });
+    mounts[virtualPath] = replaceVariables(hostTemplate, root, dataRoot, workspace, runtimeRoot);
   }
 
   const runtime: RuntimeConfig = {
     version: positiveNumber(merged.version, 1, "version"),
     runtime: { workspace },
     mounts,
-    // 会话状态策略仅认显式 "isolated"，其余一律回落默认 "cwd-env"；跨重启持久化默认关闭。
+    // 会话状态策略仅认显式 "isolated"，其余一律回落默认 "cwd-env"。
     session: {
-      defaultStatePolicy: merged.session?.defaultStatePolicy === "isolated" ? "isolated" : "cwd-env",
-      persistAcrossRestart: Boolean(merged.session?.persistAcrossRestart),
+      defaultStatePolicy: enumValue(merged.session?.defaultStatePolicy, ["isolated", "cwd-env"] as const, "cwd-env", "session.defaultStatePolicy"),
     },
     // 进程默认约束：超时 30s、取消宽限 2s、输出上限 8MB，均可被配置覆盖。
     process: {
@@ -311,7 +376,7 @@ export async function loadConfig(runRoot: string, options: { allowInvalidRuntime
     // 默认 profile 为 workspace-guard（runtime 只读，读写限定在已知虚拟根内）；
     // trusted 需显式指定，且默认不设任何已知根（即无额外放行）。
     policy: {
-      defaultProfile: merged.policy?.defaultProfile === "trusted" ? "trusted" : "workspace-guard",
+      defaultProfile: enumValue(merged.policy?.defaultProfile, ["trusted", "workspace-guard"] as const, "workspace-guard", "policy.defaultProfile"),
       profiles: {
         trusted: policyProfile(merged.policy?.profiles?.trusted, { mode: "trusted", knownReadRoots: [], knownWriteRoots: [], runtimeReadOnly: false }, "policy.profiles.trusted"),
         "workspace-guard": policyProfile(merged.policy?.profiles?.["workspace-guard"], { mode: "guardrail", knownReadRoots: ["/workspace", "/home", "/tmp", "/cache", "/posixloom"], knownWriteRoots: ["/workspace", "/home", "/tmp", "/cache"], runtimeReadOnly: true }, "policy.profiles.workspace-guard"),
@@ -319,19 +384,19 @@ export async function loadConfig(runRoot: string, options: { allowInvalidRuntime
     },
     observability: {
       traceBufferSize: positiveNumber(merged.observability?.traceBufferSize, 5000, "observability.traceBufferSize", { minimum: 0 }),
-      writeTraceFile: Boolean(merged.observability?.writeTraceFile),
+      writeTraceFile: booleanValue(merged.observability?.writeTraceFile, false, "observability.writeTraceFile"),
     },
     // 更新默认启用、默认自动应用并强制签名校验；channel/feedUrl 可被环境变量覆盖
     // （便于测试与私有更新源）。下载上限默认 2GB，防恶意超大包撑爆磁盘。
     updates: {
-      enabled: merged.updates?.enabled === undefined ? true : Boolean(merged.updates.enabled),
-      autoApply: merged.updates?.autoApply === undefined ? true : Boolean(merged.updates.autoApply),
+      enabled: booleanValue(merged.updates?.enabled, true, "updates.enabled"),
+      autoApply: booleanValue(merged.updates?.autoApply, true, "updates.autoApply"),
       channel: String(process.env.POSIXLOOM_UPDATE_CHANNEL ?? merged.updates?.channel ?? "stable"),
       feedUrl: String(process.env.POSIXLOOM_UPDATE_FEED_URL ?? merged.updates?.feedUrl ?? "").trim() || undefined,
       checkIntervalMs: positiveNumber(merged.updates?.checkIntervalMs, 86_400_000, "updates.checkIntervalMs", { minimum: 0 }),
       requestTimeoutMs: positiveNumber(merged.updates?.requestTimeoutMs, 10_000, "updates.requestTimeoutMs"),
       maxDownloadBytes: positiveNumber(merged.updates?.maxDownloadBytes, 2_147_483_648, "updates.maxDownloadBytes"),
-      requireSignature: merged.updates?.requireSignature === undefined ? true : Boolean(merged.updates.requireSignature),
+      requireSignature: booleanValue(merged.updates?.requireSignature, true, "updates.requireSignature"),
       trustedKeys: Object.fromEntries(Object.entries(merged.updates?.trustedKeys ?? {}).map(([key, value]) => [key, String(value)])),
     },
   };

@@ -13,8 +13,7 @@
     "/posixloom/runtime": "$RUNTIME_ROOT"
   },
   "session": {
-    "defaultStatePolicy": "cwd-env",
-    "persistAcrossRestart": false
+    "defaultStatePolicy": "cwd-env"
   },
   "process": {
     "defaultTimeoutMs": 30000,

@@ -35,7 +35,7 @@ import { isSafeRuntimeId, loadConfig, type LoadedConfig } from "./config.js";
 import { PosixLoomError } from "./errors.js";
 import { MountTable } from "./path.js";
 import { DEFAULT_REGISTRY, NativeRegistry } from "./registry.js";
-import type { HostPath, RuntimeComponentManifest, RuntimeManifest, RuntimeSnapshot } from "./types.js";
+import type { HostPath, RuntimeComponentManifest, RuntimeInfo, RuntimeManifest, RuntimeSnapshot } from "./types.js";
 
 /** release Runtime 必须全部声明并标记为 required 的基础环境组件清单。 */
 export const REQUIRED_RUNTIME_COMPONENTS = ["node", "msys2", "mingit", "ripgrep", "posixloom", "shims"] as const;
@@ -687,6 +687,27 @@ export class RuntimeManager {
       if (relativePath && existsSync(relativePath)) return relativePath;
     }
     return undefined;
+  }
+
+  /** 返回不触发外部命令的只读运行时摘要，供诊断 CLI 与控制协议复用。 */
+  info(): RuntimeInfo {
+    return {
+      runtimeId: this.snapshot.runtimeId,
+      runtimeSemver: this.snapshot.manifest.runtimeSemver,
+      updateSequence: this.snapshot.manifest.updateSequence,
+      mode: this.snapshot.manifest.mode,
+      source: this.snapshot.source,
+      snapshotId: this.snapshot.snapshotId,
+      runtimeRoot: this.snapshot.runtimeRoot,
+      dataRoot: this.config.dataRoot,
+      workspace: this.config.workspace,
+      policyProfile: this.config.runtime.policy.defaultProfile,
+      mounts: this.mountTable.entries.map((entry) => ({ ...entry })),
+      bash: this.findBash(),
+      nativeHost: this.findNativeHost(),
+      nativeCommands: this.registry.list().map((descriptor) => descriptor.name).sort(),
+      recoveryRequired: this.recoveryRequired,
+    };
   }
 
   /**

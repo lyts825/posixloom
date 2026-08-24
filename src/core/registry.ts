@@ -338,6 +338,11 @@ export class NativeRegistry {
   /** @param descriptors 注册表条目，默认使用 DEFAULT_REGISTRY；允许注入便于测试。 */
   constructor(private readonly descriptors = DEFAULT_REGISTRY) {}
 
+  /** 返回注册表条目的防御性副本，供 runtime info 等只读诊断接口使用。 */
+  list(): NativeCommandDescriptor[] {
+    return this.descriptors.map((descriptor) => ({ ...descriptor }));
+  }
+
   /**
    * 计算注册表内容的 base64url 指纹。
    * 该值作为 registryHash 写入 RuntimeSnapshot，并参与 snapshotId 的合成：

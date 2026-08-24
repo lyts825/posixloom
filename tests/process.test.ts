@@ -27,6 +27,28 @@ test("output collector keeps a bounded head and tail after truncation", () => {
   assert.equal(collector.totalBytes, 15);
 });
 
+test("process output observer streams binary-safe chunks before completion", async () => {
+  const events: Array<{ sequence: number; stream: "stdout" | "stderr"; data: Buffer }> = [];
+  const result = await runProcess({
+    program: process.execPath,
+    args: ["-e", "process.stdout.write(Buffer.from([0,1,2,3]));process.stderr.write(Buffer.from([255,254]))"],
+    cwd: process.cwd(),
+    env: { ...process.env } as Record<string, string>,
+    timeoutMs: 5000,
+    maxOutputBytes: 1024,
+    onOutput: async (event) => {
+      await new Promise<void>((resolve) => setTimeout(resolve, 5));
+      events.push({ ...event, data: Buffer.from(event.data) });
+    },
+  });
+  assert.deepEqual(result.outcome, { kind: "exited", exitCode: 0 });
+  assert.deepEqual(events.map((event) => event.sequence), events.map((_, index) => index));
+  assert.deepEqual(Buffer.concat(events.filter((event) => event.stream === "stdout").map((event) => event.data)), Buffer.from([0, 1, 2, 3]));
+  assert.deepEqual(Buffer.concat(events.filter((event) => event.stream === "stderr").map((event) => event.data)), Buffer.from([255, 254]));
+  assert.deepEqual(result.stdout, Buffer.from([0, 1, 2, 3]));
+  assert.deepEqual(result.stderr, Buffer.from([255, 254]));
+});
+
 test("native protocol decoder accepts split length-prefixed frames", () => {
   const encoded = encodeNativeFrame({ protocolVersion: 1, type: "hello" });
   const decoder = new NativeFrameDecoder();

@@ -84,6 +84,18 @@ export interface ProcessRunOptions {
   hostPath?: HostPath;
   signal?: AbortSignal;
   maxOutputBytes: number;
+  /**
+   * 可选的实时输出接收器。返回的 Promise 在读取更多子进程输出前被等待，
+   * 从而把下游写入速度作为背压传回进程管道。
+   */
+  onOutput?: (event: ProcessOutputEvent) => void | Promise<void>;
+}
+
+/** 实时输出事件；sequence 在 stdout/stderr 两路之间统一单调递增。 */
+export interface ProcessOutputEvent {
+  sequence: number;
+  stream: "stdout" | "stderr";
+  data: Buffer;
 }
 
 /**
@@ -247,6 +259,60 @@ export class NativeFrameDecoder {
 function pipeReadable(stream: Readable | null, collector: { push(chunk: Buffer): void }): void {
   if (!stream) return;
   stream.on("data", (chunk: Buffer | string) => collector.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
+}
+
+/** 单个控制协议输出事件的最大原始字节数，Base64 后仍远低于 16 MiB 帧上限。 */
+const MAX_STREAM_CHUNK_BYTES = 64 * 1024;
+
+/**
+ * 把同步到达的 stdout/stderr 分片串行转发给异步接收器。
+ *
+ * 第一个待发送事件入队时暂停上游；队列完全排空后恢复。这样慢 Harness
+ * 不会让 Promise 写队列无限积累。接收器异常只通知一次，由进程后端终止
+ * 子进程并把结果收敛为 OUTPUT_SINK_FAILED。
+ */
+class ProcessOutputForwarder {
+  private sequence = 0;
+  private pending = 0;
+  private lane: Promise<void> = Promise.resolve();
+  private sinkFailure: unknown;
+
+  constructor(
+    private readonly sink: ProcessRunOptions["onOutput"],
+    private readonly pause: () => void,
+    private readonly resume: () => void,
+    private readonly onFailure: (error: unknown) => void,
+  ) {}
+
+  push(stream: ProcessOutputEvent["stream"], data: Buffer): void {
+    if (!this.sink || !data.length || this.sinkFailure) return;
+    for (let offset = 0; offset < data.length; offset += MAX_STREAM_CHUNK_BYTES) {
+      const chunk = Buffer.from(data.subarray(offset, Math.min(offset + MAX_STREAM_CHUNK_BYTES, data.length)));
+      const event: ProcessOutputEvent = { sequence: this.sequence++, stream, data: chunk };
+      this.pending += 1;
+      if (this.pending === 1) this.pause();
+      this.lane = this.lane
+        .then(() => this.sinkFailure === undefined ? this.sink?.(event) : undefined)
+        .catch((error) => {
+          if (this.sinkFailure === undefined) {
+            this.sinkFailure = error;
+            this.onFailure(error);
+          }
+        })
+        .then(() => {
+          this.pending -= 1;
+          if (this.pending === 0) this.resume();
+        });
+    }
+  }
+
+  async drain(): Promise<void> {
+    await this.lane;
+  }
+
+  get failed(): boolean {
+    return this.sinkFailure !== undefined;
+  }
 }
 
 /**
@@ -439,6 +505,17 @@ async function runViaNativeHost(options: ProcessRunOptions): Promise<ProcessRunR
   let watchdog: NodeJS.Timeout | undefined;
   let resolvePromise!: (result: ProcessRunResult) => void;
   const promise = new Promise<ProcessRunResult>((resolve) => { resolvePromise = resolve; });
+  const outputForwarder = new ProcessOutputForwarder(
+    options.onOutput,
+    () => host.stdout.pause(),
+    () => {
+      if (!host.stdout.destroyed) host.stdout.resume();
+    },
+    (error) => {
+      protocolError = `Output sink failed: ${String(error)}`;
+      host.kill();
+    },
+  );
 
   // 统一收口：清看门狗、解绑 abort 监听、读报告文件并 resolve（幂等）。
   const complete = (outcome: CommandOutcome): void => {
@@ -446,7 +523,12 @@ async function runViaNativeHost(options: ProcessRunOptions): Promise<ProcessRunR
     settled = true;
     if (watchdog) clearTimeout(watchdog);
     options.signal?.removeEventListener("abort", abort);
-    resolvePromise(makeResult(outcome, stdout, stderr, readAndRemoveReport(options.reportPath), "native-host"));
+    void outputForwarder.drain().then(() => {
+      const finalOutcome = outputForwarder.failed
+        ? { kind: "crashed" as const, errorCode: "OUTPUT_SINK_FAILED" }
+        : outcome;
+      resolvePromise(makeResult(finalOutcome, stdout, stderr, readAndRemoveReport(options.reportPath), "native-host"));
+    });
   };
   // 写一帧到宿主 stdin；宿主可能已退出，先确认管道未销毁。
   const send = (frame: Buffer): void => {
@@ -476,9 +558,13 @@ async function runViaNativeHost(options: ProcessRunOptions): Promise<ProcessRunR
           hello = true;
           lastStage = "hello";
         } else if (event.type === "stdout" && event.data !== undefined) {
-          stdout.push(event.decodedData ?? Buffer.alloc(0));
+          const data = event.decodedData ?? Buffer.alloc(0);
+          stdout.push(data);
+          outputForwarder.push("stdout", data);
         } else if (event.type === "stderr" && event.data !== undefined) {
-          stderr.push(event.decodedData ?? Buffer.alloc(0));
+          const data = event.decodedData ?? Buffer.alloc(0);
+          stderr.push(data);
+          outputForwarder.push("stderr", data);
         } else if (event.type === "exit") {
           // 把宿主 outcome 映射为 CommandOutcome：宿主侧进程崩溃统一映射为
           // NATIVE_HOST_PROCESS_FAILED 错误码；exited 之外的终局按各自 kind 归位。
@@ -572,6 +658,18 @@ async function runViaNode(options: ProcessRunOptions): Promise<ProcessRunResult>
     let finished = false;
     let forced: "cancelled" | "timed-out" | undefined;
     let graceTimer: NodeJS.Timeout | undefined;
+    const outputForwarder = new ProcessOutputForwarder(
+      options.onOutput,
+      () => {
+        child.stdout.pause();
+        child.stderr.pause();
+      },
+      () => {
+        if (!child.stdout.destroyed) child.stdout.resume();
+        if (!child.stderr.destroyed) child.stderr.resume();
+      },
+      () => child.kill(),
+    );
     // 统一收口：清两个定时器、解绑 abort 监听、组装结果（报告文件优先，
     // 不存在则回退 fd 管道收集到的内容），幂等。
     const finish = (outcome: CommandOutcome): void => {
@@ -580,7 +678,12 @@ async function runViaNode(options: ProcessRunOptions): Promise<ProcessRunResult>
       clearTimeout(timer);
       if (graceTimer) clearTimeout(graceTimer);
       options.signal?.removeEventListener("abort", abort);
-      resolve(makeResult(outcome, stdout, stderr, readAndRemoveReport(options.reportPath, Buffer.concat(reportChunks)), "node-fallback"));
+      void outputForwarder.drain().then(() => {
+        const finalOutcome = outputForwarder.failed
+          ? { kind: "crashed" as const, errorCode: "OUTPUT_SINK_FAILED" }
+          : outcome;
+        resolve(makeResult(finalOutcome, stdout, stderr, readAndRemoveReport(options.reportPath, Buffer.concat(reportChunks)), "node-fallback"));
+      });
     };
     // 两级终止：先温和终止（Windows: taskkill 杀整棵进程树；其他平台:
     // SIGTERM），宽限期后仍未退出则 SIGKILL 强杀并按触发原因收场。
@@ -606,8 +709,18 @@ async function runViaNode(options: ProcessRunOptions): Promise<ProcessRunResult>
     if (options.signal?.aborted) abort();
     else options.signal?.addEventListener("abort", abort, { once: true });
     // 三个输出通道分流：stdout/stderr 进截断收集器，报告 fd 原样收集。
-    pipeReadable(child.stdout, stdout);
-    pipeReadable(child.stderr, stderr);
+    pipeReadable(child.stdout, {
+      push: (chunk: Buffer) => {
+        stdout.push(chunk);
+        outputForwarder.push("stdout", chunk);
+      },
+    });
+    pipeReadable(child.stderr, {
+      push: (chunk: Buffer) => {
+        stderr.push(chunk);
+        outputForwarder.push("stderr", chunk);
+      },
+    });
     if (options.reportFd) pipeReadable(child.stdio[3] as Readable | null, { push: (chunk: Buffer) => reportChunks.push(chunk) });
     // spawn 失败（程序不存在、权限不足等）：收敛为 spawn-failed，错误码取系统 errno。
     child.once("error", (error) => finish({ kind: "spawn-failed", errorCode: (error as NodeJS.ErrnoException).code ?? "SPAWN_FAILED" }));

@@ -35,7 +35,7 @@ interface SessionRecord {
 /**
  * 会话状态存储：sessionId -> SessionRecord 的内存映射。
  * 对外只提供快照（拷贝）与 CAS 提交两类读写入口，内部状态不会被调用方
- * 直接引用或意外修改。本类不做持久化，会话是否跨重启由上层配置决定。
+ * 直接引用或意外修改。本类不做跨进程持久化；会话生命周期与服务进程一致。
  */
 export class SessionStateStore {
   private readonly sessions = new Map<string, SessionRecord>();

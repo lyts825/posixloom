@@ -29,6 +29,8 @@ TypeScript 控制面（分类、路径、环境、会话、策略）
 - 通过 one-shot Bash 执行管道、重定向、变量展开与脚本。
 - 在同一 Session 中保存 cwd 与导出的环境变量，并支持隔离执行。
 - 通过 Rust Native Host、Windows Job Object、超时和取消管理进程树。
+- 通过控制协议实时转发二进制安全的 stdout/stderr，并对慢 Harness 施加背压。
+- 在执行前预览后端选择、参数翻译、路径决策与策略档案，不启动目标进程。
 - 以不可变 Runtime、组件锁文件、Ed25519 Feed 和事务切换实现可复现更新。
 
 ## 快速开始
@@ -50,6 +52,10 @@ npm run doctor
 # 精确 argv 的 Native Fast Path
 npm run posixloom -- exec -- rg --version
 npm run posixloom -- exec -- git --version
+
+# 只生成并检查执行计划，不启动命令
+npm run posixloom -- explain --json exec -- rg TODO /workspace/src
+npm run posixloom -- exec --dry-run --json -- rg TODO /workspace/src
 
 # Shell 路径：开发环境需指定 MSYS2 Bash 或 Git Bash
 $env:POSIXLOOM_BASH = 'C:\Program Files\Git\usr\bin\bash.exe'
@@ -87,6 +93,7 @@ npm run posixloom -- serve --stdio
 
 - [文档中心](docs/README.md)：指南与协议入口。
 - [开发指南](docs/guides/development.md)：环境准备、常用命令、测试与故障排查。
+- [配置与诊断](docs/guides/configuration.md)：有效配置、运行时摘要与 trace 查询。
 - [发布与更新指南](docs/guides/release.md)：组件供应链、Runtime 组装、签名和验证。
 - [控制协议 v1](docs/protocols/control-v1.md) 与 [StateReport v1](docs/protocols/state-report-v1.md)。
 

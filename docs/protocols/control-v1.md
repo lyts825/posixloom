@@ -21,14 +21,17 @@ Every message contains `protocolVersion: 1`. The server sends `hello` first:
 
 ```json
 {"protocolVersion":1,"type":"hello","maxFrameBytes":16777216,
- "capabilities":["session","argv","shell","cancel","runtime-doctor"]}
+ "capabilities":["session","argv","shell","cancel","runtime-doctor",
+ "runtime-info","execute-plan","stream-output-v1","trace-list"]}
 ```
 
-Responses are asynchronous, so clients correlate them by `id`. Each request
+Terminal responses are asynchronous, so clients correlate them by `id`. Each request
 must use a non-empty `id` (at most 128 characters) that is unique for the
-connection. A response is
+connection. A terminal response is
 either `{ "type": "result", "id": ..., "result": ... }` or
-`{ "type": "error", "id": ..., "code": ..., "message": ... }`.
+`{ "type": "error", "id": ..., "code": ..., "message": ... }`. An execute
+request that explicitly opts into streaming may receive correlated `event` frames
+before its one terminal response.
 
 ## Requests
 
@@ -41,13 +44,22 @@ The supported request types are:
 - `execute`: requires `id`, `sessionId`, and `input`. `input` is either
   `{ "kind":"argv", "argv":[...] }` for an exact executable/argument vector,
   or `{ "kind":"text", "raw":"..." }` for one Shell script. Optional
-  `cwd`, `envDelta`, `statePolicy` (`isolated` or `cwd-env`), and `timeoutMs`
+  `cwd`, `envDelta`, `statePolicy` (`isolated` or `cwd-env`), `timeoutMs`, and
+  boolean `stream`
   have the same meaning as the CLI.
+- `execute.plan`: validates and prepares the same execution plan as `execute`, but
+  does not create a process or commit session state. The result includes the selected
+  backend, sanitized argv, cwd translation, policy profile, and path decisions. It
+  never contains environment values, generated Shell wrapper text, or StateReport paths.
 - `cancel`: requires its own correlation `id` plus `targetId`, which names the
   in-flight execute request to abort. The two IDs must differ. The response
   reports `{ "targetId": ..., "cancelling": true|false }`; the execute request
   emits its own final result or error.
 - `runtime.doctor`: returns the runtime validation report.
+- `runtime.info`: returns the active Runtime identity, snapshot, mounts, backend paths,
+  policy profile, and Native Registry command names without running an external command.
+- `trace.list`: returns recent in-memory trace events. Optional `limit` must be an
+  integer from 1 through 5000 and defaults to 50.
 - `shutdown`: cancels in-flight work and asks the server to close after queued
   requests finish.
 
@@ -56,9 +68,30 @@ pipelines, redirects, substitutions, and `cd` are available only through the
 `text` input kind. This boundary prevents an argument containing spaces or
 metacharacters from changing command meaning.
 
+## Streaming output
+
+An `execute` request may opt into streaming with `"stream": true`. Existing clients
+that omit the field continue to receive exactly one terminal `result` or `error`.
+Streaming clients receive a `started` event, zero or more `output` events, and then
+the normal terminal response:
+
+```json
+{"protocolVersion":1,"type":"event","id":"e1","event":"started",
+ "planId":"...","backend":"native"}
+{"protocolVersion":1,"type":"event","id":"e1","event":"output",
+ "sequence":0,"stream":"stdout","dataBase64":"aGVsbG8K"}
+{"protocolVersion":1,"type":"result","id":"e1","result":{"command":{"kind":"exited","exitCode":0}}}
+```
+
+`sequence` is monotonic across stdout and stderr for one execution. Output data is
+Base64 so arbitrary bytes remain lossless. The server waits for each event write
+before reading more process output, propagating backpressure to the child pipes. All
+output events are written before the terminal response. Cancellation, timeout, and
+connection-loss behavior is unchanged.
+
 ## Execute result
 
-The result contains the original normalized command, state outcome, byte
+The terminal result contains the original normalized command, state outcome, byte
 counts, backend, plan/trace metadata, and `stdoutBase64`/`stderrBase64`. Binary
 output is therefore lossless. A committed session version is encoded as a
 decimal string because JavaScript `bigint` is not JSON-native. A timeout,

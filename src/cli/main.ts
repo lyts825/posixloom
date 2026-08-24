@@ -20,14 +20,17 @@
  * timeout）；cancelled -> 130（128 + SIGINT 惯例）；其余异常形态 -> 1；
  * usage 类错误与 doctor 不健康 -> 2。
  */
+import { existsSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createInterface } from "node:readline";
 import { asPosixLoomError } from "../core/errors.js";
+import { loadConfig, resolveConfigPaths } from "../core/config.js";
 import { PosixLoomService } from "../core/service.js";
 import { RuntimeManager } from "../core/runtime.js";
 import { RuntimeUpdater } from "../core/updater.js";
 import { serveControlPlane } from "../core/control.js";
+import { readTraceEvents, traceFilePath } from "../core/trace.js";
 
 // dist/src/cli/main.js → project root is three levels up.
 // 应用根目录：从编译产物（dist/src/cli/main.js）向上三级回到项目根，
@@ -36,7 +39,21 @@ const appRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 
 /** 打印用法帮助到 stdout；不设置退出码，供 help 与未知命令两个分支共用。 */
 function printUsage(): void {
-  console.log(`PosixLoom Runtime\n\nUsage:\n  posixloom exec -- <program> [args...]\n  posixloom exec [--cwd /path] [--isolated] [--timeout ms] -- <program> [args...]\n  posixloom shell [--cwd /path] [--isolated] [--timeout ms] -c <script>\n  posixloom shell [--cwd /path] [--isolated] [--timeout ms] --stdin\n  posixloom repl\n  posixloom serve --stdio\n  posixloom runtime doctor [--json]\n  posixloom runtime update [--check] [--force] [--json]\n  posixloom runtime rollback [--json]\n  posixloom version`);
+  console.log(`PosixLoom Runtime\n\nUsage:\n  posixloom exec [--dry-run] [--json] -- <program> [args...]\n  posixloom exec [--cwd /path] [--isolated] [--timeout ms] -- <program> [args...]\n  posixloom shell [--dry-run] [--json] [--cwd /path] [--isolated] [--timeout ms] -c <script>\n  posixloom shell [--cwd /path] [--isolated] [--timeout ms] --stdin\n  posixloom explain [--json] exec [options] -- <program> [args...]\n  posixloom explain [--json] shell [options] -c <script>\n  posixloom repl\n  posixloom serve --stdio\n  posixloom config path|show|validate [--json]\n  posixloom runtime doctor|info [--json]\n  posixloom runtime update [--check] [--force] [--json]\n  posixloom runtime rollback [--json]\n  posixloom trace list [--limit n] [--json]\n  posixloom version`);
+}
+
+/** 把 explain 预览打印为紧凑的人类可读摘要。 */
+function printPreview(preview: Awaited<ReturnType<PosixLoomService["explain"]>>): void {
+  console.log(`plan: ${preview.planId}`);
+  console.log(`route: ${preview.commandKind} -> ${preview.backend} (${preview.reason})`);
+  console.log(`program: ${preview.executable}`);
+  console.log(`argv: ${JSON.stringify(preview.argv)}`);
+  console.log(`cwd: ${preview.cwdVirtual} -> ${preview.cwdHost}`);
+  console.log(`policy: ${preview.policyProfile}; state: ${preview.statePolicy}; timeout: ${preview.timeoutMs}ms`);
+  for (const decision of preview.pathDecisions) {
+    console.log(`path[${decision.argumentIndex}]: ${decision.virtualInput ?? "-"} -> ${decision.hostOutput ?? "-"} (${decision.intent}/${decision.physicalCheck})`);
+  }
+  for (const limitation of preview.limitations) console.log(`limitation: ${limitation}`);
 }
 
 /** exec / shell 共享的命令行选项。 */
@@ -47,6 +64,10 @@ interface ParsedCommandOptions {
   isolated: boolean;
   /** 命令超时（毫秒）。 */
   timeoutMs?: number;
+  /** 只构建并打印执行计划，不创建子进程。 */
+  dryRun: boolean;
+  /** 诊断结果使用 JSON 输出（仅与 dry-run 搭配）。 */
+  json: boolean;
 }
 
 /**
@@ -61,6 +82,8 @@ function parseExec(args: string[]): ParsedCommandOptions & { argv: string[] } {
   let cwd: string | undefined;
   let isolated = false;
   let timeoutMs: number | undefined;
+  let dryRun = false;
+  let json = false;
   const command: string[] = [];
   // 见到 `--` 后停止选项解析，其余参数一律进入 command。
   let afterSeparator = false;
@@ -70,11 +93,14 @@ function parseExec(args: string[]): ParsedCommandOptions & { argv: string[] } {
     if (!afterSeparator && arg === "--cwd") { cwd = args[++index]; continue; }
     if (!afterSeparator && arg === "--isolated") { isolated = true; continue; }
     if (!afterSeparator && arg === "--timeout") { timeoutMs = Number(args[++index]); continue; }
+    if (!afterSeparator && arg === "--dry-run") { dryRun = true; continue; }
+    if (!afterSeparator && arg === "--json") { json = true; continue; }
     command.push(arg);
   }
   if (!command.length) throw new Error("Missing command. Use: posixloom exec -- <command>");
-  if (timeoutMs !== undefined && (!Number.isFinite(timeoutMs) || timeoutMs <= 0)) throw new Error("--timeout must be a positive number");
-  return { argv: command, cwd, isolated, timeoutMs };
+  if (timeoutMs !== undefined && (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0)) throw new Error("--timeout must be a positive integer");
+  if (json && !dryRun) throw new Error("--json is only valid with --dry-run");
+  return { argv: command, cwd, isolated, timeoutMs, dryRun, json };
 }
 
 /**
@@ -90,6 +116,8 @@ function parseShell(args: string[]): ParsedCommandOptions & { raw?: string; stdi
   let cwd: string | undefined;
   let isolated = false;
   let timeoutMs: number | undefined;
+  let dryRun = false;
+  let json = false;
   let raw: string | undefined;
   let stdin = false;
   for (let index = 0; index < args.length; index += 1) {
@@ -97,6 +125,8 @@ function parseShell(args: string[]): ParsedCommandOptions & { raw?: string; stdi
     if (arg === "--cwd") { cwd = args[++index]; continue; }
     if (arg === "--isolated") { isolated = true; continue; }
     if (arg === "--timeout") { timeoutMs = Number(args[++index]); continue; }
+    if (arg === "--dry-run") { dryRun = true; continue; }
+    if (arg === "--json") { json = true; continue; }
     // --stdin 必须是最后一个选项：其后不允许再出现任何参数。
     if (arg === "--stdin") {
       stdin = true;
@@ -114,8 +144,9 @@ function parseShell(args: string[]): ParsedCommandOptions & { raw?: string; stdi
   // 脚本来源必须且只能选一个：-c 与 --stdin 互斥。
   if (raw === undefined && !stdin) throw new Error("Missing script. Use: posixloom shell -c <script> or posixloom shell --stdin");
   if (raw !== undefined && stdin) throw new Error("Use either shell -c or shell --stdin, not both");
-  if (timeoutMs !== undefined && (!Number.isFinite(timeoutMs) || timeoutMs <= 0)) throw new Error("--timeout must be a positive number");
-  return { raw, stdin, cwd, isolated, timeoutMs };
+  if (timeoutMs !== undefined && (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0)) throw new Error("--timeout must be a positive integer");
+  if (json && !dryRun) throw new Error("--json is only valid with --dry-run");
+  return { raw, stdin, cwd, isolated, timeoutMs, dryRun, json };
 }
 
 /**
@@ -147,9 +178,43 @@ async function main(): Promise<void> {
     return;
   }
 
+  // 配置诊断必须早于 RuntimeManager 创建：即使用户配置或
+  // Runtime manifest 损坏，config path/validate 仍然要能定位并报告问题。
+  if (args[0] === "config") {
+    const command = args[1];
+    const json = args.includes("--json");
+    if (!command || !["path", "show", "validate"].includes(command)) {
+      throw new Error("Use: posixloom config path|show|validate [--json]");
+    }
+    const paths = await resolveConfigPaths(appRoot);
+    if (command === "path") {
+      if (json) console.log(JSON.stringify({ ...paths, userConfigExists: existsSync(paths.userConfigPath) }, null, 2));
+      else console.log(paths.userConfigPath);
+      return;
+    }
+    try {
+      const loaded = await loadConfig(appRoot, { allowInvalidRuntimePointer: true });
+      if (command === "show") {
+        console.log(JSON.stringify(loaded.runtime, null, 2));
+      } else if (json) {
+        console.log(JSON.stringify({ valid: true, path: paths.userConfigPath, runtimePointerIssues: loaded.runtimePointerIssues }, null, 2));
+      } else {
+        console.log(`config: OK (${paths.userConfigPath})`);
+        for (const issue of loaded.runtimePointerIssues) console.log(`[WARN] runtime pointer: ${issue.message}`);
+      }
+    } catch (error) {
+      const configError = asPosixLoomError(error, "CONFIG_INVALID");
+      if (command !== "validate") throw error;
+      if (json) console.log(JSON.stringify({ valid: false, path: paths.userConfigPath, error: { code: configError.code, message: configError.message, details: configError.details } }, null, 2));
+      else console.error(`[${configError.code}] ${configError.message}`);
+      process.exitCode = 2;
+    }
+    return;
+  }
+
   // 当前命令是否为 runtime 恢复类命令：这类命令的目的就是修复运行时，
   // 因此允许在运行时无效的情况下继续执行。
-  const runtimeRecoveryCommand = args[0] === "runtime" && (args[1] === "doctor" || args[1] === "update" || args[1] === "rollback");
+  const runtimeRecoveryCommand = args[0] === "runtime" && (args[1] === "doctor" || args[1] === "info" || args[1] === "update" || args[1] === "rollback");
   let runtime: RuntimeManager;
   // 标记自愈流程是否已更新过运行时，避免随后再跑一次 autoApply 静默更新。
   let runtimeUpdatedDuringRecovery = false;
@@ -207,6 +272,34 @@ async function main(): Promise<void> {
     else console.log(`Runtime rollback selected ${result.runtimeId}; restart PosixLoom to use it.`);
     return;
   }
+  // runtime info：输出不执行外部命令的运行时、挂载、策略与后端摘要。
+  if (args[0] === "runtime" && args[1] === "info") {
+    const info = runtime.info();
+    if (args.includes("--json")) console.log(JSON.stringify(info, null, 2));
+    else {
+      console.log(`Runtime: ${info.runtimeId} ${info.runtimeSemver} (${info.mode}/${info.source})`);
+      console.log(`Snapshot: ${info.snapshotId}`);
+      console.log(`Runtime root: ${info.runtimeRoot}`);
+      console.log(`Data root: ${info.dataRoot}`);
+      console.log(`Workspace: ${info.workspace}`);
+      console.log(`Policy: ${info.policyProfile}`);
+      console.log(`Bash: ${info.bash ?? "not found"}`);
+      console.log(`Native Host: ${info.nativeHost ?? "not found"}`);
+      console.log(`Native commands: ${info.nativeCommands.join(", ") || "none"}`);
+    }
+    return;
+  }
+  // trace list 从持久化 JSONL 尾部读取；未开启落盘或文件不存在时返回空列表。
+  if (args[0] === "trace") {
+    if (args[1] !== "list") throw new Error("Use: posixloom trace list [--limit n] [--json]");
+    const limitIndex = args.indexOf("--limit");
+    const limit = limitIndex >= 0 ? Number(args[limitIndex + 1]) : 50;
+    const events = await readTraceEvents(runtime.config.dataRoot, limit);
+    if (args.includes("--json")) console.log(JSON.stringify({ path: traceFilePath(runtime.config.dataRoot), events }, null, 2));
+    else if (!events.length) console.log(`No persisted traces at ${traceFilePath(runtime.config.dataRoot)}.`);
+    else for (const event of events) console.log(JSON.stringify(event));
+    return;
+  }
 
   const updates = runtime.config.runtime.updates;
   // 常规命令前的静默更新：自愈流程刚更新过则跳过；失败仅告警，不影响本次命令。
@@ -255,6 +348,30 @@ async function main(): Promise<void> {
     }
     return;
   }
+  // explain：复用 exec/shell 参数解析与服务层计划构建，但不创建子进程。
+  if (args[0] === "explain") {
+    let offset = 1;
+    const json = args[offset] === "--json";
+    if (json) offset += 1;
+    const mode = args[offset];
+    if (mode !== "exec" && mode !== "shell") throw new Error("Use: posixloom explain [--json] exec|shell ...");
+    const parsed = mode === "shell" ? parseShell(args.slice(offset + 1)) : parseExec(args.slice(offset + 1));
+    const shellRaw = mode === "shell"
+      ? ((parsed as ReturnType<typeof parseShell>).stdin ? await readStandardInput() : (parsed as ReturnType<typeof parseShell>).raw ?? "")
+      : undefined;
+    const service = new PosixLoomService(runtime);
+    const sessionId = service.createSession(parsed.cwd ?? "/workspace");
+    const preview = await service.explain({
+      ...(mode === "shell" ? { kind: "text" as const, raw: shellRaw! } : { kind: "argv" as const, argv: (parsed as ReturnType<typeof parseExec>).argv }),
+      sessionId,
+      cwd: parsed.cwd,
+      statePolicy: parsed.isolated ? "isolated" : undefined,
+      timeoutMs: parsed.timeoutMs,
+    });
+    if (json) console.log(JSON.stringify(preview, null, 2));
+    else printPreview(preview);
+    return;
+  }
   // 其余未知命令：打印用法并以 2 退出（usage 类错误）。
   if (args[0] !== "exec" && args[0] !== "run" && args[0] !== "shell") {
     printUsage();
@@ -268,6 +385,18 @@ async function main(): Promise<void> {
     : undefined;
   const service = new PosixLoomService(runtime);
   const sessionId = service.createSession(parsed.cwd ?? "/workspace");
+  if (parsed.dryRun) {
+    const preview = await service.explain({
+      ...(args[0] === "shell" ? { kind: "text" as const, raw: shellRaw! } : { kind: "argv" as const, argv: (parsed as ReturnType<typeof parseExec>).argv }),
+      sessionId,
+      cwd: parsed.cwd,
+      statePolicy: parsed.isolated ? "isolated" : undefined,
+      timeoutMs: parsed.timeoutMs,
+    });
+    if (parsed.json) console.log(JSON.stringify(preview, null, 2));
+    else printPreview(preview);
+    return;
+  }
   // exec 走 argv 精确模式，shell 走 text 脚本模式；--isolated 映射为
   // statePolicy:isolated（不提交会话状态），其余选项原样透传。
   const completion = await service.execute({

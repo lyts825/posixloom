@@ -14,8 +14,9 @@
  * - 磁盘写入经 writeLane 这条 Promise 链串行化：并发 record 触发的多次
  *   appendFile 按调用顺序逐个执行，不会交错乱序，也无需加锁。
  */
-import { appendFile } from "node:fs/promises";
+import { appendFile, open } from "node:fs/promises";
 import { join } from "node:path";
+import { PosixLoomError } from "./errors.js";
 
 /**
  * 单条追踪事件：除强制字段 timestamp 外，其余字段由调用方按事件类型注入
@@ -24,6 +25,61 @@ import { join } from "node:path";
 export interface TraceEvent extends Record<string, unknown> {
   /** 事件产生时间（record 时打点的 UTC ISO-8601 字符串） */
   timestamp: string;
+}
+
+/** 返回持久化 trace 的固定路径。 */
+export function traceFilePath(dataRoot: string): string {
+  return join(dataRoot, "logs", "posixloom-trace.jsonl");
+}
+
+/**
+ * 从 JSONL 文件尾部读取最近的 trace。按块倒序读取，避免为了少量诊断事件
+ * 把长期增长的整个日志载入内存。
+ */
+export async function readTraceEvents(dataRoot: string, limit = 50): Promise<TraceEvent[]> {
+  if (!Number.isSafeInteger(limit) || limit <= 0 || limit > 5000) {
+    throw new PosixLoomError("TRACE_LIMIT_INVALID", "Trace limit must be an integer between 1 and 5000", { limit });
+  }
+  const target = traceFilePath(dataRoot);
+  let handle: Awaited<ReturnType<typeof open>>;
+  try {
+    handle = await open(target, "r");
+  } catch (error: any) {
+    if (error?.code === "ENOENT") return [];
+    throw error;
+  }
+  try {
+    const size = (await handle.stat()).size;
+    const chunks: Buffer[] = [];
+    let position = size;
+    let newlineCount = 0;
+    while (position > 0 && newlineCount <= limit) {
+      const length = Math.min(64 * 1024, position);
+      position -= length;
+      const chunk = Buffer.allocUnsafe(length);
+      const { bytesRead } = await handle.read(chunk, 0, length, position);
+      const data = chunk.subarray(0, bytesRead);
+      chunks.unshift(data);
+      for (const byte of data) if (byte === 0x0a) newlineCount += 1;
+    }
+    const text = Buffer.concat(chunks).toString("utf8");
+    const lines = text.split("\n").filter(Boolean).slice(-limit);
+    return lines.map((line, index) => {
+      try {
+        const event = JSON.parse(line) as TraceEvent;
+        if (!event || typeof event !== "object" || typeof event.timestamp !== "string") throw new Error("missing timestamp");
+        return event;
+      } catch (error) {
+        throw new PosixLoomError("TRACE_FILE_INVALID", "Persisted trace contains an invalid JSONL entry", {
+          path: target,
+          lineFromTail: lines.length - index,
+          cause: String(error),
+        });
+      }
+    });
+  } finally {
+    await handle.close();
+  }
 }
 
 /**
@@ -65,7 +121,7 @@ export class TraceRecorder {
     }
     if (this.writeTraceFile) {
       const line = `${JSON.stringify(event)}\n`;
-      const target = join(this.dataRoot, "logs", "posixloom-trace.jsonl");
+      const target = traceFilePath(this.dataRoot);
       // 排入写队列：与先前尚未完成的追加串行执行，避免并发交错
       this.writeLane = this.writeLane.then(() => appendFile(target, line, "utf8"));
       await this.writeLane;

@@ -31,14 +31,17 @@ import { buildNativeEnv, buildPosixEnv, canonicalEnvKey, diffExportedEnv } from 
 import { classify } from "./classifier.js";
 import { PolicyGate } from "./policy.js";
 import { NativeRegistry } from "./registry.js";
-import { runProcess, type ProcessRunResult } from "./process.js";
+import { runProcess, type ProcessOutputEvent, type ProcessRunResult } from "./process.js";
 import { RuntimeManager } from "./runtime.js";
 import { isSafeExistingDirectory, normalizeVirtual } from "./path.js";
 import { SessionStateStore } from "./session.js";
 import { TraceRecorder, type TraceEvent } from "./trace.js";
 import type {
   CommandCompletion,
+  CommandKind,
   CommandOutcome,
+  ExecutionPlan,
+  ExecutionPreview,
   MountBootstrap,
   NativeExecutionPlan,
   ResolutionTemplate,
@@ -46,6 +49,7 @@ import type {
   ShellExecutionPlan,
   StateOutcome,
   StatePatch,
+  StatePolicy,
 } from "./types.js";
 
 /**
@@ -269,6 +273,24 @@ export interface ArgvExecuteOptions extends ExecuteBaseOptions {
 /** execute 的两种输入形态（文本 / 精确 argv），二选一。 */
 export type ExecuteOptions = TextExecuteOptions | ArgvExecuteOptions;
 
+/** execute 生命周期观察器；控制协议用它发送 started 与流式输出事件。 */
+export interface ExecuteObserver {
+  onStarted?: (preview: ExecutionPreview) => void | Promise<void>;
+  onOutput?: (event: ProcessOutputEvent) => void | Promise<void>;
+}
+
+/** 经过完整预检、可直接交给进程层执行的内部计划。 */
+interface PreparedExecution {
+  plan: ExecutionPlan;
+  hostPath?: string;
+  cwdVirtual: string;
+  cwdHost: string;
+  commandKind: CommandKind;
+  reason: string;
+  sessionVersion: bigint;
+  statePolicy: StatePolicy;
+}
+
 /**
  * PosixLoomService -- PosixLoom 命令执行编排核心，把各模块串成完整执行管道。
  *
@@ -331,12 +353,22 @@ export class PosixLoomService {
    * @param options 命令输入（text 或 argv）及会话/策略/超时等参数
    * @returns CommandCompletion；执行层错误（CWD_NOT_FOUND 等）以异常形式抛出
    */
-  async execute(options: ExecuteOptions): Promise<CommandCompletion> {
+  async execute(options: ExecuteOptions, observer: ExecuteObserver = {}): Promise<CommandCompletion> {
     const statePolicy = options.statePolicy ?? this.runtime.config.runtime.session.defaultStatePolicy;
-    const operation = async (): Promise<CommandCompletion> => this.executeOnce(options, statePolicy);
+    const operation = async (): Promise<CommandCompletion> => this.executeOnce(options, statePolicy, observer);
     const completion = statePolicy === "cwd-env" ? await this.sessions.inStateLane(options.sessionId, operation) : await operation();
     completion.trace = await this.traceRecorder.record(completion.trace);
     return completion;
+  }
+
+  /**
+   * 构建但不执行命令，返回经过脱敏的执行计划预览。
+   * cwd-env 预览也进入会话 lane，保证它读取的是前序命令提交后的最新状态。
+   */
+  async explain(options: ExecuteOptions): Promise<ExecutionPreview> {
+    const statePolicy = options.statePolicy ?? this.runtime.config.runtime.session.defaultStatePolicy;
+    const operation = async (): Promise<ExecutionPreview> => this.preview(await this.prepareExecution(options, statePolicy));
+    return statePolicy === "cwd-env" ? this.sessions.inStateLane(options.sessionId, operation) : operation();
   }
 
   /**
@@ -361,19 +393,68 @@ export class PosixLoomService {
    * @param options 命令输入
    * @param statePolicy 已解析的状态策略（execute 层确定，含默认值回落）
    */
-  private async executeOnce(options: ExecuteOptions, statePolicy: "isolated" | "cwd-env"): Promise<CommandCompletion> {
-    // 阶段 1：命令前完整性断言。
-    await this.runtime.assertRuntimeIntegrity("pre-command");
-    // 阶段 2：输入形态分派--argv 模式直接使用精确参数向量，text 模式保留原文待分类。
+  private async executeOnce(options: ExecuteOptions, statePolicy: StatePolicy, observer: ExecuteObserver): Promise<CommandCompletion> {
+    // 空命令保持既有短路语义：完成完整性预检后不构建计划、不启动进程。
     const exactArgv = options.kind === "argv" ? options.argv : undefined;
     const raw = options.kind === "argv" ? undefined : options.raw;
-    // 空命令（空 argv 或空白文本）短路：不启动进程、不触碰会话状态。
-    if (exactArgv && exactArgv.length === 0) return this.emptyCompletion();
-    if (!exactArgv && !raw?.trim()) return this.emptyCompletion();
-    const commandId = randomUUID();
+    if ((exactArgv && exactArgv.length === 0) || (!exactArgv && !raw?.trim())) {
+      await this.runtime.assertRuntimeIntegrity("pre-command");
+      return this.emptyCompletion();
+    }
     const started = Date.now();
-    // 阶段 3：会话快照 -> 虚拟 cwd（请求覆盖优先于会话当前值）-> 宿主路径
-    // -> 策略断言 -> 存在性检查（目录不存在抛 CWD_NOT_FOUND）。
+    const prepared = await this.prepareExecution(options, statePolicy);
+    await observer.onStarted?.(this.preview(prepared));
+    const { plan } = prepared;
+
+    if (plan.mode === "native") {
+      const result = await runProcess({
+        program: plan.executable,
+        args: plan.argv,
+        cwd: plan.cwdHost,
+        env: plan.envHost,
+        timeoutMs: plan.timeoutMs,
+        cancelGraceMs: this.runtime.config.runtime.process.cancelGraceMs,
+        hostPath: prepared.hostPath,
+        signal: options.signal,
+        maxOutputBytes: this.runtime.config.runtime.process.maxOutputBytes,
+        onOutput: observer.onOutput,
+      });
+      await this.runtime.assertRuntimeIntegrity("post-command");
+      return this.nativeCompletion(plan, result, prepared.reason, started);
+    }
+
+    let result: ProcessRunResult;
+    try {
+      result = await runProcess({
+        program: plan.bashExecutable,
+        args: ["--noprofile", "--norc", "-s"],
+        cwd: prepared.cwdHost,
+        env: plan.envPosix,
+        timeoutMs: plan.timeoutMs,
+        cancelGraceMs: this.runtime.config.runtime.process.cancelGraceMs,
+        input: buildShellScript(plan),
+        reportPath: plan.stateReportPath,
+        hostPath: prepared.hostPath,
+        signal: options.signal,
+        maxOutputBytes: this.runtime.config.runtime.process.maxOutputBytes,
+        onOutput: observer.onOutput,
+      });
+    } finally {
+      rmSync(plan.stateReportPath, { force: true });
+    }
+    await this.runtime.assertRuntimeIntegrity("post-command");
+    return this.shellCompletion(plan, result, prepared.reason, started);
+  }
+
+  /** 运行完整预检并构建唯一的内部执行计划，供 explain 与 execute 共用。 */
+  private async prepareExecution(options: ExecuteOptions, statePolicy: StatePolicy): Promise<PreparedExecution> {
+    await this.runtime.assertRuntimeIntegrity("pre-command");
+    const exactArgv = options.kind === "argv" ? options.argv : undefined;
+    const raw = options.kind === "argv" ? undefined : options.raw;
+    if ((exactArgv && exactArgv.length === 0) || (!exactArgv && !raw?.trim())) {
+      throw new PosixLoomError("COMMAND_EMPTY", "Cannot explain an empty command");
+    }
+    const commandId = randomUUID();
     const state = this.sessions.snapshot(options.sessionId);
     const virtualCwd = options.cwd ?? state.cwd;
     const cwdHost = this.runtime.mountTable.toHost(virtualCwd);
@@ -396,53 +477,59 @@ export class PosixLoomService {
     if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) throw new PosixLoomError("TIMEOUT_INVALID", "timeoutMs must be a positive integer", { timeoutMs });
     const hostPath = this.runtime.findNativeHost();
     if (!hostPath && this.runtime.snapshot.manifest.mode === "release") throw new PosixLoomError("NATIVE_HOST_MISSING", "Release Runtime requires its packaged Native Host");
-    // 阶段 7a：native 快路径--仅当命令为 simple 且注册表命中（模板含可执行文件与
-    // 适配器翻译后的 argv）时走 Windows 原生执行；否则落入下方 shell 路径。
+
+    let plan: ExecutionPlan;
     if (classified.kind === "simple" && template.backend === "native" && template.argv && template.executable) {
-      const native = this.buildNativePlan(commandId, options, state, statePolicy, template, virtualCwd, cwdHost, timeoutMs);
-      const result = await runProcess({
-        program: native.executable,
-        args: native.argv,
-        cwd: native.cwdHost,
-        env: native.envHost,
-        timeoutMs,
-        cancelGraceMs: this.runtime.config.runtime.process.cancelGraceMs,
-        hostPath,
-        signal: options.signal,
-        maxOutputBytes: this.runtime.config.runtime.process.maxOutputBytes,
-      });
-      // 阶段 8（native 分支）：命令后完整性断言，再组装完成结果。
-      await this.runtime.assertRuntimeIntegrity("post-command");
-      return this.nativeCompletion(native, result, classified.reason, started);
+      plan = this.buildNativePlan(commandId, options, state, statePolicy, template, virtualCwd, cwdHost, timeoutMs);
+    } else {
+      plan = this.buildShellPlan(commandId, options, commandBody, state, statePolicy, template, virtualCwd, cwdHost, timeoutMs);
+      this.policy.assertExecutable(plan.bashExecutable);
     }
-    // 阶段 7b：shell 路径--builtin、shell 语法、explicit-shell 以及注册表未命中的
-    // simple 命令统一交给 MSYS2 bash。
-    const shell = this.buildShellPlan(commandId, options, commandBody, state, statePolicy, template, virtualCwd, cwdHost, timeoutMs);
-    this.policy.assertExecutable(shell.bashExecutable);
-    let result: ProcessRunResult;
-    try {
-      // bash --noprofile --norc -s 从 stdin 读脚本：避免用户 profile 污染环境；
-      // 脚本由 buildShellScript 现场生成，StateReport 路径经 envPosix 注入脚本。
-      result = await runProcess({
-        program: shell.bashExecutable,
-        args: ["--noprofile", "--norc", "-s"],
-        cwd: cwdHost,
-        env: shell.envPosix,
-        timeoutMs,
-        cancelGraceMs: this.runtime.config.runtime.process.cancelGraceMs,
-        input: buildShellScript(shell),
-        reportPath: shell.stateReportPath,
-        hostPath,
-        signal: options.signal,
-        maxOutputBytes: this.runtime.config.runtime.process.maxOutputBytes,
-      });
-    } finally {
-      // 无论成败都清理 StateReport 临时文件（force 容忍进程层已删除的情况）。
-      rmSync(shell.stateReportPath, { force: true });
-    }
-    // 阶段 8（shell 分支）：命令后完整性断言，再解析报告并组装完成结果。
-    await this.runtime.assertRuntimeIntegrity("post-command");
-    return this.shellCompletion(shell, result, classified.reason, started);
+
+    return {
+      plan,
+      hostPath,
+      cwdVirtual: virtualCwd,
+      cwdHost,
+      commandKind: classified.kind,
+      reason: template.reason,
+      sessionVersion: state.version,
+      statePolicy,
+    };
+  }
+
+  /** 把内部计划裁剪成不含环境值、脚本文本与临时路径的公开预览。 */
+  private preview(prepared: PreparedExecution): ExecutionPreview {
+    const { plan } = prepared;
+    const native = plan.mode === "native";
+    return {
+      planId: plan.planId,
+      commandId: plan.commandId,
+      sessionId: plan.sessionId,
+      snapshotId: plan.snapshotId,
+      sessionVersion: prepared.sessionVersion.toString(),
+      mode: plan.mode,
+      backend: native ? "native" : "msys2",
+      commandKind: prepared.commandKind,
+      reason: prepared.reason,
+      executable: native ? plan.executable : plan.bashExecutable,
+      argv: native ? [...plan.argv] : ["--noprofile", "--norc", "-s"],
+      cwdVirtual: prepared.cwdVirtual,
+      cwdHost: prepared.cwdHost,
+      timeoutMs: plan.timeoutMs,
+      statePolicy: prepared.statePolicy,
+      policyProfile: plan.policyProfile,
+      pathDecisions: native ? plan.pathDecisions.map((decision) => ({ ...decision })) : [],
+      environmentKeys: Object.keys(native ? plan.envHost : plan.envPosix).sort(),
+      checks: { runtimeIntegrity: "passed", cwdPolicy: "passed", executablePolicy: "passed" },
+      limitations: native
+        ? ["The preview is non-binding; execution replans and revalidates against current runtime and session state."]
+        : [
+          "Shell syntax is interpreted at runtime; paths produced by expansion, substitution, globbing, or scripts cannot be enumerated statically.",
+          "The preview is non-binding; execution replans and revalidates against current runtime and session state.",
+        ],
+      replayable: false,
+    };
   }
 
   /**

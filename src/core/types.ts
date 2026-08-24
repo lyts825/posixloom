@@ -103,12 +103,10 @@ export interface RuntimeConfig {
   runtime: { workspace: string };
   /** 挂载表：虚拟挂载点 -> 宿主目录；值支持 $RUNTIME_ROOT / $DATA / $RUN 等变量替换。 */
   mounts: Record<string, string>;
-  /** 会话块：默认状态策略与会话持久化开关。 */
+  /** 会话块：新建会话使用的默认状态策略。 */
   session: {
     /** 新建会话默认使用的 StatePolicy。 */
     defaultStatePolicy: StatePolicy;
-    /** 会话（及其状态）是否跨宿主进程重启持久化。 */
-    persistAcrossRestart: boolean;
   };
   /** 进程块：超时、取消宽限与输出限额，构成命令执行的资源安全边界。 */
   process: {
@@ -251,6 +249,25 @@ export interface RuntimeSnapshot {
   manifest: RuntimeManifest;
   /** 运行时来源："bundled" 随安装包携带 / "data" 经更新器安装 / "development" 开发源码树。 */
   source: "bundled" | "data" | "development";
+}
+
+/** 面向 CLI / Harness 的只读运行时摘要。 */
+export interface RuntimeInfo {
+  runtimeId: string;
+  runtimeSemver: string;
+  updateSequence?: number;
+  mode: "development" | "release";
+  source: RuntimeSnapshot["source"];
+  snapshotId: string;
+  runtimeRoot: HostPath;
+  dataRoot: HostPath;
+  workspace: HostPath;
+  policyProfile: "trusted" | "workspace-guard";
+  mounts: MountSpec[];
+  bash?: HostPath;
+  nativeHost?: HostPath;
+  nativeCommands: string[];
+  recoveryRequired: boolean;
 }
 
 /**
@@ -470,6 +487,61 @@ export interface ShellExecutionPlan extends BaseExecutionPlan {
 
 /** 执行计划判别联合：按 mode 收窄为原生直启或 shell 解释两条路线。 */
 export type ExecutionPlan = NativeExecutionPlan | ShellExecutionPlan;
+
+/**
+ * 可安全返回给 CLI / Harness 的执行计划预览。
+ *
+ * 预览只包含路由、路径、策略和状态版本等审计信息，不包含完整环境变量、
+ * Shell wrapper 或 StateReport 路径，避免诊断接口泄露进程环境中的敏感值。
+ */
+export interface ExecutionPreview {
+  /** 本次预览生成的计划 id；实际重新执行时会生成新的 id。 */
+  planId: string;
+  /** 本次预览生成的命令 id。 */
+  commandId: string;
+  /** 目标会话 id。 */
+  sessionId: string;
+  /** 计划绑定的运行时快照。 */
+  snapshotId: string;
+  /** 计划读取到的会话状态版本，使用十进制字符串以便 JSON 序列化。 */
+  sessionVersion: string;
+  /** 最终执行路线。 */
+  mode: "native" | "shell";
+  /** 最终执行后端。 */
+  backend: Backend;
+  /** 分类器给出的命令类别。 */
+  commandKind: CommandKind;
+  /** 后端选择原因。 */
+  reason: string;
+  /** 将启动的宿主可执行文件。 */
+  executable: HostPath;
+  /** 传给可执行文件的参数；Shell 路线仅公开固定 Bash 启动参数。 */
+  argv: string[];
+  /** 虚拟工作目录。 */
+  cwdVirtual: VirtualPath;
+  /** 翻译后的宿主工作目录。 */
+  cwdHost: HostPath;
+  /** 超时限制。 */
+  timeoutMs: number;
+  /** 状态提交策略。 */
+  statePolicy: StatePolicy;
+  /** 策略档案。 */
+  policyProfile: "trusted" | "workspace-guard";
+  /** Native 参数适配器产生的路径审计；Shell 路线为空。 */
+  pathDecisions: PathDecision[];
+  /** 将注入进程的环境变量名称，仅公开名称、不公开值。 */
+  environmentKeys: string[];
+  /** 预检已完成的关键安全门禁；任一失败都会转为结构化错误而不产生 ready 预览。 */
+  checks: {
+    runtimeIntegrity: "passed";
+    cwdPolicy: "passed";
+    executablePolicy: "passed";
+  };
+  /** 审计者必须知道的静态分析边界。 */
+  limitations: string[];
+  /** 预览不是可重放的授权令牌；真正执行会重新规划与校验。 */
+  replayable: false;
+}
 
 /**
  * 会话状态补丁：shell 命令的 StateReport 解析结果（或 API 直接修改请求）。

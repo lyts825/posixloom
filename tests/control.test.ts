@@ -34,6 +34,8 @@ test("control protocol exposes a versioned Harness-facing session and argv API",
   const hello = await reader.next();
   assert.equal(hello.type, "hello");
   assert.equal(hello.protocolVersion, 1);
+  assert.equal(hello.capabilities.includes("stream-output-v1"), true);
+  assert.equal(hello.capabilities.includes("execute-plan"), true);
 
   input.write(encodeNativeFrame({ protocolVersion: 1, type: "session.create", id: "s", cwd: "/workspace" }));
   const created = await reader.next();
@@ -54,6 +56,68 @@ test("control protocol exposes a versioned Harness-facing session and argv API",
 
   input.write(encodeNativeFrame({ protocolVersion: 1, type: "shutdown", id: "shutdown" }));
   assert.equal((await reader.next()).result.shuttingDown, true);
+  await server;
+});
+
+test("control protocol previews plans and streams ordered binary output", async () => {
+  const runtime = await RuntimeManager.create(process.cwd());
+  const input = new PassThrough();
+  const output = new PassThrough();
+  const reader = new FrameReader(output);
+  const server = serveControlPlane(runtime, input, output);
+  await reader.next();
+
+  input.write(encodeNativeFrame({ protocolVersion: 1, type: "session.create", id: "create-stream" }));
+  const sessionId = (await reader.next()).result.sessionId;
+  input.write(encodeNativeFrame({
+    protocolVersion: 1,
+    type: "execute.plan",
+    id: "plan",
+    sessionId,
+    envDelta: { POSIXLOOM_TEST_SECRET: "control-secret-value" },
+    input: { kind: "argv", argv: ["node", "-p", "1"] },
+  }));
+  const planned = await reader.next();
+  assert.equal(planned.type, "result");
+  assert.equal(planned.result.backend, "native");
+  assert.equal(JSON.stringify(planned).includes("control-secret-value"), false);
+
+  input.write(encodeNativeFrame({
+    protocolVersion: 1,
+    type: "execute",
+    id: "stream",
+    sessionId,
+    stream: true,
+    input: {
+      kind: "argv",
+      argv: ["node", "-e", "process.stdout.write(Buffer.from([0,1,2]));process.stderr.write(Buffer.from([255,254]))"],
+    },
+  }));
+  const frames: any[] = [];
+  for (;;) {
+    const frame = await reader.next();
+    frames.push(frame);
+    if (frame.id === "stream" && frame.type === "result") break;
+  }
+  assert.equal(frames[0].event, "started");
+  const outputEvents = frames.filter((frame) => frame.event === "output");
+  assert.deepEqual(outputEvents.map((frame) => frame.sequence), outputEvents.map((_, index) => index));
+  assert.deepEqual(
+    Buffer.concat(outputEvents.filter((frame) => frame.stream === "stdout").map((frame) => Buffer.from(frame.dataBase64, "base64"))),
+    Buffer.from([0, 1, 2]),
+  );
+  assert.deepEqual(
+    Buffer.concat(outputEvents.filter((frame) => frame.stream === "stderr").map((frame) => Buffer.from(frame.dataBase64, "base64"))),
+    Buffer.from([255, 254]),
+  );
+  assert.equal(frames.at(-1).result.command.kind, "exited");
+
+  input.write(encodeNativeFrame({ protocolVersion: 1, type: "runtime.info", id: "info" }));
+  assert.equal((await reader.next()).result.runtimeId, runtime.snapshot.runtimeId);
+  input.write(encodeNativeFrame({ protocolVersion: 1, type: "trace.list", id: "traces", limit: 1 }));
+  assert.equal((await reader.next()).result.events.length, 1);
+  input.write(encodeNativeFrame({ protocolVersion: 1, type: "shutdown", id: "done" }));
+  await reader.next();
   await server;
 });
 

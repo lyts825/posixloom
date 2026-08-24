@@ -56,6 +56,10 @@ interface ControlRequest {
   cwd?: string;
   /** 命令超时（毫秒），必须为正整数。 */
   timeoutMs?: number;
+  /** execute 专用：显式为 true 时在最终 result 前发送 started/output 事件。 */
+  stream?: boolean;
+  /** trace.list 专用：返回最近多少条内存 trace。 */
+  limit?: number;
   /** 状态提交策略：isolated 不提交会话状态；cwd-env 把 cwd/导出环境提交回会话。 */
   statePolicy?: "isolated" | "cwd-env";
   /** 环境变量增量：值为 string 表示设置，null 表示删除。 */
@@ -124,6 +128,7 @@ function validateExecuteRequest(request: ControlRequest): asserts request is Val
   if (request.timeoutMs !== undefined && (!Number.isSafeInteger(request.timeoutMs) || request.timeoutMs <= 0)) {
     invalidRequest("timeoutMs must be a positive integer");
   }
+  if (request.stream !== undefined && typeof request.stream !== "boolean") invalidRequest("stream must be a boolean");
   if (request.statePolicy !== undefined && request.statePolicy !== "isolated" && request.statePolicy !== "cwd-env") {
     invalidRequest("statePolicy must be isolated or cwd-env");
   }
@@ -270,6 +275,27 @@ export async function serveControlPlane(runtime: RuntimeManager, input: Readable
         await send({ type: "result", id, result: runtime.doctor() });
         return;
       }
+      // 运行时摘要：不执行外部命令，返回快照、挂载、后端路径与注册表命令。
+      if (request.type === "runtime.info") {
+        await send({ type: "result", id, result: runtime.info() });
+        return;
+      }
+      // 当前服务进程的内存 trace；持久化 trace 由 CLI 从 JSONL 尾部读取。
+      if (request.type === "trace.list") {
+        const limit = request.limit ?? 50;
+        if (!Number.isSafeInteger(limit) || limit <= 0 || limit > 5000) invalidRequest("limit must be an integer between 1 and 5000");
+        await send({ type: "result", id, result: { events: service.traces().slice(-limit) } });
+        return;
+      }
+      // 计划预览与 execute 共用服务层准备管道，但不会创建子进程或提交会话状态。
+      if (request.type === "execute.plan") {
+        validateExecuteRequest(request);
+        const options: ExecuteOptions = request.input.kind === "argv"
+          ? { kind: "argv", argv: request.input.argv, sessionId: request.sessionId, cwd: request.cwd, envDelta: request.envDelta, statePolicy: request.statePolicy, timeoutMs: request.timeoutMs }
+          : { kind: "text", raw: request.input.raw, sessionId: request.sessionId, cwd: request.cwd, envDelta: request.envDelta, statePolicy: request.statePolicy, timeoutMs: request.timeoutMs };
+        await send({ type: "result", id, result: await service.explain(options) });
+        return;
+      }
       // execute：核心命令执行。先做全字段校验，再注册取消句柄，最后按输入
       // 形态构造执行选项（argv 与 text 是判别联合，各自映射到对应的执行选项）。
       if (request.type === "execute") {
@@ -282,7 +308,25 @@ export async function serveControlPlane(runtime: RuntimeManager, input: Readable
           ? { kind: "argv", argv: request.input.argv, sessionId: request.sessionId, cwd: request.cwd, envDelta: request.envDelta, statePolicy: request.statePolicy, timeoutMs: request.timeoutMs, signal: controller.signal }
           : { kind: "text", raw: request.input.raw, sessionId: request.sessionId, cwd: request.cwd, envDelta: request.envDelta, statePolicy: request.statePolicy, timeoutMs: request.timeoutMs, signal: controller.signal };
         try {
-          const completion = await service.execute(options);
+          const completion = await service.execute(options, request.stream
+            ? {
+              onStarted: async (preview) => send({
+                type: "event",
+                id,
+                event: "started",
+                planId: preview.planId,
+                backend: preview.backend,
+              }),
+              onOutput: async (event) => send({
+                type: "event",
+                id,
+                event: "output",
+                sequence: event.sequence,
+                stream: event.stream,
+                dataBase64: event.data.toString("base64"),
+              }),
+            }
+            : {});
           // 输出统一走 jsonCompletion：stdout/stderr 转 Base64、bigint 版本转字符串。
           await send({ type: "result", id, result: jsonCompletion(completion) });
         } finally {
@@ -322,7 +366,11 @@ export async function serveControlPlane(runtime: RuntimeManager, input: Readable
   let serviceError: unknown;
   try {
     // 握手帧：宣告帧上限与能力集，Harness 在发送第一个请求前即可完成协商。
-    await send({ type: "hello", maxFrameBytes: NATIVE_MAX_FRAME_BYTES, capabilities: ["session", "argv", "shell", "cancel", "runtime-doctor"] });
+    await send({
+      type: "hello",
+      maxFrameBytes: NATIVE_MAX_FRAME_BYTES,
+      capabilities: ["session", "argv", "shell", "cancel", "runtime-doctor", "runtime-info", "execute-plan", "stream-output-v1", "trace-list"],
+    });
     controlLoop: for await (const chunk of input) {
       // 已进入收尾（shutdown / 输出失效）则不再读取新数据。
       if (closing) break;
