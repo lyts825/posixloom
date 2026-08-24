@@ -2,12 +2,12 @@
  * service.ts -- PosixLoomService：整个 PosixLoom 的命令执行编排核心。
  *
  * 职责：
- * - 把 RuntimeManager、NativeRegistry、PolicyGate、SessionStateStore、TraceRecorder
- *   和进程执行层（runProcess，优先经 Rust Native Host）串成一条完整的执行管道；
- * - 将用户输入分类（simple / builtin / shell-required / explicit-shell）并路由到两种后端：
+ * - 把 RuntimeManager 的插件能力图与 PolicyGate、SessionStateStore、TraceRecorder
+ *   串成一条完整的执行管道；
+ * - 通过 classifier / resolver / planner / backend 扩展点路由用户输入：
  *   native 快路径（Windows 原生可执行文件 + 适配器翻译参数）与 msys2 shell 路径
  *   （bash --noprofile --norc -s 从 stdin 执行生成的包装脚本）；
- * - 为 shell 路径生成包装脚本：挂载 MSYS 挂载点、导出 POSIX 环境、cd 到虚拟 cwd、
+ * - 由内置 shell 插件生成包装脚本：挂载 MSYS 挂载点、导出 POSIX 环境、cd 到虚拟 cwd、
  *   执行用户命令，再通过临时文件 StateReport 回传会话状态（退出码 / 物理 pwd / 全量环境）；
  * - 逐字节严格解析并校验 StateReport，把 cwd 与环境差量以乐观锁（baseStateVersion）
  *   提交回会话。
@@ -24,25 +24,33 @@
  *   Node 侧无需解析 stderr 即可定位失败发生在哪个阶段。
  */
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync, rmSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { PosixLoomError, asPosixLoomError } from "./errors.js";
-import { buildNativeEnv, buildPosixEnv, canonicalEnvKey, diffExportedEnv } from "./env.js";
-import { classify } from "./classifier.js";
+import { diffExportedEnv } from "./env.js";
 import { PolicyGate } from "./policy.js";
 import { NativeRegistry } from "./registry.js";
-import { runProcess, type InteractiveProcessController, type ProcessOutputEvent, type ProcessRunResult } from "./process.js";
+import type { InteractiveProcessController, ProcessOutputEvent, ProcessRunResult } from "./process.js";
 import { RuntimeManager } from "./runtime.js";
+import { parseStateReport, quotePosix, toMixedPath } from "./shell.js";
 import { isSafeExistingDirectory, normalizeVirtual } from "./path.js";
 import { SessionStateStore } from "./session.js";
 import { TraceRecorder, type TraceEvent } from "./trace.js";
+import {
+  COMMAND_CLASSIFIERS,
+  COMMAND_RESOLVERS,
+  EXECUTION_BACKENDS,
+  EXECUTION_HOOKS,
+  EXECUTION_PLANNERS,
+  type RuntimeCommandInput,
+} from "../plugins/contracts.js";
 import type {
   CommandCompletion,
   CommandKind,
   CommandOutcome,
+  ClassifiedCommand,
   ExecutionPlan,
   ExecutionPreview,
-  MountBootstrap,
   NativeExecutionPlan,
   ResolutionTemplate,
   SessionState,
@@ -53,195 +61,10 @@ import type {
   TerminalSize,
 } from "./types.js";
 
-/**
- * parseStateReport 成功解析 StateReport 后的结果：
- * - exitCode：用户命令的业务退出码（非报告写入状态）；
- * - cwd：报告回传的物理 pwd（Base64 解码后的 POSIX 虚拟路径）；
- * - exportedEnv：报告中 NUL 分隔的全量环境（键已做 Windows 大小写折叠）。
- */
-export interface ParsedStateReport {
-  exitCode: number;
-  cwd: string;
-  exportedEnv: Record<string, string>;
-}
-
-/**
- * 用 POSIX 单引号包裹任意字符串，确保嵌入 shell 脚本后不发生分词、展开或注入；
- * 单引号字面量用 '\'' 序列转义（关闭引号 + 转义后的单引号 + 重新开启引号）。
- */
-export function quotePosix(value: string): string {
-  return `'${value.replaceAll("'", "'\\''")}'`;
-}
-
-/**
- * 生成喂给 `bash --noprofile --norc -s`（stdin）的一次性包装脚本。
- *
- * 脚本按固定顺序分为六个阶段，失败阶段各有独立退出码，便于 Node 侧定位：
- *   1. set +e：关闭 errexit，各阶段失败由显式退出码表达；
- *   2. 定义并执行 __posixloom_mount：用 mount -f 逐项重建 MSYS 挂载视图（失败 exit 242）；
- *   3. 导出 POSIX 环境（export 本身不会失败，无独立退出码）；
- *   4. cd 进入虚拟 cwd（失败 exit 243，例如目录被并发删除）；
- *   5. 用户命令包在 __posixloom_user_command 函数中执行并捕获退出码；
- *   6. __posixloom_emit_report 把退出码、pwd -P（Base64）、env -0 全量环境写入
- *      $POSIXLOOM_STATE_REPORT_PATH（协议见 docs/protocols/state-report-v1.md）；
- *      报告失败 exit 240，成功则以用户命令退出码退出。
- *
- * 注意：脚本字符串属于 StateReport / 退出码协议的一部分，内容不得改动。
- */
-export function buildShellScript(plan: ShellExecutionPlan): string {
-  // __posixloom_mount：mount -f 把宿主目录绑定到 MSYS 虚拟路径；/tmp 特例容忍失败--
-  // MSYS/Cygwin 可能把 /tmp 提供为系统级固定挂载，无法按会话替换。
-  const mountFunction = [
-    "__posixloom_mount() {",
-    "  mount -f \"$1\" \"$2\" >/dev/null 2>&1 && return 0",
-    "  # MSYS/Cygwin may provide /tmp as a fixed system mount that cannot be replaced per session.",
-    "  [ \"$2\" = /tmp ] && [ -d /tmp ] && return 0",
-    "  return 1",
-    "}",
-  ].join("\n");
-  // 逐挂载点调用 __posixloom_mount：宿主路径先转混合路径（正斜杠），任一挂载失败立即
-  // exit 242，阻止用户命令在缺失挂载的视图下执行。
-  const mounts = plan.mountBootstrap.map((mount) =>
-    `__posixloom_mount ${quotePosix(toMixedPath(mount.hostPath))} ${quotePosix(mount.virtualPath)} || exit 242`,
-  ).join("\n");
-  // 导出 POSIX 环境；PWD 被刻意跳过--真实值应由下方 cd 之后由 bash 自行维护。
-  const exports = Object.entries(plan.envPosix)
-    .filter(([key]) => key !== "PWD")
-    .map(([key, value]) => `export ${key}=${quotePosix(value)}`)
-    .join("\n");
-  return [
-    // 阶段 1：关闭 errexit。
-    "set +e",
-    // 阶段 2：挂载函数定义 + 逐项挂载（失败 exit 242）。
-    mountFunction,
-    mounts,
-    // 阶段 3：导出环境。
-    exports,
-    // 阶段 4：进入虚拟 cwd（失败 exit 243）。
-    `cd -- ${quotePosix(plan.cwdVirtual)} || exit 243`,
-    // 阶段 5：用户命令包成函数整体解析后调用，退出码立即捕获到 __posixloom_command_code。
-    "__posixloom_user_command() {",
-    plan.commandBody,
-    "}",
-    "__posixloom_user_command",
-    "__posixloom_command_code=$?",
-    // 阶段 6：__posixloom_emit_report 收集并写入 StateReport--pwd -P 取物理路径做 Base64、
-    // env -0 取全量环境并统计字节数；任何一步失败函数返回非零。
-    "__posixloom_emit_report() {",
-    "  local __posixloom_code=\"$1\"",
-    "  local __posixloom_cwd64 __posixloom_env_bytes",
-    "  __posixloom_cwd64=\"$(pwd -P | tr -d '\\n' | base64 -w 0 2>/dev/null)\" || return 1",
-    "  __posixloom_env_bytes=\"$(env -0 | wc -c | tr -d '[:space:]')\" || return 1",
-    "  : > \"$POSIXLOOM_STATE_REPORT_PATH\" || return 1",
-    "  printf '__POSIXLOOM_REPORT_V1\\nexit-code=%s\\ncwd-b64=%s\\nenv-bytes=%s\\n' \"$__posixloom_code\" \"$__posixloom_cwd64\" \"$__posixloom_env_bytes\" > \"$POSIXLOOM_STATE_REPORT_PATH\"",
-    "  env -0 >> \"$POSIXLOOM_STATE_REPORT_PATH\" || return 1",
-    "  printf '__POSIXLOOM_REPORT_END\\n' >> \"$POSIXLOOM_STATE_REPORT_PATH\"",
-    "}",
-    // 报告成功 -> 透传用户命令退出码；报告失败 -> exit 240（与用户命令自身失败区分）。
-    "if __posixloom_emit_report \"$__posixloom_command_code\"; then exit \"$__posixloom_command_code\"; else exit 240; fi",
-    "",
-  ].join("\n");
-}
-
-/**
- * Windows 路径 -> MSYS "混合"路径（正斜杠形式）：
- * UNC 路径 \\server\share 映射为 //server/share，其余仅把反斜杠替换为正斜杠。
- * 反斜杠在 shell 中是转义字符，宿主路径必须先转成此形态才能安全嵌入脚本
- * （挂载源路径与 POSIXLOOM_STATE_REPORT_PATH 的值）。
- */
-function toMixedPath(path: string): string {
-  if (path.startsWith("\\\\")) return `//${path.slice(2).replaceAll("\\", "/")}`;
-  return path.replaceAll("\\", "/");
-}
-
-/**
- * 逐字节严格解析 StateReport v1（协议见 docs/protocols/state-report-v1.md）。
- *
- * 文件结构：__POSIXLOOM_REPORT_V1 头行 + exit-code/cwd-b64/env-bytes 三个元数据行 +
- * env-bytes 字节的 NUL 分隔 NAME=value 环境块 + __POSIXLOOM_REPORT_END 尾行。
- * 全部校验失败都抛 STATE_PROTOCOL_FAILED：头部/元数据标签不匹配、行截断、数值
- * 非安全整数或越界、环境块越过报告边界、尾标记缺失或存在尾随数据、cwd 非规范
- * Base64、cwd 或环境块非合法 UTF-8、环境键按 Windows 大小写折叠后冲突。
- * 调用方（shellCompletion）把这些异常转为 state=protocol-failed，会话状态保持不变。
- *
- * @param report StateReport 文件的原始字节
- * @returns 解析结果；报告为空（未产生，例如命令被 set -e/exit/exec 短路）时返回 undefined
- */
-export function parseStateReport(report: Buffer): ParsedStateReport | undefined {
-  const header = Buffer.from("__POSIXLOOM_REPORT_V1\n");
-  // 空报告 = 未产生，不算协议错误；与"产生了但内容非法"严格区分开。
-  if (!report.length) return undefined;
-  if (!report.subarray(0, header.length).equals(header)) throw new PosixLoomError("STATE_PROTOCOL_FAILED", "StateReport header is invalid");
-  let offset = header.length;
-  // 行读取器：定位下一个 \n 并推进游标；找不到换行说明报告被截断。
-  const readLine = (): string => {
-    const end = report.indexOf(0x0a, offset);
-    if (end < 0) throw new PosixLoomError("STATE_PROTOCOL_FAILED", "StateReport line is truncated");
-    const line = report.subarray(offset, end).toString("utf8");
-    offset = end + 1;
-    return line;
-  };
-  // 三行元数据：退出码 / Base64 cwd / 环境块字节数；标签必须逐字精确匹配。
-  const exitLine = readLine();
-  const cwdLine = readLine();
-  const bytesLine = readLine();
-  if (!exitLine.startsWith("exit-code=") || !cwdLine.startsWith("cwd-b64=") || !bytesLine.startsWith("env-bytes=")) {
-    throw new PosixLoomError("STATE_PROTOCOL_FAILED", "StateReport metadata labels are invalid");
-  }
-  const exitCode = Number(exitLine.slice("exit-code=".length));
-  const cwd64 = cwdLine.slice("cwd-b64=".length);
-  const envBytes = Number(bytesLine.slice("env-bytes=".length));
-  // 数值合法性：退出码必须落在 0..255；env-bytes 必须是非负安全整数且环境块
-  // 不得越过报告末尾（拒绝截断的环境数据，也让解析无需猜测 NUL 块边界）。
-  if (!Number.isSafeInteger(exitCode) || exitCode < 0 || exitCode > 255 || !Number.isSafeInteger(envBytes) || envBytes < 0 || offset + envBytes > report.length) {
-    throw new PosixLoomError("STATE_PROTOCOL_FAILED", "StateReport metadata is invalid");
-  }
-  const envBlock = report.subarray(offset, offset + envBytes);
-  offset += envBytes;
-  // 尾标记必须紧跟环境块，且其后不得有任何多余字节（防报告被拼接或篡改）。
-  const endMarker = Buffer.from("__POSIXLOOM_REPORT_END\n");
-  if (!report.subarray(offset, offset + endMarker.length).equals(endMarker)) {
-    throw new PosixLoomError("STATE_PROTOCOL_FAILED", "StateReport end marker is missing");
-  }
-  if (offset + endMarker.length !== report.length) throw new PosixLoomError("STATE_PROTOCOL_FAILED", "StateReport contains trailing data");
-  // cwd 必须是规范 Base64：先校验字符集与填充，再要求"解码后重编码"得到完全
-  // 相同的串（拒绝非规范编码，例如多余的填充位或非法长度）。
-  if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(cwd64)) {
-    throw new PosixLoomError("STATE_PROTOCOL_FAILED", "StateReport cwd is not canonical Base64");
-  }
-  const cwdBytes = Buffer.from(cwd64, "base64");
-  if (cwdBytes.toString("base64") !== cwd64) throw new PosixLoomError("STATE_PROTOCOL_FAILED", "StateReport cwd is not canonical Base64");
-  // 解码后的 cwd 字节必须是严格 UTF-8（fatal 模式，非法序列直接抛错）。
-  let cwd: string;
-  try {
-    cwd = new TextDecoder("utf-8", { fatal: true }).decode(cwdBytes);
-  } catch (error) {
-    throw new PosixLoomError("STATE_PROTOCOL_FAILED", "StateReport cwd is not valid UTF-8", { cause: String(error) });
-  }
-  // 逐条解析 NUL 分隔的环境条目；整个环境块也必须是严格 UTF-8。
-  const exportedEnv: Record<string, string> = {};
-  const sourceKeys = new Map<string, string>();
-  let envText: string;
-  try {
-    envText = new TextDecoder("utf-8", { fatal: true }).decode(envBlock);
-  } catch (error) {
-    throw new PosixLoomError("STATE_PROTOCOL_FAILED", "StateReport environment is not valid UTF-8", { cause: String(error) });
-  }
-  // 每条 NAME=value：键经 canonicalEnvKey 做 Windows 大小写折叠；折叠后冲突
-  //（同一 POSIX 环境出现 Windows 视角下无法区分的重复键）使整份报告失败。
-  for (const entry of envText.split("\0")) {
-    if (!entry) continue;
-    const equals = entry.indexOf("=");
-    if (equals <= 0) continue;
-    const sourceKey = entry.slice(0, equals);
-    const key = canonicalEnvKey(sourceKey);
-    const prior = sourceKeys.get(key);
-    if (prior) throw new PosixLoomError("STATE_PROTOCOL_FAILED", `StateReport environment keys are duplicated or collide on Windows: ${prior} / ${sourceKey}`);
-    sourceKeys.set(key, sourceKey);
-    exportedEnv[key] = entry.slice(equals + 1);
-  }
-  return { exitCode, cwd, exportedEnv };
-}
+/** Shell quoting and StateReport helpers remain public through the service API. */
+export { parseStateReport, quotePosix };
+export { buildShellScript } from "./shell.js";
+export type { ParsedStateReport } from "./shell.js";
 
 /**
  * execute 的公共参数。
@@ -299,15 +122,16 @@ interface PreparedExecution {
 /**
  * PosixLoomService -- PosixLoom 命令执行编排核心，把各模块串成完整执行管道。
  *
- * 持有并连接五个协作组件：
+ * 持有并连接插件微内核与状态/安全组件：
  * - RuntimeManager：运行时完整性校验、bash / Native Host 查找、挂载表、配置与快照；
  * - SessionStateStore：会话状态（cwd + exportedEnv + 乐观锁版本号）与串行 lane；
- * - NativeRegistry：simple 命令 -> Windows 原生可执行文件 + 适配器的解析；
+ * - PluginKernel：分类器、解析器、计划器、执行后端与只读 hook 的有序能力图；
+ * - NativeRegistry：由插件贡献合成的命令与 argv 适配器索引；
  * - PolicyGate：cwd 与可执行文件路径的策略断言（trusted / workspace-guard）；
  * - TraceRecorder：命令级 trace 的环形缓冲与可选落盘。
  *
  * 管道概览（executeOnce）：完整性预检 -> 会话快照与虚拟 cwd -> 策略与存在性检查
- * -> 命令分类 -> 模板解析（native 优先）-> native / shell 执行计划 -> runProcess
+ * -> 插件分类 -> 插件解析 -> 插件计划 -> 插件后端
  * -> StateReport 解析与会话提交 -> 完整性复检。
  */
 export class PosixLoomService {
@@ -383,11 +207,11 @@ export class PosixLoomService {
    *   1. 命令前运行时完整性断言（release 模式校验 manifest 与组件树，防篡改扩散）；
    *   2. 输入形态分派（argv / text）与空命令短路；
    *   3. 会话快照 -> 虚拟 cwd（请求覆盖优先）-> 宿主路径 -> 策略断言 -> 存在性检查；
-   *   4. 命令分类（argv 模式跳过分类，直接按 simple 处理）；
-   *   5. 解析 ResolutionTemplate（simple 命令先查 native 注册表，未命中回落 msys2）；
+   *   4. 按优先级咨询 classifier 插件；
+   *   5. 按优先级咨询 resolver 插件，得到 ResolutionTemplate；
    *   6. 校验超时并定位 Native Host（release 模式缺失即失败）；
-   *   7a. native 快路径：buildNativePlan -> runProcess -> nativeCompletion（状态不适用）；
-   *   7b. shell 路径：buildShellPlan -> runProcess（bash -s + stdin 脚本）->
+   *   7a. native 快路径：planner -> backend -> nativeCompletion（状态不适用）；
+   *   7b. shell 路径：planner -> backend（bash -s + stdin 脚本）->
    *       shellCompletion（解析 StateReport、交叉验证退出码、按策略提交会话补丁）；
    *   8. 命令后运行时完整性断言，然后返回完成结果。
    *
@@ -410,49 +234,33 @@ export class PosixLoomService {
     const prepared = await this.prepareExecution(options, statePolicy);
     await observer.onStarted?.(this.preview(prepared));
     const { plan } = prepared;
-
-    if (plan.mode === "native") {
-      const result = await runProcess({
-        program: plan.executable,
-        args: plan.argv,
-        cwd: plan.cwdHost,
-        env: plan.envHost,
-        timeoutMs: plan.timeoutMs,
-        cancelGraceMs: this.runtime.config.runtime.process.cancelGraceMs,
+    const backend = this.runtime.plugins.extensions(EXECUTION_BACKENDS).find((candidate) => candidate.mode === plan.mode);
+    if (!backend) {
+      throw new PosixLoomError("PLUGIN_CAPABILITY_MISSING", `No execution backend accepts ${plan.mode} plans`, { extensionPoint: EXECUTION_BACKENDS.id, mode: plan.mode });
+    }
+    const hookContext = { runtime: this.runtime, input: this.pluginInput(options), sessionId: options.sessionId };
+    try {
+      const result = await backend.execute({
+        plan,
+        runtime: this.runtime,
         hostPath: prepared.hostPath,
         signal: options.signal,
-        maxOutputBytes: this.runtime.config.runtime.process.maxOutputBytes,
         onOutput: observer.onOutput,
-        terminal: plan.terminal,
         interactive: options.interactive,
       });
       await this.runtime.assertRuntimeIntegrity("post-command");
-      return this.nativeCompletion(plan, result, prepared.reason, started);
+      for (const hook of this.runtime.plugins.extensions(EXECUTION_HOOKS)) {
+        await hook.afterExecute?.({ ...hookContext, plan, result });
+      }
+      return plan.mode === "native"
+        ? this.nativeCompletion(plan, result, prepared.reason, started)
+        : this.shellCompletion(plan, result, prepared.reason, started);
+    } catch (error) {
+      for (const hook of this.runtime.plugins.extensions(EXECUTION_HOOKS)) {
+        await hook.onError?.({ ...hookContext, error });
+      }
+      throw error;
     }
-
-    let result: ProcessRunResult;
-    try {
-      result = await runProcess({
-        program: plan.bashExecutable,
-        args: plan.terminal ? ["--noprofile", "--norc", "-c", buildShellScript(plan)] : ["--noprofile", "--norc", "-s"],
-        cwd: prepared.cwdHost,
-        env: plan.envPosix,
-        timeoutMs: plan.timeoutMs,
-        cancelGraceMs: this.runtime.config.runtime.process.cancelGraceMs,
-        input: plan.terminal ? undefined : buildShellScript(plan),
-        reportPath: plan.stateReportPath,
-        hostPath: prepared.hostPath,
-        signal: options.signal,
-        maxOutputBytes: this.runtime.config.runtime.process.maxOutputBytes,
-        onOutput: observer.onOutput,
-        terminal: plan.terminal,
-        interactive: options.interactive,
-      });
-    } finally {
-      rmSync(plan.stateReportPath, { force: true });
-    }
-    await this.runtime.assertRuntimeIntegrity("post-command");
-    return this.shellCompletion(plan, result, prepared.reason, started);
   }
 
   /** 运行完整预检并构建唯一的内部执行计划，供 explain 与 execute 共用。 */
@@ -463,23 +271,31 @@ export class PosixLoomService {
     if ((exactArgv && exactArgv.length === 0) || (!exactArgv && !raw?.trim())) {
       throw new PosixLoomError("COMMAND_EMPTY", "Cannot explain an empty command");
     }
+    const hookContext = { runtime: this.runtime, input: this.pluginInput(options), sessionId: options.sessionId };
+    for (const hook of this.runtime.plugins.extensions(EXECUTION_HOOKS)) await hook.beforePrepare?.(hookContext);
     const commandId = randomUUID();
     const state = this.sessions.snapshot(options.sessionId);
     const virtualCwd = options.cwd ?? state.cwd;
     const cwdHost = this.runtime.mountTable.toHost(virtualCwd);
     this.policy.assertCwd(virtualCwd, cwdHost);
     if (!existsSync(cwdHost)) throw new PosixLoomError("CWD_NOT_FOUND", `Working directory does not exist: ${virtualCwd}`, { cwdHost });
-    // 阶段 4：命令分类。argv 模式直接按 simple 处理（调用方已完成分词，不再让
-    // 文本分类器猜测）；text 模式交给 classify 识别 simple / builtin / shell 语法。
-    const classified = exactArgv
-      ? { kind: "simple" as const, argv: [...exactArgv], reason: "exact argv request" }
-      : classify(raw ?? "");
+    // 阶段 4：按优先级咨询分类器。内置 argv 插件精确保留参数边界；内置 text
+    // 插件识别 simple / builtin / shell-required / explicit-shell。
+    let classified: ClassifiedCommand | undefined;
+    for (const classifier of this.runtime.plugins.extensions(COMMAND_CLASSIFIERS)) {
+      classified = await classifier.classify({ input: hookContext.input });
+      if (classified) break;
+    }
+    if (!classified) {
+      throw new PosixLoomError("PLUGIN_CAPABILITY_MISSING", "No command classifier accepted the request", { extensionPoint: COMMAND_CLASSIFIERS.id, inputKind: hookContext.input.kind });
+    }
+    this.assertClassification(classified);
     // 命令身份：argv 模式用规范化 JSON、text 模式用原文，作为模板 ID 的哈希输入。
     const commandIdentity = exactArgv ? JSON.stringify({ argv: exactArgv }) : raw ?? "";
     // 命令体：argv 模式逐个单引号包裹后拼接（防注入），text 模式原样交给 bash。
     const commandBody = exactArgv ? exactArgv.map(quotePosix).join(" ") : raw ?? "";
     // 阶段 5：解析执行模板（simple 先查 native 注册表，未命中回落 MSYS2 bash）。
-    const template = this.resolveTemplate(commandIdentity, classified);
+    const template = await this.resolveTemplate(commandIdentity, classified);
     // 阶段 6：超时参数（非法值直接抛 TIMEOUT_INVALID）；定位 Native Host，
     // release Runtime 不允许缺失（不可回落到 Node 直接 spawn）。
     const timeoutMs = options.timeoutMs ?? this.runtime.config.runtime.process.defaultTimeoutMs;
@@ -487,13 +303,28 @@ export class PosixLoomService {
     const hostPath = this.runtime.findNativeHost();
     if (!hostPath && this.runtime.snapshot.manifest.mode === "release") throw new PosixLoomError("NATIVE_HOST_MISSING", "Release Runtime requires its packaged Native Host");
 
-    let plan: ExecutionPlan;
-    if (classified.kind === "simple" && template.backend === "native" && template.argv && template.executable) {
-      plan = this.buildNativePlan(commandId, options, state, statePolicy, template, virtualCwd, cwdHost, timeoutMs);
-    } else {
-      plan = this.buildShellPlan(commandId, options, commandBody, state, statePolicy, template, virtualCwd, cwdHost, timeoutMs);
-      this.policy.assertExecutable(plan.bashExecutable);
+    let plan: ExecutionPlan | undefined;
+    for (const planner of this.runtime.plugins.extensions(EXECUTION_PLANNERS)) {
+      plan = await planner.build({
+        commandId,
+        commandBody,
+        sessionId: options.sessionId,
+        envDelta: options.envDelta,
+        terminal: options.terminal,
+        state,
+        statePolicy,
+        template,
+        virtualCwd,
+        cwdHost,
+        timeoutMs,
+        runtime: this.runtime,
+        policy: this.policy,
+      });
+      if (plan) break;
     }
+    if (!plan) throw new PosixLoomError("PLUGIN_CAPABILITY_MISSING", `No execution planner accepted ${template.backend}`, { extensionPoint: EXECUTION_PLANNERS.id, backend: template.backend });
+    this.assertPlanInvariants(plan, { commandId, sessionId: options.sessionId, virtualCwd, cwdHost, timeoutMs, state, statePolicy });
+    for (const hook of this.runtime.plugins.extensions(EXECUTION_HOOKS)) await hook.afterPrepare?.({ ...hookContext, plan });
 
     return {
       plan,
@@ -505,6 +336,76 @@ export class PosixLoomService {
       sessionVersion: state.version,
       statePolicy,
     };
+  }
+
+  /** Convert the public request union to the immutable view consumed by classifiers and hooks. */
+  private pluginInput(options: ExecuteOptions): RuntimeCommandInput {
+    return options.kind === "argv"
+      ? { kind: "argv", argv: Object.freeze([...options.argv]) }
+      : { kind: "text", raw: options.raw };
+  }
+
+  /** Validate runtime values from trusted-but-fallible classifier plugins. */
+  private assertClassification(classified: ClassifiedCommand): void {
+    const kinds: readonly CommandKind[] = ["simple", "builtin", "shell-required", "explicit-shell"];
+    const argvValid = classified.argv === null
+      || (Array.isArray(classified.argv) && classified.argv.every((argument) => typeof argument === "string"));
+    if (!kinds.includes(classified.kind)
+      || typeof classified.reason !== "string"
+      || !classified.reason.trim()
+      || !argvValid
+      || (classified.kind === "simple" && (!classified.argv || classified.argv.length === 0))) {
+      throw new PosixLoomError("PLUGIN_CLASSIFICATION_INVALID", "Command classifier returned an invalid classification", { classified });
+    }
+  }
+
+  /** Keep identity, state, cwd, policy, and report-file invariants inside the microkernel. */
+  private assertPlanInvariants(plan: ExecutionPlan, expected: {
+    commandId: string;
+    sessionId: string;
+    virtualCwd: string;
+    cwdHost: string;
+    timeoutMs: number;
+    state: SessionState;
+    statePolicy: StatePolicy;
+  }): void {
+    const commonValid = plan.commandId === expected.commandId
+      && plan.sessionId === expected.sessionId
+      && plan.snapshotId === this.runtime.snapshot.snapshotId
+      && plan.timeoutMs === expected.timeoutMs
+      && plan.policyProfile === this.runtime.config.runtime.policy.defaultProfile
+      && plan.detached === false
+      && Boolean(plan.planId);
+    if (!commonValid) {
+      throw new PosixLoomError("PLUGIN_PLAN_INVALID", "Execution planner changed a microkernel-owned plan invariant", {
+        commandId: plan.commandId,
+        sessionId: plan.sessionId,
+        snapshotId: plan.snapshotId,
+      });
+    }
+    if (plan.mode === "native") {
+      if (plan.cwdHost !== expected.cwdHost) {
+        throw new PosixLoomError("PLUGIN_PLAN_INVALID", "Native planner changed the validated working directory", { expected: expected.cwdHost, actual: plan.cwdHost });
+      }
+      this.policy.assertExecutable(plan.executable);
+      return;
+    }
+    const expectedReport = join(this.runtime.config.dataRoot, "tmp", `posixloom-${expected.commandId}.report`);
+    if (plan.cwdVirtual !== expected.virtualCwd
+      || plan.baseStateVersion !== expected.state.version
+      || plan.statePolicy !== expected.statePolicy
+      || plan.stateReportPath !== expectedReport
+      || plan.envPosix.POSIXLOOM_STATE_REPORT_PATH !== toMixedPath(expectedReport)) {
+      throw new PosixLoomError("PLUGIN_PLAN_INVALID", "Shell planner changed a microkernel-owned state or path invariant", {
+        expectedCwd: expected.virtualCwd,
+        actualCwd: plan.cwdVirtual,
+      });
+    }
+    const expectedMounts = this.runtime.mountTable.entries.map((entry) => ({ virtualPath: entry.virtualPath, hostPath: entry.hostPath }));
+    if (JSON.stringify(plan.mountBootstrap) !== JSON.stringify(expectedMounts)) {
+      throw new PosixLoomError("PLUGIN_PLAN_INVALID", "Shell planner changed the validated mount table");
+    }
+    this.policy.assertExecutable(plan.bashExecutable);
   }
 
   /** 把内部计划裁剪成不含环境值、脚本文本与临时路径的公开预览。 */
@@ -548,125 +449,52 @@ export class PosixLoomService {
    * templateId = SHA-256(identity + 命令种类 + runtimeId + registryHash)：模板 ID
    * 绑定运行时与注册表版本，同一命令在不同版本下得到不同 ID，保证可观测性与审计安全。
    *
-   * - simple 命令先查 registry.resolve（argv[0] 为命令名，路径参数被适配器翻译）：
-   *   命中则用 native 后端，携带适配器翻译后的 argv、可执行文件与路径决策记录；
-   * - 未命中、或本就需要 shell（builtin / shell-required / explicit-shell）一律
-   *   回落 msys2 后端（adapterId 固定为 msys2-bash-v1，可执行文件为 null）。
+   * resolver 插件按优先级依次接受或跳过请求；内置 native resolver 先查注册表，
+   * 内置 MSYS2 resolver 以最低优先级兜底。返回模板必须绑定当前 templateId、
+   * runtimeId、registryHash 与 commandKind，否则由微内核拒绝。
    *
    * @param identity 命令身份（argv 的规范化 JSON 或原始文本）
    * @param classified 分类结果
    * @returns ResolutionTemplate（backend、templateId、argv、executable、pathDecisions 等）
    */
-  private resolveTemplate(identity: string, classified: ReturnType<typeof classify>): ResolutionTemplate {
-    const argv = classified.argv;
-    const templateId = createHash("sha256").update(JSON.stringify({ identity, kind: classified.kind, runtime: this.runtime.snapshot.runtimeId, registry: this.runtime.snapshot.registryHash })).digest("hex");
-    if (classified.kind === "simple" && argv?.length) {
-      const native = this.registry.resolve(argv[0], argv, this.runtime.snapshot, this.runtime.mountTable, this.policy);
-      if (native) {
-        return {
-          templateId,
-          runtimeId: this.runtime.snapshot.runtimeId,
-          registryHash: this.runtime.snapshot.registryHash,
-          commandKind: classified.kind,
-          backend: "native",
-          adapterId: native.descriptor.adapterId,
-          reason: `native registry hit: ${argv[0]}`,
-          argv: native.adapter.argv,
-          executable: native.executable,
-          shellEquivalent: native.descriptor.shellEquivalent,
-          pathDecisions: native.adapter.decisions,
-        };
+  private async resolveTemplate(identity: string, classified: ClassifiedCommand): Promise<ResolutionTemplate> {
+    const templateId = createHash("sha256").update(JSON.stringify({ identity, kind: classified.kind, runtime: this.runtime.snapshot.runtimeId, registry: this.runtime.snapshot.registryHash, plugins: this.runtime.snapshot.pluginsHash })).digest("hex");
+    for (const resolver of this.runtime.plugins.extensions(COMMAND_RESOLVERS)) {
+      const template = await resolver.resolve({
+        identity,
+        classified,
+        templateId,
+        runtime: this.runtime,
+        registry: this.registry,
+        policy: this.policy,
+      });
+      if (!template) continue;
+      if (template.templateId !== templateId || template.runtimeId !== this.runtime.snapshot.runtimeId || template.registryHash !== this.runtime.snapshot.registryHash || template.commandKind !== classified.kind) {
+        throw new PosixLoomError("PLUGIN_RESOLUTION_INVALID", `Resolver ${resolver.id} returned a template for a different command or runtime`, { resolverId: resolver.id });
       }
+      this.assertResolutionTemplate(template, resolver.id);
+      return template;
     }
-    return {
-      templateId,
-      runtimeId: this.runtime.snapshot.runtimeId,
-      registryHash: this.runtime.snapshot.registryHash,
-      commandKind: classified.kind,
-      backend: "msys2",
-      adapterId: "msys2-bash-v1",
-      reason: classified.kind === "simple" ? "native registry miss; use MSYS2" : classified.reason,
-      argv,
-      executable: null,
-      shellEquivalent: false,
-      pathDecisions: [],
-    };
+    throw new PosixLoomError("PLUGIN_CAPABILITY_MISSING", "No command resolver accepted the classified command", { extensionPoint: COMMAND_RESOLVERS.id, commandKind: classified.kind });
   }
 
-  /**
-   * 组装 NativeExecutionPlan：Windows 原生可执行文件直接执行（不经 bash）。
-   *
-   * - 环境由 buildNativeEnv 生成（宿主视角：HOME/TMP 指向 DataRoot、PWD 为宿主 cwd、
-   *   PATH 由运行时组件目录拼装）；
-   * - planId = SHA-256(commandId + templateId + cwdHost)，把结果与计划关联起来；
-   * - 模板不完整（缺可执行文件或 argv）抛 PLAN_INVALID；可执行文件还要过策略断言。
-   *
-   * statePolicy / virtualCwd 在 native 路径不参与状态管道（native 不回传 StateReport），
-   * 用 void 显式标记"有意未使用"。
-   */
-  private buildNativePlan(commandId: string, options: ExecuteOptions, state: SessionState, statePolicy: "isolated" | "cwd-env", template: ResolutionTemplate, virtualCwd: string, cwdHost: string, timeoutMs: number): NativeExecutionPlan {
-    if (!template.executable || !template.argv) throw new PosixLoomError("PLAN_INVALID", "Native template is incomplete");
-    const envHost = buildNativeEnv(state, options.envDelta, this.runtime.snapshot.runtimeRoot, this.runtime.config.dataRoot, cwdHost);
-    const pathDecisions = template.pathDecisions;
-    void statePolicy;
-    void virtualCwd;
-    this.policy.assertExecutable(template.executable);
-    return {
-      mode: "native",
-      planId: createHash("sha256").update(`${commandId}:${template.templateId}:${cwdHost}`).digest("hex"),
-      commandId,
-      sessionId: options.sessionId,
-      snapshotId: this.runtime.snapshot.snapshotId,
-      timeoutMs,
-      detached: false,
-      policyProfile: this.runtime.config.runtime.policy.defaultProfile,
-      terminal: options.terminal ? { ...options.terminal } : undefined,
-      executable: template.executable,
-      argv: template.argv.slice(1),
-      cwdHost,
-      envHost,
-      pathDecisions,
-    };
-  }
-
-  /**
-   * 组装 ShellExecutionPlan：经 MSYS2 bash 执行的命令包装计划。
-   *
-   * - 定位 bash 可执行文件（找不到抛 BASH_NOT_FOUND）；
-   * - mountBootstrap：运行时挂载表全部条目，供脚本内逐项 mount -f 重建挂载视图；
-   * - envPosix：POSIX 视角环境（HOME=/home、TMP=/tmp、PWD=虚拟 cwd、PATH 以
-   *   /posixloom/bin:/usr/bin 前缀，并通过 MSYS2_ARG_CONV_EXCL 等禁用 MSYS 路径转换），
-   *   另注入 POSIXLOOM_STATE_REPORT_PATH（DataRoot/tmp/posixloom-<commandId>.report 的混合路径）
-   *   告诉脚本 StateReport 写到哪里；
-   * - baseStateVersion 记录计划生成时的会话版本，供提交阶段做乐观锁校验。
-   */
-  private buildShellPlan(commandId: string, options: ExecuteOptions, commandBody: string, state: SessionState, statePolicy: "isolated" | "cwd-env", template: ResolutionTemplate, virtualCwd: string, cwdHost: string, timeoutMs: number): ShellExecutionPlan {
-    const bash = this.runtime.findBash();
-    if (!bash) throw new PosixLoomError("BASH_NOT_FOUND", "MSYS2 Bash was not found; set POSIXLOOM_BASH or install a release Runtime");
-    const mounts: MountBootstrap[] = this.runtime.mountTable.entries.map((entry) => ({ virtualPath: entry.virtualPath, hostPath: entry.hostPath }));
-    const envPosix = buildPosixEnv(state, options.envDelta, this.runtime.snapshot.runtimeRoot, this.runtime.config.dataRoot, virtualCwd);
-    const stateReportPath = join(this.runtime.config.dataRoot, "tmp", `posixloom-${commandId}.report`);
-    envPosix.POSIXLOOM_STATE_REPORT_PATH = toMixedPath(stateReportPath);
-    void cwdHost;
-    return {
-      mode: "shell",
-      planId: createHash("sha256").update(`${commandId}:${template.templateId}:${virtualCwd}`).digest("hex"),
-      commandId,
-      sessionId: options.sessionId,
-      snapshotId: this.runtime.snapshot.snapshotId,
-      timeoutMs,
-      detached: false,
-      policyProfile: this.runtime.config.runtime.policy.defaultProfile,
-      terminal: options.terminal ? { ...options.terminal } : undefined,
-      bashExecutable: bash,
-      commandBody,
-      cwdVirtual: virtualCwd,
-      envPosix,
-      baseStateVersion: state.version,
-      statePolicy,
-      mountBootstrap: mounts,
-      stateReportPath,
-    };
+  private assertResolutionTemplate(template: ResolutionTemplate, resolverId: string): void {
+    const argvValid = template.argv === null
+      || (Array.isArray(template.argv) && template.argv.every((argument) => typeof argument === "string"));
+    const commonValid = (template.backend === "native" || template.backend === "msys2")
+      && typeof template.adapterId === "string"
+      && Boolean(template.adapterId)
+      && typeof template.reason === "string"
+      && Boolean(template.reason.trim())
+      && typeof template.shellEquivalent === "boolean"
+      && Array.isArray(template.pathDecisions)
+      && argvValid;
+    const backendValid = template.backend === "native"
+      ? typeof template.executable === "string" && Boolean(template.executable) && Array.isArray(template.argv) && template.argv.length > 0
+      : template.executable === null;
+    if (!commonValid || !backendValid) {
+      throw new PosixLoomError("PLUGIN_RESOLUTION_INVALID", `Resolver ${resolverId} returned a malformed template`, { resolverId, backend: template.backend });
+    }
   }
 
   /**

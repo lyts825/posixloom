@@ -51,8 +51,9 @@ posixloom trace list --limit 50
 posixloom trace list --limit 50 --json
 ```
 
-`runtime info` reports the immutable snapshot id, Runtime source and mode, mounts,
-policy profile, resolved Bash and Native Host paths, and Native Fast Path commands.
+`runtime info` reports the immutable snapshot and plugin-graph hashes, Runtime source
+and mode, mounts, policy profile, resolved Bash and Native Host paths, Native Fast
+Path commands, and a data-only inventory of active runtime plugins.
 
 `trace list` reads the tail of `<DataRoot>/logs/posixloom-trace.jsonl`. Persistent trace
 recording is disabled by default; enable `observability.writeTraceFile` in the user

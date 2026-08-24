@@ -12,14 +12,13 @@ PosixLoom 不是 Linux Kernel、系统调用模拟器或完整虚拟机。它根
 CLI / Harness
     │
     ▼
-TypeScript 控制面（分类、路径、环境、会话、策略）
+插件微内核（依赖、生命周期、扩展点、回滚）
     │
-    ├── 简单且已验证的命令 ──→ Windows Native Fast Path
+    ├── descriptor / adapter / classifier / resolver / planner / backend 插件
+    │       ├── 简单且已验证的命令 ──→ Windows Native Fast Path
+    │       └── 脚本、管道与 Shell 语义 ──→ Minimal MSYS2 Bash
     │
-    └── 脚本、管道与 Shell 语义 ──→ Minimal MSYS2 Bash
-                                      │
-                                      ▼
-                          Windows 文件系统与进程模型
+    └── 不可替换安全根：Runtime 完整性、策略、会话 CAS、StateReport 提交
 ```
 
 核心能力：
@@ -34,6 +33,7 @@ TypeScript 控制面（分类、路径、环境、会话、策略）
 - 以不可变 Runtime、组件锁文件、Ed25519 Feed 和事务切换实现可复现更新。
 - 提供可独立部署的浏览器 GUI 与带 Bearer 鉴权、CORS 白名单、NDJSON 流输出的远程 HTTP API。
 - 提供声明式插件市场；插件安装只落盘经过校验的命令清单，不加载或执行第三方 JavaScript。
+- 以内置与自定义能力共用的 `RuntimePlugin` 协议组合命令流水线，支持依赖排序、优先级、事务激活和逆序清理。
 
 ## 快速开始
 
@@ -114,7 +114,7 @@ npm run posixloom -- plugin run workspace-inspector git-status
 | `src/core/` | 分类、路径、环境、会话、执行、策略、更新等核心逻辑 |
 | `src/http/` | 独立 HTTP/JSON 适配器与通用扩展端口（不引用 GUI/插件实现） |
 | `src/gui/` | 独立静态 GUI 服务与浏览器资源（只接收 API URL） |
-| `src/plugins/` | 声明式插件目录、校验、安装与查询（不引用 HTTP/GUI） |
+| `src/plugins/` | 插件微内核、执行扩展点、第一方能力插件，以及数据型市场插件 |
 | `src/composition/` | 显式的可选跨组件适配器；隔离组合知识 |
 | `native/posixloom-host/` | Rust Native Host 与 Windows Job Object 集成 |
 | `config/` | 默认运行时配置 |
@@ -133,12 +133,13 @@ npm run posixloom -- plugin run workspace-inspector git-status
 - [配置与诊断](docs/guides/configuration.md)：有效配置、运行时摘要与 trace 查询。
 - [GUI 与远程服务](docs/guides/gui-http.md)：分离部署、鉴权、CORS 与启动方式。
 - [插件市场](docs/guides/plugins.md)：清单模型、远程目录、安装和运行边界。
+- [一切皆插件架构](docs/guides/plugin-architecture.md)：微内核、扩展点、生命周期、示例与信任边界。
 - [发布与更新指南](docs/guides/release.md)：组件供应链、Runtime 组装、签名和验证。
 - [HTTP API v1](docs/protocols/http-v1.md)、[控制协议 v1](docs/protocols/control-v1.md) 与 [StateReport v1](docs/protocols/state-report-v1.md)。
 
 ## 当前边界
 
-项目目前处于 `0.1.0` 开发阶段，目标平台为 Windows 10/11 x64。Session 仅在当前服务进程内保存，进程退出后不会恢复；配置中的历史字段 `session.persistAcrossRestart: true` 会被明确拒绝。HTTP 服务自身不终止 TLS，跨机器或公网使用时应置于 HTTPS 反向代理之后。插件是声明式命令包而非进程内代码扩展，运行插件命令仍受常规策略约束。默认策略提供的是防误操作 Guardrail，不是针对恶意本地代码的 OS 级安全沙箱。发布前应执行完整门禁：
+项目目前处于 `0.1.0` 开发阶段，目标平台为 Windows 10/11 x64。Session 仅在当前服务进程内保存，进程退出后不会恢复；配置中的历史字段 `session.persistAcrossRestart: true` 会被明确拒绝。HTTP 服务自身不终止 TLS，跨机器或公网使用时应置于 HTTPS 反向代理之后。市场插件是不会自动加载代码的声明式命令包；进程内 `RuntimePlugin` 只能由宿主显式注入，必须视为与宿主等权的可信代码。默认策略提供的是防误操作 Guardrail，不是针对恶意本地代码的 OS 级安全沙箱。发布前应执行完整门禁：
 
 ```powershell
 npm run verify

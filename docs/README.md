@@ -5,6 +5,7 @@
 - [配置与诊断](guides/configuration.md)：配置路径、执行计划预览、运行时摘要与 trace。
 - [GUI 与远程 HTTP](guides/gui-http.md)：独立组件、组合启动、鉴权、CORS 与远程部署。
 - [插件市场](guides/plugins.md)：声明式清单、目录发现、安装与显式运行。
+- [一切皆插件架构](guides/plugin-architecture.md)：运行时插件内核、扩展点、生命周期与安全边界。
 - [发布与更新指南](guides/release.md)：组件同步、Runtime 组装、签名和验证。
 - [HTTP API v1](protocols/http-v1.md)：远程会话、执行、流输出及扩展端点。
 - [Control protocol v1](protocols/control-v1.md)：Harness 与 `posixloom serve --stdio` 之间的长度前缀 JSON 协议。

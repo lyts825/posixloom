@@ -33,6 +33,8 @@ test("diagnostic CLI exposes explain, config validation, runtime info and trace 
 
   const runtime = runJson(["runtime", "info", "--json"]);
   assert.equal(typeof runtime.snapshotId, "string");
+  assert.equal(typeof runtime.pluginsHash, "string");
+  assert.equal(runtime.plugins.some((plugin: any) => plugin.id === "core.backend.native" && plugin.state === "active"), true);
   assert.equal(runtime.nativeCommands.includes("node"), true);
 
   const traces = runJson(["trace", "list", "--limit", "2", "--json"]);

@@ -16,7 +16,7 @@
  *   entrypoint SHA-256 与整树哈希（每文件 SHA-256 按路径排序串联后再哈希），
  *   任何偏差都按 FAIL 处理。
  * - 为什么快照不可变：snapshotId 由 runtimeId、manifest 哈希、注册表哈希、
- *   挂载表哈希、策略哈希五路输入共同合成。会话、状态上报与更新器据此判断
+ *   插件图哈希、挂载表哈希、策略哈希六路输入共同合成。会话、状态上报与更新器据此判断
  *   "当前环境是否仍是启动时的那个环境"，避免环境漂移导致行为不可复现或越权。
  * - 为什么命令边界复验完整性：bash 命令本身有能力改写运行时目录，而 fs.watch
  *   的事件既不保证送达也不保证及时，因此监听器只承担"未变"的快路径；脏标记
@@ -34,7 +34,10 @@ import { basename, dirname, join, resolve, sep } from "node:path";
 import { isSafeRuntimeId, loadConfig, type LoadedConfig } from "./config.js";
 import { PosixLoomError } from "./errors.js";
 import { MountTable } from "./path.js";
-import { DEFAULT_REGISTRY, NativeRegistry } from "./registry.js";
+import { NativeRegistry } from "./registry.js";
+import { createBuiltinRuntimePlugins } from "../plugins/builtins.js";
+import { NATIVE_COMMAND_ADAPTERS, NATIVE_COMMANDS } from "../plugins/contracts.js";
+import { PluginKernel, type RuntimePlugin } from "../plugins/kernel.js";
 import type { HostPath, RuntimeComponentManifest, RuntimeInfo, RuntimeManifest, RuntimeSnapshot } from "./types.js";
 
 /** release Runtime 必须全部声明并标记为 required 的基础环境组件清单。 */
@@ -473,12 +476,14 @@ export function validateRuntimeManifest(value: unknown, runtimeRoot: string): Do
 export class RuntimeManager {
   /** 已加载的 PosixLoom 配置（含策略、挂载表与更新设置）。 */
   readonly config: LoadedConfig;
-  /** 内置命令注册表（DEFAULT_REGISTRY），创建时已通过 validate() 校验。 */
+  /** 由插件贡献合成的命令注册表，创建时已通过 validate() 校验。 */
   readonly registry: NativeRegistry;
   /** 运行时路径挂载表（工作区路径 <-> Runtime 路径）。 */
   readonly mountTable: MountTable;
   /** 启动时合成的不可变运行时快照（含 snapshotId 与 manifest）。 */
   readonly snapshot: RuntimeSnapshot;
+  /** Activated capability graph used by runtime loading and command execution. */
+  readonly plugins: PluginKernel;
   /** 是否处于恢复模式（指针/manifest/深度校验任一异常时为 true）。 */
   readonly recoveryRequired: boolean;
   /** 恢复模式下收集的启动诊断项，doctor() 会原样透出。 */
@@ -491,11 +496,12 @@ export class RuntimeManager {
   private integrityWatcher?: FSWatcher;
 
   /** 私有构造：仅在 create() 完成加载与校验后调用。 */
-  private constructor(config: LoadedConfig, registry: NativeRegistry, snapshot: RuntimeSnapshot, recoveryChecks: DoctorCheck[], recoveryRequired: boolean) {
+  private constructor(config: LoadedConfig, registry: NativeRegistry, snapshot: RuntimeSnapshot, recoveryChecks: DoctorCheck[], recoveryRequired: boolean, plugins: PluginKernel) {
     this.config = config;
     this.registry = registry;
     this.mountTable = new MountTable(config.runtime.mounts);
     this.snapshot = snapshot;
+    this.plugins = plugins;
     this.recoveryChecks = recoveryChecks;
     this.recoveryRequired = recoveryRequired;
     // fs.watch 完整性监听：release 且未损坏时对 runtimeRoot 做递归目录监听，
@@ -516,13 +522,13 @@ export class RuntimeManager {
   /**
    * 加载并校验当前 Runtime，构造 RuntimeManager 实例。
    *
-   * 流程：loadConfig -> 校验内置注册表 -> 读取 manifest.json -> 校验 manifest
+   * 流程：loadConfig -> 激活插件图并校验其注册表 -> 读取 manifest.json -> 校验 manifest
    * 与指针身份一致 -> validateRuntimeManifest 深度校验 -> 合成 snapshotId ->
    * 构造实例（release 且未损坏时附加目录监听）。
    *
    * 错误码（严格模式下直接抛出；options.allowInvalidRuntime 为 true 时改为
    * 收集到 recoveryChecks 并进入恢复模式，供 posixloom doctor 等诊断场景）：
-   * - REGISTRY_INVALID：内置注册表条目非法（来自 registry.validate()）；
+   * - REGISTRY_INVALID：插件贡献的注册表条目或适配器非法（来自 registry.validate()）；
    * - RUNTIME_ID_INVALID：指针指向的 runtimeId 不合法；
    * - MANIFEST_INVALID：manifest 无法解析或不是 JSON 对象；
    * - RUNTIME_MANIFEST_MISSING：非开发源却找不到 manifest；
@@ -534,9 +540,23 @@ export class RuntimeManager {
    * @param options.allowInvalidRuntime 允许坏 manifest/坏指针启动（诊断与恢复用）
    * @returns 校验通过的 RuntimeManager 实例（或恢复模式实例）
    */
-  static async create(runRoot: string, options: { allowInvalidRuntime?: boolean } = {}): Promise<RuntimeManager> {
+  static async create(runRoot: string, options: {
+    allowInvalidRuntime?: boolean;
+    /** Trusted in-process plugins. Data-only marketplace packs are not loaded here. */
+    plugins?: readonly RuntimePlugin[];
+    /** Advanced embedding option for constructing a completely custom capability graph. */
+    includeBuiltinPlugins?: boolean;
+  } = {}): Promise<RuntimeManager> {
     const config = await loadConfig(runRoot, { allowInvalidRuntimePointer: options.allowInvalidRuntime });
-    const registry = new NativeRegistry(DEFAULT_REGISTRY);
+    const plugins = new PluginKernel([
+      ...(options.includeBuiltinPlugins === false ? [] : createBuiltinRuntimePlugins()),
+      ...(options.plugins ?? []),
+    ]);
+    await plugins.start();
+    const registry = new NativeRegistry(
+      [...plugins.extensions(NATIVE_COMMANDS)],
+      [...plugins.extensions(NATIVE_COMMAND_ADAPTERS)],
+    );
     registry.validate();
     const runtimeId = config.runtimeId;
     const runtimeRoot = config.runtimeRoot;
@@ -596,20 +616,22 @@ export class RuntimeManager {
     if (failures.length && !options.allowInvalidRuntime) {
       throw new PosixLoomError("RUNTIME_VALIDATION_FAILED", "Selected Runtime failed startup validation", { runtimeId, failures });
     }
-    // 四路内容哈希合成 snapshotId：runtimeId + manifest 哈希 + 注册表哈希 +
-    // 挂载表哈希 + 策略哈希。任一路变化都会改变快照身份，供会话与状态上报
+    // 五路内容哈希合成 snapshotId：runtimeId + manifest 哈希 + 注册表哈希 +
+    // 插件图哈希 + 挂载表哈希 + 策略哈希。任一路变化都会改变快照身份，供会话与状态上报
     // 判断运行环境是否漂移；快照一经构造即不可变。
     const mountsHash = hashText(JSON.stringify(config.runtime.mounts));
     const policyHash = hashText(JSON.stringify(config.runtime.policy));
     const registryHash = registry.hash();
+    const pluginsHash = hashText(JSON.stringify(plugins.inspect().map(({ id, version, requires, provides }) => ({ id, version, requires, provides }))));
     const runtimeManifestHash = hashText(JSON.stringify(manifest));
-    const snapshotId = hashText(JSON.stringify({ runtimeId, runtimeManifestHash, registryHash, mountsHash, policyHash }));
+    const snapshotId = hashText(JSON.stringify({ runtimeId, runtimeManifestHash, registryHash, pluginsHash, mountsHash, policyHash }));
     const snapshot: RuntimeSnapshot = {
       snapshotId,
       runtimeId,
       runtimeRoot: resolve(runtimeRoot),
       runtimeManifestHash,
       registryHash,
+      pluginsHash,
       mountsHash,
       policyHash,
       manifest,
@@ -622,7 +644,7 @@ export class RuntimeManager {
       || failures.length > 0
       || manifest.runtimeId !== runtimeId
       || manifest.mode !== expectedMode;
-    return new RuntimeManager(config, registry, snapshot, recoveryChecks, recoveryRequired);
+    return new RuntimeManager(config, registry, snapshot, recoveryChecks, recoveryRequired, plugins);
   }
 
   /**
@@ -698,6 +720,7 @@ export class RuntimeManager {
       mode: this.snapshot.manifest.mode,
       source: this.snapshot.source,
       snapshotId: this.snapshot.snapshotId,
+      pluginsHash: this.snapshot.pluginsHash,
       runtimeRoot: this.snapshot.runtimeRoot,
       dataRoot: this.config.dataRoot,
       workspace: this.config.workspace,
@@ -706,6 +729,7 @@ export class RuntimeManager {
       bash: this.findBash(),
       nativeHost: this.findNativeHost(),
       nativeCommands: this.registry.list().map((descriptor) => descriptor.name).sort(),
+      plugins: this.plugins.inspect(),
       recoveryRequired: this.recoveryRequired,
     };
   }
@@ -820,6 +844,11 @@ export class RuntimeManager {
     if (nativeHost) add("native-host", "PASS", "Native Host found", { path: nativeHost });
     else add("native-host", this.snapshot.manifest.mode === "release" ? "FAIL" : "WARN", this.snapshot.manifest.mode === "release" ? "Release Native Host is missing" : "Native Host not built; Node process fallback will be used");
     add("mounts", "PASS", "Mount table loaded", { mounts: this.mountTable.entries });
+    const pluginInventory = this.plugins.inspect();
+    const inactivePlugins = pluginInventory.filter((plugin) => plugin.state !== "active");
+    add("plugins", inactivePlugins.length ? "FAIL" : "PASS", inactivePlugins.length
+      ? `${inactivePlugins.length} runtime plugin(s) are not active`
+      : `${pluginInventory.length} runtime plugins active`, { plugins: pluginInventory });
     const profile = this.config.runtime.policy.profiles[this.config.runtime.policy.defaultProfile];
     add("policy", profile ? "PASS" : "FAIL", profile ? `Default policy: ${this.config.runtime.policy.defaultProfile} (${profile.mode})` : "Default policy profile is missing");
     // 非 dev 来源（或 release manifest）启用更新时必须强制签名校验，

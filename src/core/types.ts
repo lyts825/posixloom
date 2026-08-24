@@ -29,8 +29,8 @@
  *    拒绝"可逐条复核，也是策略拒绝错误的 details 来源。
  *
  * 4. RuntimeSnapshot 不可变
- *    snapshotId 由 runtimeId + manifestHash + registryHash + mountsHash +
- *    policyHash 五要素复合哈希合成；任一要素变化都会得到全新的快照 id。
+ *    snapshotId 由 runtimeId + manifestHash + registryHash + pluginsHash +
+ *    mountsHash + policyHash 六要素复合哈希合成；任一要素变化都会得到全新的快照 id。
  *    ExecutionPlan 携带 snapshotId 即锁定"计划基于哪份运行时指纹生成"，
  *    命令执行期间的运行时热更新 / 篡改因此可被精确检测。
  *
@@ -231,13 +231,13 @@ export interface RuntimeManifest {
 
 /**
  * 运行时快照：不可变的运行时指纹。为什么不可变——snapshotId 是五要素
- * （runtimeId + manifestHash + registryHash + mountsHash + policyHash）的
+ * （runtimeId + manifestHash + registryHash + pluginsHash + mountsHash + policyHash）的
  * 复合哈希，组件、注册表、挂载、策略任一变化都会生成全新快照；计划与命令
  * 绑定 snapshotId 后即可检测"计划生成之后运行时是否被热更新或篡改"，保证
  * 审计链可追溯。
  */
 export interface RuntimeSnapshot {
-  /** 五要素复合 SHA-256 指纹（由 runtime.ts 在装载运行时时合成）。 */
+  /** 六要素复合 SHA-256 指纹（由 runtime.ts 在装载运行时时合成）。 */
   snapshotId: string;
   /** 运行时标识（同 RuntimeManifest.runtimeId）。 */
   runtimeId: string;
@@ -247,6 +247,8 @@ export interface RuntimeSnapshot {
   runtimeManifestHash: string;
   /** 原生命令注册表哈希。 */
   registryHash: string;
+  /** 已激活插件身份、版本、依赖与扩展点声明的哈希。 */
+  pluginsHash: string;
   /** 挂载表哈希。 */
   mountsHash: string;
   /** 策略配置哈希。 */
@@ -265,6 +267,7 @@ export interface RuntimeInfo {
   mode: "development" | "release";
   source: RuntimeSnapshot["source"];
   snapshotId: string;
+  pluginsHash: string;
   runtimeRoot: HostPath;
   dataRoot: HostPath;
   workspace: HostPath;
@@ -273,6 +276,15 @@ export interface RuntimeInfo {
   bash?: HostPath;
   nativeHost?: HostPath;
   nativeCommands: string[];
+  /** Activated in-process capability plugins; functions and private state are never exposed. */
+  plugins: Array<{
+    id: string;
+    version: string;
+    description: string;
+    requires: string[];
+    provides: string[];
+    state: "registered" | "active" | "stopped" | "failed";
+  }>;
   recoveryRequired: boolean;
 }
 
@@ -352,11 +364,11 @@ export interface NativeCommandDescriptor {
 /**
  * 命令解析模板（service.ts 的 resolveTemplate 产物）：把"命令分类 + 运行时
  * 指纹 + 注册表命中情况"固化为一个可缓存、可哈希（templateId）的中间结论，
- * 再据此构建具体 ExecutionPlan。缓存有效的前提是 runtimeId 与 registryHash
- * 均未变化。
+ * 再据此构建具体 ExecutionPlan。templateId 还绑定 RuntimeSnapshot.pluginsHash，
+ * 缓存有效的前提是 runtimeId、registryHash 与插件图均未变化。
  */
 export interface ResolutionTemplate {
-  /** 模板指纹（由调用方身份、命令分类、runtimeId、registryHash 哈希合成），可作缓存键。 */
+  /** 模板指纹（由调用方身份、命令分类、runtimeId、registryHash、pluginsHash 合成），可作缓存键。 */
   templateId: string;
   /** 解析所基于的运行时 id。 */
   runtimeId: string;

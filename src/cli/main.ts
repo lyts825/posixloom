@@ -383,7 +383,7 @@ async function main(): Promise<void> {
   }
   // version 短路：版本串硬编码，避免为拿版本号而加载运行时。
   if (args[0] === "version" || args[0] === "--version") {
-    console.log("posixloom 0.1.0-dev (PosixLoom Runtime; architecture v1.8)");
+    console.log("posixloom 0.1.0-dev (PosixLoom Runtime; architecture v2.0 plugin kernel)");
     return;
   }
 
@@ -488,6 +488,7 @@ async function main(): Promise<void> {
     else {
       console.log(`Runtime: ${info.runtimeId} ${info.runtimeSemver} (${info.mode}/${info.source})`);
       console.log(`Snapshot: ${info.snapshotId}`);
+      console.log(`Plugin graph: ${info.pluginsHash}`);
       console.log(`Runtime root: ${info.runtimeRoot}`);
       console.log(`Data root: ${info.dataRoot}`);
       console.log(`Workspace: ${info.workspace}`);
@@ -495,6 +496,7 @@ async function main(): Promise<void> {
       console.log(`Bash: ${info.bash ?? "not found"}`);
       console.log(`Native Host: ${info.nativeHost ?? "not found"}`);
       console.log(`Native commands: ${info.nativeCommands.join(", ") || "none"}`);
+      console.log(`Plugins: ${info.plugins.length} (${info.plugins.filter((plugin) => plugin.state === "active").length} active) - ${info.plugins.map((plugin) => plugin.id).join(", ") || "none"}`);
     }
     return;
   }

@@ -30,9 +30,15 @@ import { PolicyGate } from "./policy.js";
 import type { HostPath, NativeCommandDescriptor, PathDecision, PathIntent, RuntimeSnapshot } from "./types.js";
 
 /** 适配器统一返回结构：翻译改写后的 argv，以及逐参数记录的路径翻译决策（PathDecision）。 */
-interface AdapterResult {
+export interface AdapterResult {
   argv: string[];
   decisions: PathDecision[];
+}
+
+/** A pluggable argv adapter used by one or more native command descriptors. */
+export interface NativeCommandAdapter {
+  id: string;
+  adapt(argv: string[], table: MountTable, gate: PolicyGate): AdapterResult;
 }
 
 /**
@@ -75,6 +81,9 @@ function resolveExecutable(descriptor: NativeCommandDescriptor, snapshot: Runtim
     const candidate = join(snapshot.runtimeRoot, descriptor.executable.slice("$RUNTIME_ROOT/".length));
     if (existsSync(candidate)) return candidate;
   }
+  // Trusted embedding plugins may point at an explicit host executable. Release
+  // policy still rejects paths outside RuntimeRoot in PolicyGate.assertExecutable.
+  if (isAbsolute(descriptor.executable) && existsSync(descriptor.executable)) return descriptor.executable;
   if (snapshot.manifest.mode === "release") return undefined;
   return findOnPath(descriptor.name);
 }
@@ -367,6 +376,16 @@ export const DEFAULT_REGISTRY: NativeCommandDescriptor[] = [
   { name: "node", executable: "$RUNTIME_ROOT/node/node.exe", adapterId: "node-v1", shellEquivalent: false },
 ];
 
+/** Built-in adapters are contributions just like third-party native tool adapters. */
+export const DEFAULT_NATIVE_ADAPTERS: NativeCommandAdapter[] = [
+  { id: "git-v1", adapt: gitAdapter },
+  { id: "rg-v1", adapt: rgAdapter },
+  { id: "node-v1", adapt: nodeAdapter },
+];
+
+const NATIVE_COMMAND_NAME = /^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$/;
+const NATIVE_ADAPTER_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+
 /**
  * 原生命令注册表。
  *
@@ -377,12 +396,26 @@ export const DEFAULT_REGISTRY: NativeCommandDescriptor[] = [
  * - validate()：运行时加载阶段的注册表自检，拦截不合法配置。
  */
 export class NativeRegistry {
+  private readonly descriptors: readonly NativeCommandDescriptor[];
+  private readonly adapters: readonly NativeCommandAdapter[];
+
   /** @param descriptors 注册表条目，默认使用 DEFAULT_REGISTRY；允许注入便于测试。 */
-  constructor(private readonly descriptors = DEFAULT_REGISTRY) {}
+  constructor(
+    descriptors: readonly NativeCommandDescriptor[] = DEFAULT_REGISTRY,
+    adapters: readonly NativeCommandAdapter[] = DEFAULT_NATIVE_ADAPTERS,
+  ) {
+    this.descriptors = Object.freeze(descriptors.map((descriptor) => Object.freeze({ ...descriptor })));
+    this.adapters = Object.freeze(adapters.map((adapter) => Object.freeze({ id: adapter.id, adapt: adapter.adapt })));
+  }
 
   /** 返回注册表条目的防御性副本，供 runtime info 等只读诊断接口使用。 */
   list(): NativeCommandDescriptor[] {
     return this.descriptors.map((descriptor) => ({ ...descriptor }));
+  }
+
+  /** Return adapter ids without exposing executable adapter functions. */
+  listAdapters(): string[] {
+    return this.adapters.map((adapter) => adapter.id);
   }
 
   /**
@@ -392,7 +425,7 @@ export class NativeRegistry {
    * 基于旧注册表的解析结果。
    */
   hash(): string {
-    return Buffer.from(JSON.stringify(this.descriptors)).toString("base64url");
+    return Buffer.from(JSON.stringify({ descriptors: this.descriptors, adapters: this.adapters.map((adapter) => adapter.id) })).toString("base64url");
   }
 
   /**
@@ -425,14 +458,27 @@ export class NativeRegistry {
     const executable = resolveExecutable(descriptor, snapshot);
     if (!executable) return undefined;
     // 3) 按 adapterId 前缀选择适配器，完成参数级路径翻译（只改写 argv，不执行命令）。
-    const adapter = descriptor.adapterId.startsWith("git")
-      ? gitAdapter(argv, table, gate)
-      : descriptor.adapterId.startsWith("rg")
-        ? rgAdapter(argv, table, gate)
-        : nodeAdapter(argv, table, gate);
+    const adapterPlugin = this.adapters.find((candidate) => candidate.id === descriptor.adapterId);
+    if (!adapterPlugin) {
+      throw new PosixLoomError("REGISTRY_ADAPTER_MISSING", `Native command ${descriptor.name} references an unavailable adapter: ${descriptor.adapterId}`, {
+        command: descriptor.name,
+        adapterId: descriptor.adapterId,
+      });
+    }
+    const adapter = adapterPlugin.adapt([...argv], table, gate);
+    if (!adapter || !Array.isArray(adapter.argv) || adapter.argv.some((argument) => typeof argument !== "string") || !Array.isArray(adapter.decisions)) {
+      throw new PosixLoomError("REGISTRY_ADAPTER_INVALID", `Native adapter returned an invalid result: ${adapterPlugin.id}`, { adapterId: adapterPlugin.id, command });
+    }
     // 4) 策略断言：守卫模式下校验可执行文件必须位于 runtimeRoot 内（release）且确实存在；失败抛错而非回退。
     gate.assertExecutable(executable);
-    return { descriptor, executable, adapter };
+    return {
+      descriptor,
+      executable,
+      adapter: {
+        argv: [...adapter.argv],
+        decisions: adapter.decisions.map((decision) => ({ ...decision })),
+      },
+    };
   }
 
   /**
@@ -444,10 +490,34 @@ export class NativeRegistry {
    * @throws PosixLoomError 错误码固定为 REGISTRY_INVALID。
    */
   validate(): void {
+    const commandNames = new Set<string>();
+    const adapterIds = new Set<string>();
+    for (const adapter of this.adapters) {
+      if (typeof adapter.id !== "string" || !NATIVE_ADAPTER_ID.test(adapter.id) || typeof adapter.adapt !== "function" || adapterIds.has(adapter.id)) {
+        throw new PosixLoomError("REGISTRY_INVALID", `Invalid or duplicate Native adapter: ${adapter.id}`);
+      }
+      adapterIds.add(adapter.id);
+    }
     for (const descriptor of this.descriptors) {
       // 字段完整性检查。
-      if (!descriptor.name || !descriptor.executable || !descriptor.adapterId) {
+      if (typeof descriptor.name !== "string" || !NATIVE_COMMAND_NAME.test(descriptor.name) || typeof descriptor.executable !== "string" || !descriptor.executable || typeof descriptor.adapterId !== "string" || !NATIVE_ADAPTER_ID.test(descriptor.adapterId) || typeof descriptor.shellEquivalent !== "boolean") {
         throw new PosixLoomError("REGISTRY_INVALID", `Invalid Native registry entry: ${JSON.stringify(descriptor)}`);
+      }
+      if (commandNames.has(descriptor.name)) {
+        throw new PosixLoomError("REGISTRY_INVALID", `Duplicate Native registry command: ${descriptor.name}`);
+      }
+      commandNames.add(descriptor.name);
+      if (!adapterIds.has(descriptor.adapterId)) {
+        throw new PosixLoomError("REGISTRY_INVALID", `Native registry entry references an unavailable adapter: ${descriptor.name}/${descriptor.adapterId}`);
+      }
+      if (descriptor.executable.includes("\0") || (descriptor.executable.includes("$RUNTIME_ROOT") && !descriptor.executable.startsWith("$RUNTIME_ROOT/"))) {
+        throw new PosixLoomError("REGISTRY_INVALID", `Native registry entry has an invalid executable reference: ${descriptor.name}`);
+      }
+      if (descriptor.executable.startsWith("$RUNTIME_ROOT/")) {
+        const relative = descriptor.executable.slice("$RUNTIME_ROOT/".length);
+        if (!relative || relative.split(/[\\/]+/).some((segment) => segment === "..")) {
+          throw new PosixLoomError("REGISTRY_INVALID", `Native registry entry escapes RuntimeRoot: ${descriptor.name}`);
+        }
       }
       // 禁止引用未经验证的 runtime/current/ 路径。
       if (descriptor.executable.includes("runtime/current/")) {

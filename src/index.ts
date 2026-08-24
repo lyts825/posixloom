@@ -46,6 +46,10 @@ export * from "./core/runtime.js";
 export * from "./core/updater.js";
 // 声明式插件市场：清单校验、远程目录发现与 DataRoot 原子安装。
 export * from "./plugins/marketplace.js";
+// 插件微内核、统一扩展点与第一方插件；内置能力和可信自定义能力使用同一协议。
+export * from "./plugins/kernel.js";
+export * from "./plugins/contracts.js";
+export * from "./plugins/builtins.js";
 // 第 5 层：进程执行原语（spawn / 超时取消 / 输出截断 / 帧协议）、命令编排
 // 服务门面（计划构建与 StateReport 提交）与宿主控制协议（帧编解码与请求分发）。
 export * from "./core/control.js";
