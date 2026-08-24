@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#0b0d10">
+  <title>PosixLoom Console</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/app.css">
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <a class="brand" href="#console" aria-label="PosixLoom 首页">
+        <span class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></span>
+        <span class="brand-copy"><strong>PosixLoom</strong><small>Control Studio</small></span>
+      </a>
+      <div class="topbar-actions">
+        <button class="connection-pill" id="connectionButton" type="button" title="连接设置">
+          <span class="status-dot" id="statusDot"></span>
+          <span id="connectionLabel">正在连接</span>
+        </button>
+        <button class="icon-button mobile-nav-button" id="mobileNavButton" type="button" aria-label="打开导航" aria-expanded="false">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/></svg>
+        </button>
+      </div>
+    </header>
+
+    <aside class="sidebar" id="sidebar">
+      <nav aria-label="主导航">
+        <button class="nav-item active" type="button" data-view="console">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m7 8 4 4-4 4M13 16h4"/></svg>
+          <span>控制台</span>
+        </button>
+        <button class="nav-item" type="button" data-view="runtime">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="4" width="16" height="16" rx="3"/><path d="M8 9h8M8 13h5M8 17h3"/></svg>
+          <span>运行时</span>
+        </button>
+        <button class="nav-item" type="button" data-view="plugins">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 4h3v4h2V4h3a2 2 0 0 1 2 2v3h-4v2h4v3a2 2 0 0 1-2 2h-3v4h-2v-4H8a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2Z"/></svg>
+          <span>插件市场</span>
+          <span class="nav-badge" id="pluginBadge" hidden>0</span>
+        </button>
+      </nav>
+      <div class="sidebar-footer">
+        <div class="api-caption">API</div>
+        <div class="api-address" id="apiAddress">—</div>
+        <div class="version-caption">HTTP protocol v1</div>
+      </div>
+    </aside>
+
+    <main class="main-content">
+      <section class="view active" id="view-console" aria-labelledby="consoleTitle">
+        <div class="page-heading">
+          <div>
+            <p class="eyebrow">WORKSPACE SHELL</p>
+            <h1 id="consoleTitle">控制台</h1>
+            <p>在受控会话中执行命令，实时查看输出与执行路径。</p>
+          </div>
+          <div class="session-control">
+            <span class="session-icon" aria-hidden="true"></span>
+            <div><small>当前会话</small><strong id="sessionLabel">尚未创建</strong></div>
+            <button class="icon-button" id="newSessionButton" type="button" title="新建会话" aria-label="新建会话">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+            </button>
+          </div>
+        </div>
+
+        <div class="console-grid">
+          <section class="panel composer-panel">
+            <div class="panel-header compact">
+              <div class="segmented" role="group" aria-label="命令输入模式">
+                <button class="active" type="button" data-mode="text">Shell</button>
+                <button type="button" data-mode="argv">argv JSON</button>
+              </div>
+              <label class="cwd-field"><span>cwd</span><input id="cwdInput" value="/workspace" spellcheck="false"></label>
+            </div>
+            <div class="editor-wrap">
+              <span class="prompt" aria-hidden="true">❯</span>
+              <textarea id="commandInput" rows="5" spellcheck="false" aria-label="命令" placeholder="输入命令，例如 git status --short"></textarea>
+            </div>
+            <div class="composer-footer">
+              <span class="shortcut-hint"><kbd>Ctrl</kbd><span>+</span><kbd>Enter</kbd> 执行</span>
+              <div class="button-row">
+                <button class="button secondary" id="explainButton" type="button">预览计划</button>
+                <button class="button danger" id="cancelButton" type="button" hidden>停止</button>
+                <button class="button primary" id="runButton" type="button">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9 7 8 5-8 5Z"/></svg>
+                  执行
+                </button>
+              </div>
+            </div>
+          </section>
+
+          <section class="panel terminal-panel">
+            <div class="panel-header terminal-header">
+              <div class="terminal-title"><span class="terminal-lights" aria-hidden="true"><i></i><i></i><i></i></span><strong>输出</strong></div>
+              <div class="terminal-meta">
+                <span class="route-chip" id="routeChip" hidden>—</span>
+                <span id="executionTime">就绪</span>
+                <button class="text-button" id="clearButton" type="button">清空</button>
+              </div>
+            </div>
+            <div class="terminal-scroll" id="terminalScroll">
+              <pre class="terminal-output" id="terminalOutput" aria-live="polite"><span class="terminal-muted">PosixLoom 控制台已就绪。</span></pre>
+            </div>
+          </section>
+        </div>
+      </section>
+
+      <section class="view" id="view-runtime" aria-labelledby="runtimeTitle">
+        <div class="page-heading">
+          <div><p class="eyebrow">SYSTEM HEALTH</p><h1 id="runtimeTitle">运行时</h1><p>查看快照、执行后端、挂载点与诊断结果。</p></div>
+          <button class="button secondary" id="refreshRuntimeButton" type="button">刷新诊断</button>
+        </div>
+        <div class="metric-grid" id="runtimeMetrics">
+          <article class="metric-card skeleton"></article><article class="metric-card skeleton"></article><article class="metric-card skeleton"></article><article class="metric-card skeleton"></article>
+        </div>
+        <div class="runtime-grid">
+          <section class="panel">
+            <div class="panel-header"><div><p class="panel-kicker">FILESYSTEM</p><h2>挂载映射</h2></div></div>
+            <div class="table-wrap"><table><thead><tr><th>虚拟路径</th><th>宿主路径</th></tr></thead><tbody id="mountTable"></tbody></table></div>
+          </section>
+          <section class="panel">
+            <div class="panel-header"><div><p class="panel-kicker">DOCTOR</p><h2>健康检查</h2></div><span class="health-summary" id="healthSummary">—</span></div>
+            <div class="check-list" id="doctorChecks"></div>
+          </section>
+        </div>
+      </section>
+
+      <section class="view" id="view-plugins" aria-labelledby="pluginsTitle">
+        <div class="page-heading plugins-heading">
+          <div><p class="eyebrow">DECLARATIVE EXTENSIONS</p><h1 id="pluginsTitle">插件市场</h1><p>安装经过验证的命令包；安装本身不会执行任何代码。</p></div>
+          <label class="search-field">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="6"/><path d="m16 16 4 4"/></svg>
+            <input id="pluginSearch" type="search" placeholder="搜索插件、标签或作者" autocomplete="off">
+          </label>
+        </div>
+        <div class="market-toolbar">
+          <div class="filter-tabs" role="group" aria-label="插件筛选">
+            <button class="active" type="button" data-filter="all">全部</button>
+            <button type="button" data-filter="installed">已安装</button>
+            <button type="button" data-filter="updates">可更新</button>
+          </div>
+          <span id="pluginCount">正在载入…</span>
+        </div>
+        <div class="plugin-grid" id="pluginGrid"></div>
+        <div class="empty-state" id="pluginEmpty" hidden><strong>没有匹配的插件</strong><span>换个关键词或筛选条件试试。</span></div>
+      </section>
+    </main>
+  </div>
+
+  <dialog class="auth-dialog" id="authDialog">
+    <form method="dialog" id="authForm">
+      <div class="dialog-mark" aria-hidden="true"><span></span><span></span><span></span></div>
+      <p class="eyebrow">REMOTE ACCESS</p>
+      <h2>连接 PosixLoom</h2>
+      <p>远程服务需要 Bearer Token。Token 只保存在此标签页的 sessionStorage 中，不会写入 URL。</p>
+      <label><span>访问令牌</span><input id="tokenInput" type="password" autocomplete="current-password" minlength="16" placeholder="输入至少 16 字节的令牌"></label>
+      <div class="dialog-error" id="authError" role="alert"></div>
+      <div class="button-row"><button class="button primary wide" value="connect" type="submit">连接</button></div>
+    </form>
+  </dialog>
+
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+  <noscript>PosixLoom GUI 需要 JavaScript 才能连接控制服务。</noscript>
+  <script type="module" src="/app.js"></script>
+</body>
+</html>
+

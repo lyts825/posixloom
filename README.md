@@ -32,6 +32,8 @@ TypeScript 控制面（分类、路径、环境、会话、策略）
 - 通过控制协议实时转发二进制安全的 stdout/stderr，并对慢 Harness 施加背压。
 - 在执行前预览后端选择、参数翻译、路径决策与策略档案，不启动目标进程。
 - 以不可变 Runtime、组件锁文件、Ed25519 Feed 和事务切换实现可复现更新。
+- 提供可独立部署的浏览器 GUI 与带 Bearer 鉴权、CORS 白名单、NDJSON 流输出的远程 HTTP API。
+- 提供声明式插件市场；插件安装只落盘经过校验的命令清单，不加载或执行第三方 JavaScript。
 
 ## 快速开始
 
@@ -81,12 +83,39 @@ npm run posixloom -- serve --stdio
 
 协议使用长度前缀 JSON 帧，详见 [control protocol v1](docs/protocols/control-v1.md)。
 
+启动本地 GUI（默认分别监听 GUI `127.0.0.1:7330` 与 API `127.0.0.1:7331`）：
+
+```powershell
+npm run gui
+```
+
+GUI 与 API 是两个独立服务。也可以让 GUI 连接已有远程 API，或只启动 HTTP API：
+
+```powershell
+npm run posixloom -- gui --api-url https://posixloom.example.com
+
+$env:POSIXLOOM_HTTP_TOKEN = 'replace-with-at-least-16-bytes'
+npm run posixloom -- serve --http --host 0.0.0.0 --port 7331 --cors-origin https://console.example.com
+```
+
+浏览及安装声明式插件：
+
+```powershell
+npm run posixloom -- plugin search workspace
+npm run posixloom -- plugin install workspace-inspector
+npm run posixloom -- plugin run workspace-inspector git-status
+```
+
 ## 仓库结构
 
 | 路径 | 用途 |
 |---|---|
 | `src/cli/` | `posixloom` CLI 与命令分发 |
 | `src/core/` | 分类、路径、环境、会话、执行、策略、更新等核心逻辑 |
+| `src/http/` | 独立 HTTP/JSON 适配器与通用扩展端口（不引用 GUI/插件实现） |
+| `src/gui/` | 独立静态 GUI 服务与浏览器资源（只接收 API URL） |
+| `src/plugins/` | 声明式插件目录、校验、安装与查询（不引用 HTTP/GUI） |
+| `src/composition/` | 显式的可选跨组件适配器；隔离组合知识 |
 | `native/posixloom-host/` | Rust Native Host 与 Windows Job Object 集成 |
 | `config/` | 默认运行时配置 |
 | `runtime/` | 开发 Runtime 指针与快照元数据 |
@@ -102,12 +131,14 @@ npm run posixloom -- serve --stdio
 - [文档中心](docs/README.md)：指南与协议入口。
 - [开发指南](docs/guides/development.md)：环境准备、常用命令、测试与故障排查。
 - [配置与诊断](docs/guides/configuration.md)：有效配置、运行时摘要与 trace 查询。
+- [GUI 与远程服务](docs/guides/gui-http.md)：分离部署、鉴权、CORS 与启动方式。
+- [插件市场](docs/guides/plugins.md)：清单模型、远程目录、安装和运行边界。
 - [发布与更新指南](docs/guides/release.md)：组件供应链、Runtime 组装、签名和验证。
-- [控制协议 v1](docs/protocols/control-v1.md) 与 [StateReport v1](docs/protocols/state-report-v1.md)。
+- [HTTP API v1](docs/protocols/http-v1.md)、[控制协议 v1](docs/protocols/control-v1.md) 与 [StateReport v1](docs/protocols/state-report-v1.md)。
 
 ## 当前边界
 
-项目目前处于 `0.1.0` 开发阶段，目标平台为 Windows 10/11 x64。Session 仅在当前 CLI/Harness 进程内保存，进程退出后不会恢复；配置中的历史字段 `session.persistAcrossRestart: true` 会被明确拒绝。默认策略提供的是防误操作 Guardrail，不是针对恶意本地代码的 OS 级安全沙箱。发布前应执行完整门禁：
+项目目前处于 `0.1.0` 开发阶段，目标平台为 Windows 10/11 x64。Session 仅在当前服务进程内保存，进程退出后不会恢复；配置中的历史字段 `session.persistAcrossRestart: true` 会被明确拒绝。HTTP 服务自身不终止 TLS，跨机器或公网使用时应置于 HTTPS 反向代理之后。插件是声明式命令包而非进程内代码扩展，运行插件命令仍受常规策略约束。默认策略提供的是防误操作 Guardrail，不是针对恶意本地代码的 OS 级安全沙箱。发布前应执行完整门禁：
 
 ```powershell
 npm run verify

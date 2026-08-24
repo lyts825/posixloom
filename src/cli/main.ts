@@ -21,6 +21,7 @@
  * usage 类错误与 doctor 不健康 -> 2。
  */
 import { existsSync } from "node:fs";
+import { spawn } from "node:child_process";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createInterface } from "node:readline";
@@ -32,7 +33,11 @@ import { RuntimeUpdater } from "../core/updater.js";
 import { serveControlPlane } from "../core/control.js";
 import { readTraceEvents, traceFilePath } from "../core/trace.js";
 import { InteractiveProcessController } from "../core/process.js";
-import type { TerminalSize } from "../core/types.js";
+import { PluginMarketplace } from "../plugins/marketplace.js";
+import { startRemoteHttpServer, type RemoteHttpServer } from "../http/server.js";
+import { startGuiServer, type GuiServer } from "../gui/server.js";
+import { createPluginMarketplaceHttpExtension } from "../composition/plugin-http.js";
+import type { CommandCompletion, TerminalSize } from "../core/types.js";
 
 // dist/src/cli/main.js → project root is three levels up.
 // 应用根目录：从编译产物（dist/src/cli/main.js）向上三级回到项目根，
@@ -41,7 +46,7 @@ const appRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 
 /** 打印用法帮助到 stdout；不设置退出码，供 help 与未知命令两个分支共用。 */
 function printUsage(): void {
-  console.log(`PosixLoom Runtime\n\nUsage:\n  posixloom exec [--dry-run] [--json] -- <program> [args...]\n  posixloom exec [--pty] [--cols n] [--rows n] [--cwd /path] [--isolated] [--timeout ms] -- <program> [args...]\n  posixloom shell [--dry-run] [--json] [--cwd /path] [--isolated] [--timeout ms] -c <script>\n  posixloom shell [--pty] [--cols n] [--rows n] [--cwd /path] [--isolated] [--timeout ms] -c <script>\n  posixloom shell [--cwd /path] [--isolated] [--timeout ms] --stdin\n  posixloom explain [--json] exec [options] -- <program> [args...]\n  posixloom explain [--json] shell [options] -c <script>\n  posixloom repl\n  posixloom serve --stdio\n  posixloom config path|show|validate [--json]\n  posixloom runtime doctor|info [--json]\n  posixloom runtime update [--check] [--force] [--json]\n  posixloom runtime rollback [--json]\n  posixloom trace list [--limit n] [--json]\n  posixloom version`);
+  console.log(`PosixLoom Runtime\n\nUsage:\n  posixloom exec [--dry-run] [--json] -- <program> [args...]\n  posixloom exec [--pty] [--cols n] [--rows n] [--cwd /path] [--isolated] [--timeout ms] -- <program> [args...]\n  posixloom shell [--dry-run] [--json] [--cwd /path] [--isolated] [--timeout ms] -c <script>\n  posixloom shell [--pty] [--cols n] [--rows n] [--cwd /path] [--isolated] [--timeout ms] -c <script>\n  posixloom shell [--cwd /path] [--isolated] [--timeout ms] --stdin\n  posixloom explain [--json] exec [options] -- <program> [args...]\n  posixloom explain [--json] shell [options] -c <script>\n  posixloom repl\n  posixloom serve --stdio\n  posixloom serve --http [--host host] [--port n] [--token token] [--cors-origin origin] [--marketplace url]\n  posixloom gui [--host host] [--port n] [--api-url url] [--api-host host] [--api-port n] [--token token] [--marketplace url] [--no-open]\n  posixloom plugin search [query] [--marketplace url] [--json]\n  posixloom plugin list|install <id>|uninstall <id>|run <id> <command> [--json]\n  posixloom config path|show|validate [--json]\n  posixloom runtime doctor|info [--json]\n  posixloom runtime update [--check] [--force] [--json]\n  posixloom runtime rollback [--json]\n  posixloom trace list [--limit n] [--json]\n  posixloom version`);
 }
 
 /** 把 explain 预览打印为紧凑的人类可读摘要。 */
@@ -209,6 +214,160 @@ async function readStandardInput(): Promise<string> {
   return Buffer.concat(chunks).toString("utf8").replace(/^\uFEFF/, "");
 }
 
+interface HttpCliOptions {
+  mode: "stdio" | "http";
+  host: string;
+  port: number;
+  token?: string;
+  corsOrigins: string[];
+  marketplaceUrl?: string;
+  plugins: boolean;
+}
+
+interface GuiCliOptions {
+  host: string;
+  port: number;
+  apiUrl?: string;
+  apiHost: string;
+  apiPort: number;
+  token?: string;
+  marketplaceUrl?: string;
+  open: boolean;
+  plugins: boolean;
+}
+
+function requiredOptionValue(args: string[], index: number, name: string): string {
+  const value = args[index + 1];
+  if (!value || value.startsWith("--")) throw new Error(`${name} requires a value`);
+  return value;
+}
+
+function cliPort(value: string | undefined, fallback: number, name: string): number {
+  const port = value === undefined ? fallback : Number(value);
+  if (!Number.isSafeInteger(port) || port <= 0 || port > 65_535) throw new Error(`${name} must be an integer between 1 and 65535`);
+  return port;
+}
+
+function parseServeOptions(args: string[]): HttpCliOptions {
+  let mode: "stdio" | "http" | undefined;
+  let host = process.env.POSIXLOOM_HTTP_HOST ?? "127.0.0.1";
+  let portValue = process.env.POSIXLOOM_HTTP_PORT;
+  let token = process.env.POSIXLOOM_HTTP_TOKEN;
+  let marketplaceUrl = process.env.POSIXLOOM_MARKETPLACE_URL;
+  let plugins = true;
+  const corsOrigins: string[] = [];
+  for (let index = 0; index < args.length; index += 1) {
+    const argument = args[index];
+    if (argument === "--stdio") { if (mode) throw new Error("Choose exactly one serve transport"); mode = "stdio"; continue; }
+    if (argument === "--http") { if (mode) throw new Error("Choose exactly one serve transport"); mode = "http"; continue; }
+    if (argument === "--host") { host = requiredOptionValue(args, index, argument); index += 1; continue; }
+    if (argument === "--port") { portValue = requiredOptionValue(args, index, argument); index += 1; continue; }
+    if (argument === "--token") { token = requiredOptionValue(args, index, argument); index += 1; continue; }
+    if (argument === "--cors-origin") { corsOrigins.push(requiredOptionValue(args, index, argument)); index += 1; continue; }
+    if (argument === "--marketplace") { marketplaceUrl = requiredOptionValue(args, index, argument); index += 1; continue; }
+    if (argument === "--no-plugins") { plugins = false; continue; }
+    throw new Error(`Unknown serve option: ${argument}`);
+  }
+  if (!mode) throw new Error("serve requires --stdio or --http");
+  if (mode === "stdio" && (args.length !== 1 || args[0] !== "--stdio")) throw new Error("serve --stdio cannot be combined with HTTP options");
+  return { mode, host, port: cliPort(portValue, 7331, "--port"), token, corsOrigins, marketplaceUrl, plugins };
+}
+
+function parseGuiOptions(args: string[]): GuiCliOptions {
+  let host = process.env.POSIXLOOM_GUI_HOST ?? "127.0.0.1";
+  let portValue = process.env.POSIXLOOM_GUI_PORT;
+  let apiUrl: string | undefined;
+  let apiHost = process.env.POSIXLOOM_HTTP_HOST ?? "127.0.0.1";
+  let apiPortValue = process.env.POSIXLOOM_HTTP_PORT;
+  let token = process.env.POSIXLOOM_HTTP_TOKEN;
+  let marketplaceUrl = process.env.POSIXLOOM_MARKETPLACE_URL;
+  let open = true;
+  let plugins = true;
+  for (let index = 0; index < args.length; index += 1) {
+    const argument = args[index];
+    if (argument === "--host") { host = requiredOptionValue(args, index, argument); index += 1; continue; }
+    if (argument === "--port") { portValue = requiredOptionValue(args, index, argument); index += 1; continue; }
+    if (argument === "--api-url") { apiUrl = requiredOptionValue(args, index, argument); index += 1; continue; }
+    if (argument === "--api-host") { apiHost = requiredOptionValue(args, index, argument); index += 1; continue; }
+    if (argument === "--api-port") { apiPortValue = requiredOptionValue(args, index, argument); index += 1; continue; }
+    if (argument === "--token") { token = requiredOptionValue(args, index, argument); index += 1; continue; }
+    if (argument === "--marketplace") { marketplaceUrl = requiredOptionValue(args, index, argument); index += 1; continue; }
+    if (argument === "--no-open") { open = false; continue; }
+    if (argument === "--no-plugins") { plugins = false; continue; }
+    throw new Error(`Unknown gui option: ${argument}`);
+  }
+  if (apiUrl && (args.includes("--api-host") || args.includes("--api-port") || args.includes("--token") || args.includes("--marketplace") || args.includes("--no-plugins"))) {
+    throw new Error("--api-url connects to an existing service and cannot be combined with embedded API options");
+  }
+  return {
+    host,
+    port: cliPort(portValue, 7330, "--port"),
+    apiUrl,
+    apiHost,
+    apiPort: cliPort(apiPortValue, 7331, "--api-port"),
+    token,
+    marketplaceUrl,
+    open,
+    plugins,
+  };
+}
+
+function urlHost(host: string): string {
+  return host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
+}
+
+function openBrowser(url: string): void {
+  const target = process.platform === "win32"
+    ? { program: "rundll32.exe", args: ["url.dll,FileProtocolHandler", url] }
+    : process.platform === "darwin"
+      ? { program: "open", args: [url] }
+      : { program: "xdg-open", args: [url] };
+  try {
+    const child = spawn(target.program, target.args, { detached: true, stdio: "ignore", windowsHide: true });
+    child.once("error", (error) => console.error(`[GUI OPEN WARN] ${error.message}`));
+    child.unref();
+  } catch (error) {
+    console.error(`[GUI OPEN WARN] ${String(error)}`);
+  }
+}
+
+async function waitForNetworkServices(services: Array<RemoteHttpServer | GuiServer>): Promise<void> {
+  let stopping = false;
+  const stop = (): void => {
+    if (stopping) return;
+    stopping = true;
+    void Promise.allSettled(services.map((service) => service.close()));
+  };
+  process.once("SIGINT", stop);
+  process.once("SIGTERM", stop);
+  try {
+    await Promise.race(services.map((service) => service.closed));
+  } finally {
+    process.off("SIGINT", stop);
+    process.off("SIGTERM", stop);
+    await Promise.allSettled(services.map((service) => service.close()));
+  }
+}
+
+function marketplaceFor(dataRoot: string, marketplaceUrl?: string): PluginMarketplace {
+  return new PluginMarketplace(dataRoot, { marketplaceUrl });
+}
+
+function cliJsonCompletion(completion: CommandCompletion): Record<string, unknown> {
+  return {
+    command: completion.command,
+    state: completion.state.kind === "committed" ? { ...completion.state, newVersion: completion.state.newVersion.toString() } : completion.state,
+    stdoutBase64: completion.stdout.toString("base64"),
+    stderrBase64: completion.stderr.toString("base64"),
+    stdoutBytes: completion.stdoutBytes,
+    stderrBytes: completion.stderrBytes,
+    truncated: completion.truncated,
+    backend: completion.backend,
+    planId: completion.planId,
+    trace: completion.trace,
+  };
+}
+
 /**
  * CLI 主入口：短路 help / version（无需运行时）-> 创建 RuntimeManager（失败时
  * 进入自愈流程）-> 处理 runtime 子命令 -> 可选的 autoApply 静默更新 ->
@@ -224,7 +383,7 @@ async function main(): Promise<void> {
   }
   // version 短路：版本串硬编码，避免为拿版本号而加载运行时。
   if (args[0] === "version" || args[0] === "--version") {
-    console.log("posixloom 0.1.0-dev (PosixLoom Runtime; architecture v1.7)");
+    console.log("posixloom 0.1.0-dev (PosixLoom Runtime; architecture v1.8)");
     return;
   }
 
@@ -367,11 +526,130 @@ async function main(): Promise<void> {
     }
   }
 
-  // serve：目前仅支持 stdio 传输，直接把进程标准流交给控制平面，
-  // 由 serveControlPlane 负责帧协议与连接生命周期。
+  // 插件市场是独立的声明式安装面；只有 plugin run 会显式把已安装命令交给
+  // PosixLoomService，安装/浏览本身不执行插件内容。
+  if (args[0] === "plugin") {
+    let marketplaceUrl = process.env.POSIXLOOM_MARKETPLACE_URL;
+    let json = false;
+    let cwd: string | undefined;
+    const positional: string[] = [];
+    for (let index = 1; index < args.length; index += 1) {
+      const argument = args[index];
+      if (argument === "--json") { json = true; continue; }
+      if (argument === "--marketplace") { marketplaceUrl = requiredOptionValue(args, index, argument); index += 1; continue; }
+      if (argument === "--cwd") { cwd = requiredOptionValue(args, index, argument); index += 1; continue; }
+      if (argument.startsWith("--")) throw new Error(`Unknown plugin option: ${argument}`);
+      positional.push(argument);
+    }
+    const command = positional[0];
+    const marketplace = marketplaceFor(runtime.config.dataRoot, marketplaceUrl);
+    if (command === "search") {
+      const plugins = await marketplace.catalog(positional.slice(1).join(" "));
+      if (json) console.log(JSON.stringify({ plugins }, null, 2));
+      else if (!plugins.length) console.log("No marketplace plugins matched the query.");
+      else for (const plugin of plugins) console.log(`${plugin.installedVersion ? "[installed]" : "[available]"} ${plugin.manifest.id} ${plugin.manifest.version} - ${plugin.manifest.name}`);
+      return;
+    }
+    if (command === "list") {
+      if (positional.length !== 1) throw new Error("Use: posixloom plugin list [--json]");
+      const plugins = await marketplace.installed();
+      if (json) console.log(JSON.stringify({ plugins }, null, 2));
+      else if (!plugins.length) console.log("No plugins are installed.");
+      else for (const plugin of plugins) console.log(`${plugin.manifest.id} ${plugin.manifest.version} - ${plugin.manifest.name}`);
+      return;
+    }
+    if (command === "install") {
+      if (positional.length !== 2) throw new Error("Use: posixloom plugin install <id> [--marketplace url] [--json]");
+      const installed = await marketplace.install(positional[1]);
+      if (json) console.log(JSON.stringify({ plugin: installed }, null, 2));
+      else console.log(`Installed ${installed.manifest.name} ${installed.manifest.version}. Commands are inert until explicitly run.`);
+      return;
+    }
+    if (command === "uninstall" || command === "remove") {
+      if (positional.length !== 2) throw new Error("Use: posixloom plugin uninstall <id> [--json]");
+      await marketplace.uninstall(positional[1]);
+      if (json) console.log(JSON.stringify({ removed: true, pluginId: positional[1] }, null, 2));
+      else console.log(`Uninstalled ${positional[1]}.`);
+      return;
+    }
+    if (command === "run") {
+      if (positional.length !== 3) throw new Error("Use: posixloom plugin run <id> <command> [--cwd /path] [--json]");
+      const recipe = await marketplace.command(positional[1], positional[2]);
+      const service = new PosixLoomService(runtime);
+      const sessionId = service.createSession(cwd ?? recipe.cwd ?? "/workspace");
+      const common = { sessionId, cwd: cwd ?? recipe.cwd, timeoutMs: recipe.timeoutMs };
+      const completion = recipe.input.kind === "argv"
+        ? await service.execute({ ...common, kind: "argv", argv: recipe.input.argv })
+        : await service.execute({ ...common, kind: "text", raw: recipe.input.raw });
+      if (json) console.log(JSON.stringify(cliJsonCompletion(completion), null, 2));
+      else {
+        if (completion.stdout.length) process.stdout.write(completion.stdout);
+        if (completion.stderr.length) process.stderr.write(completion.stderr);
+      }
+      if (completion.command.kind === "exited") process.exitCode = completion.command.exitCode;
+      else if (completion.command.kind === "timed-out") process.exitCode = 124;
+      else if (completion.command.kind === "cancelled") process.exitCode = 130;
+      else process.exitCode = 1;
+      return;
+    }
+    throw new Error("Use: posixloom plugin search|list|install|uninstall|run ...");
+  }
+
+  // GUI 与远程 API 是两个独立服务器。gui 默认在 CLI 组合根同时启动两者；
+  // --api-url 则只启动静态 GUI，并连接一个已有的远程服务。
+  if (args[0] === "gui") {
+    const guiOptions = parseGuiOptions(args.slice(1));
+    const services: Array<RemoteHttpServer | GuiServer> = [];
+    try {
+      if (guiOptions.apiUrl) {
+        const gui = await startGuiServer({ host: guiOptions.host, port: guiOptions.port, apiBaseUrl: guiOptions.apiUrl });
+        services.push(gui);
+        console.log(`PosixLoom GUI: ${gui.origin}`);
+        console.log(`Remote API: ${new URL(guiOptions.apiUrl).origin} (external)`);
+      } else {
+        const clientApiHost = guiOptions.apiHost === "0.0.0.0" ? "127.0.0.1" : guiOptions.apiHost === "::" ? "::1" : guiOptions.apiHost;
+        const apiBaseUrl = `http://${urlHost(clientApiHost)}:${guiOptions.apiPort}`;
+        const gui = await startGuiServer({ host: guiOptions.host, port: guiOptions.port, apiBaseUrl });
+        services.push(gui);
+        const plugins = guiOptions.plugins ? marketplaceFor(runtime.config.dataRoot, guiOptions.marketplaceUrl) : undefined;
+        const api = await startRemoteHttpServer(runtime, {
+          host: guiOptions.apiHost,
+          port: guiOptions.apiPort,
+          token: guiOptions.token,
+          corsOrigins: [gui.origin],
+          extensions: plugins ? [createPluginMarketplaceHttpExtension(plugins)] : undefined,
+        });
+        services.push(api);
+        console.log(`PosixLoom GUI: ${gui.origin}`);
+        console.log(`Remote API: ${api.origin}${guiOptions.token ? " (Bearer auth)" : " (loopback only)"}`);
+      }
+      if (guiOptions.open) openBrowser(services[0].origin);
+      await waitForNetworkServices(services);
+    } catch (error) {
+      await Promise.allSettled(services.map((service) => service.close()));
+      throw error;
+    }
+    return;
+  }
+
+  // serve 传输彼此独立：stdio 继续使用帧协议；HTTP 只提供 JSON API，不托管 GUI。
   if (args[0] === "serve") {
-    if (!args.includes("--stdio")) throw new Error("serve requires --stdio");
-    await serveControlPlane(runtime, process.stdin, process.stdout);
+    const serveOptions = parseServeOptions(args.slice(1));
+    if (serveOptions.mode === "stdio") {
+      await serveControlPlane(runtime, process.stdin, process.stdout);
+      return;
+    }
+    const plugins = serveOptions.plugins ? marketplaceFor(runtime.config.dataRoot, serveOptions.marketplaceUrl) : undefined;
+    const server = await startRemoteHttpServer(runtime, {
+      host: serveOptions.host,
+      port: serveOptions.port,
+      token: serveOptions.token,
+      corsOrigins: serveOptions.corsOrigins,
+      extensions: plugins ? [createPluginMarketplaceHttpExtension(plugins)] : undefined,
+    });
+    console.log(`PosixLoom HTTP API listening at ${server.origin}`);
+    console.log(`Authentication: ${serveOptions.token ? "Bearer token required" : "disabled (loopback binding)"}`);
+    await waitForNetworkServices([server]);
     return;
   }
 

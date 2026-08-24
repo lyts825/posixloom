@@ -44,8 +44,16 @@ export * from "./core/registry.js";
 //（更新 feed 拉取、签名校验、下载限额与原子应用）。
 export * from "./core/runtime.js";
 export * from "./core/updater.js";
+// 声明式插件市场：清单校验、远程目录发现与 DataRoot 原子安装。
+export * from "./plugins/marketplace.js";
 // 第 5 层：进程执行原语（spawn / 超时取消 / 输出截断 / 帧协议）、命令编排
 // 服务门面（计划构建与 StateReport 提交）与宿主控制协议（帧编解码与请求分发）。
 export * from "./core/control.js";
 export * from "./core/process.js";
 export * from "./core/service.js";
+// 可独立启动的远程 HTTP/JSON 适配器；不引用 GUI 或插件市场实现。
+export * from "./http/server.js";
+// 独立静态 GUI 服务；只接收 API URL，不引用控制服务或插件实现。
+export * from "./gui/server.js";
+// 显式组合适配器位于组件之外，避免 HTTP 与插件市场互相依赖。
+export * from "./composition/plugin-http.js";
