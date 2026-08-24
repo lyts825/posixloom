@@ -97,7 +97,8 @@ export class MountTable {
    *  （避免 /home2 误命中 /home）；entries 已按长度降序，首个命中即最长前缀。 */
   findMount(path: VirtualPath): MountSpec | undefined {
     const normalized = normalizeVirtual(path);
-    return this.entries.find((entry) => normalized === entry.virtualPath || normalized.startsWith(`${entry.virtualPath}/`));
+    return this.entries.find((entry) => normalized === entry.virtualPath
+      || (entry.virtualPath === "/" ? normalized.startsWith("/") : normalized.startsWith(`${entry.virtualPath}/`)));
   }
 
   /**

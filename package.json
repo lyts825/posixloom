@@ -19,7 +19,7 @@
     "release:environment": "powershell -NoProfile -ExecutionPolicy Bypass -File packaging/publish-environment.ps1",
     "update:feed": "node scripts/create-update-feed.mjs",
     "format:check": "node scripts/check-format.mjs",
-    "verify": "npm run format:check && cargo fmt --manifest-path native/posixloom-host/Cargo.toml -- --check && cargo build --release --locked --manifest-path native/posixloom-host/Cargo.toml && npm test && cargo test --locked --manifest-path native/posixloom-host/Cargo.toml"
+    "verify": "npm run format:check && cargo fmt --manifest-path native/posixloom-host/Cargo.toml -- --check && cargo clippy --locked --all-targets --manifest-path native/posixloom-host/Cargo.toml -- -D warnings && cargo build --release --locked --manifest-path native/posixloom-host/Cargo.toml && npm test && cargo test --locked --manifest-path native/posixloom-host/Cargo.toml"
   },
   "devDependencies": {
     "@types/node": "^22.15.0",

@@ -177,30 +177,72 @@ function rgAdapter(argv: string[], table: MountTable, gate: PolicyGate): Adapter
 }
 
 /**
- * node 适配器：只翻译两类参数 --
- * - --require / --import 的模块路径值（read 意图）；
- * - 脚本入口（argv[1]，即第一个位置参数，execute 意图）。
- * 其余 token（node 自身的其他选项、传给脚本的业务参数）不涉及虚拟路径语义，原样透传。
+ * node 适配器：翻译预加载模块路径与真正的脚本入口。
+ * 脚本入口不一定是 argv[1]（例如 `node --inspect /workspace/app.js`），因此需要
+ * 跳过 Node 选项及其值，直到找到第一个位置参数；入口之后的 token 都是脚本参数，
+ * 即使以 `/` 开头也必须原样保留。`-e` / `-p` 直接提供代码，不再寻找脚本入口。
  */
 function nodeAdapter(argv: string[], table: MountTable, gate: PolicyGate): AdapterResult {
   const output = [...argv];
   const decisions: PathDecision[] = [];
+  const moduleOptions = new Set(["-r", "--require", "--import", "--loader", "--experimental-loader"]);
+  const inlineCodeOptions = new Set(["-e", "--eval", "-p", "--print"]);
+  let afterSeparator = false;
+  let entrypointSeen = false;
+
+  const translate = (index: number, intent: PathIntent): void => {
+    const token = output[index];
+    if (!token?.startsWith("/")) return;
+    const translated = translatePathToken(token, table, "path-scalar", intent, index, roots(gate, intent), check(gate));
+    output[index] = translated.token;
+    decisions.push(translated.decision);
+  };
+
   for (let index = 1; index < output.length; index += 1) {
     const token = output[index];
-    // --require / --import 的值是模块路径，按 read 意图翻译。
-    if (token === "--require" || token === "--import") {
-      const next = output[index + 1];
-      if (next?.startsWith("/")) {
-        const translated = translatePathToken(next, table, "path-scalar", "read", index + 1, roots(gate, "read"), check(gate));
-        output[index + 1] = translated.token;
+    if (entrypointSeen) continue;
+    if (!afterSeparator && token === "--") { afterSeparator = true; continue; }
+    if (!afterSeparator && index === 1 && token === "inspect") continue;
+
+    // 预加载模块选项允许独立值、长选项等号形式和 -rPATH 组合形式。
+    if (!afterSeparator && moduleOptions.has(token)) {
+      translate(index + 1, "read");
+      index += 1;
+      continue;
+    }
+    const moduleEquals = !afterSeparator ? token.match(/^(--require|--import|--loader|--experimental-loader)=(.*)$/) : undefined;
+    if (moduleEquals?.[2]?.startsWith("/")) {
+      const translated = translatePathToken(moduleEquals[2], table, "path-scalar", "read", index, roots(gate, "read"), check(gate));
+      output[index] = `${moduleEquals[1]}=${translated.token}`;
+      decisions.push(translated.decision);
+      continue;
+    }
+    if (!afterSeparator && token.startsWith("-r") && token !== "-r") {
+      const modulePath = token.slice(2);
+      if (modulePath.startsWith("/")) {
+        const translated = translatePathToken(modulePath, table, "path-scalar", "read", index, roots(gate, "read"), check(gate));
+        output[index] = `-r${translated.token}`;
         decisions.push(translated.decision);
       }
-    } else if (index === 1 && token?.startsWith("/")) {
-      // argv[1] 是脚本入口，按 execute 意图翻译。
-      const translated = translatePathToken(token, table, "path-scalar", "execute", index, roots(gate, "execute"), check(gate));
-      output[index] = translated.token;
-      decisions.push(translated.decision);
+      continue;
     }
+
+    // eval/print 的下一个 token 是代码而不是脚本路径；组合形式同样终止入口搜索。
+    if (!afterSeparator && inlineCodeOptions.has(token)) {
+      entrypointSeen = true;
+      index += 1;
+      continue;
+    }
+    if (!afterSeparator && (/^-(?:e|p).+/.test(token) || /^--(?:eval|print|run)=/.test(token))) {
+      entrypointSeen = true;
+      continue;
+    }
+    if (!afterSeparator && token === "-") { entrypointSeen = true; continue; }
+    if (!afterSeparator && token.startsWith("-")) continue;
+
+    // 第一个非选项 token 是脚本入口（相对入口无需翻译，但仍会结束入口搜索）。
+    translate(index, "execute");
+    entrypointSeen = true;
   }
   return { argv: output, decisions };
 }

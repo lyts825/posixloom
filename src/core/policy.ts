@@ -16,7 +16,7 @@
  *   策略允许且已挂载的宿主目录才可访问，避免策略引用未挂载区域。
  */
 import { existsSync } from "node:fs";
-import { resolve } from "node:path";
+import { resolve, win32 } from "node:path";
 import { PosixLoomError } from "./errors.js";
 import { isHostPathInside, MountTable, physicalCheck } from "./path.js";
 import type { HostPath, PathIntent, PolicyProfile, RuntimeSnapshot, VirtualPath } from "./types.js";
@@ -28,7 +28,8 @@ import type { HostPath, PathIntent, PolicyProfile, RuntimeSnapshot, VirtualPath 
  */
 function rootContains(root: VirtualPath, candidate: VirtualPath): boolean {
   const normalizedRoot = root.replace(/\/$/, "") || "/";
-  return candidate === normalizedRoot || candidate.startsWith(`${normalizedRoot}/`);
+  return candidate === normalizedRoot
+    || (normalizedRoot === "/" ? candidate.startsWith("/") : candidate.startsWith(`${normalizedRoot}/`));
 }
 
 /**
@@ -103,8 +104,8 @@ export class PolicyGate {
    *
    * trusted 模式返回全部挂载点宿主路径；guard 模式先按意图选取策略根
    * （write/create 用 knownWriteRoots，其余用 knownReadRoots），
-   * 再过滤挂载表：挂载点与策略根任一方包含另一方即视为相交，
-   * 交集内挂载点的宿主路径即为允许根。
+   * 再与挂载表逐项求交：策略根包含挂载点时放行整个挂载；策略根位于更宽
+   * 的挂载内部时，只返回与策略根对应的宿主子目录，避免扩大授权范围。
    *
    * @param intent 路径访问意图（read/write/create/execute/unknown）
    * @returns 允许访问的宿主根路径列表
@@ -113,9 +114,23 @@ export class PolicyGate {
     if (this.trusted) return this.mounts.entries.map((entry) => entry.hostPath);
     // 按意图选择读根或写根，再与挂载表求交
     const roots = intent === "write" || intent === "create" ? this.profile.knownWriteRoots : this.profile.knownReadRoots;
-    return this.mounts.entries
-      .filter((entry) => roots.some((root) => rootContains(root, entry.virtualPath) || rootContains(entry.virtualPath, root)))
-      .map((entry) => entry.hostPath);
+    const intersections = new Map<string, HostPath>();
+    for (const entry of this.mounts.entries) {
+      for (const root of roots) {
+        if (rootContains(root, entry.virtualPath)) {
+          intersections.set(entry.hostPath.toLowerCase(), entry.hostPath);
+        } else if (rootContains(entry.virtualPath, root)) {
+          // 策略根位于一个更宽的挂载内时，只放行对应的宿主子目录；返回整个
+          // 挂载根会让 /workspace 策略意外放行同一根挂载下的 /other。
+          const suffix = entry.virtualPath === "/"
+            ? root.slice(1)
+            : root.slice(entry.virtualPath.length).replace(/^\//, "");
+          const hostRoot = suffix ? win32.join(entry.hostPath, suffix) : entry.hostPath;
+          intersections.set(hostRoot.toLowerCase(), hostRoot);
+        }
+      }
+    }
+    return [...intersections.values()];
   }
 
   /**

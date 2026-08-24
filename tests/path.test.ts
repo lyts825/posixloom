@@ -1,6 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { MountTable, normalizeVirtual } from "../src/core/path.js";
+import { PolicyGate } from "../src/core/policy.js";
+import { RuntimeManager } from "../src/core/runtime.js";
 
 test("mount table performs longest-prefix virtual to host translation", () => {
   const table = new MountTable({
@@ -29,4 +31,27 @@ test("host-to-virtual translation chooses the most specific host mount", () => {
     { virtualPath: "/short", hostPath: "C:\\work\\nested" },
   ]);
   assert.equal(table.toVirtual("C:\\work\\nested\\file.txt"), "/short/file.txt");
+});
+
+test("virtual root mounts and policy roots contain all descendants", async () => {
+  const table = new MountTable({ "/": "C:\\sandbox" });
+  assert.equal(table.toHost("/nested/file.txt"), "C:\\sandbox\\nested\\file.txt");
+  assert.equal(table.findMount("/nested")?.virtualPath, "/");
+
+  const runtime = await RuntimeManager.create(process.cwd());
+  const nestedGate = new PolicyGate("workspace-guard", {
+    mode: "guardrail",
+    knownReadRoots: ["/workspace"],
+    knownWriteRoots: ["/workspace"],
+    runtimeReadOnly: true,
+  }, table, runtime.snapshot);
+  assert.deepEqual(nestedGate.allowedHostRoots("read"), ["C:\\sandbox\\workspace"]);
+
+  const gate = new PolicyGate("workspace-guard", {
+    mode: "guardrail",
+    knownReadRoots: ["/"],
+    knownWriteRoots: ["/"],
+    runtimeReadOnly: true,
+  }, runtime.mountTable, runtime.snapshot);
+  assert.deepEqual(new Set(gate.allowedHostRoots("read")), new Set(runtime.mountTable.entries.map((entry) => entry.hostPath)));
 });

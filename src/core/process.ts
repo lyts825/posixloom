@@ -117,36 +117,50 @@ interface PendingInteractiveEvent {
   reject: (error: unknown) => void;
 }
 
+const MAX_PENDING_INTERACTIVE_BYTES = 1024 * 1024;
+const MAX_PENDING_INTERACTIVE_EVENTS = 256;
+
 /**
  * 可在命令启动前接收输入的交互控制器。
  * CLI/Harness 与进程启动是并发的，因此在 Native Host 附加 sink 前
- * 到达的少量输入会有界缓冲；超过 1 MiB 则拒绝，防止对端在子进程
- * 尚未就绪时无限堆积内存。附加后所有事件经 Promise lane 严格保序。
+ * 到达的少量输入会有界缓冲；附加后所有事件经 Promise lane 严格保序，
+ * 且未送达的输入在整个生命周期内都受 1 MiB / 256 事件双重上限约束。
  */
 export class InteractiveProcessController {
   private sink?: InteractiveSink;
   private readonly pending: PendingInteractiveEvent[] = [];
   private pendingBytes = 0;
+  private pendingEvents = 0;
   private lane: Promise<void> = Promise.resolve();
   private inputEnded = false;
+  private endPromise?: Promise<void>;
   private terminalError?: Error;
 
   private enqueue(event: InteractiveControlEvent, bytes = 0): Promise<void> {
     if (this.terminalError) return Promise.reject(this.terminalError);
-    if (this.sink) return this.deliver(event);
-    if (this.pendingBytes + bytes > 1024 * 1024) {
-      return Promise.reject(new PosixLoomError("TERMINAL_INPUT_BUFFER_FULL", "Interactive input exceeded the pre-start buffer limit"));
+    if (this.pendingBytes + bytes > MAX_PENDING_INTERACTIVE_BYTES || this.pendingEvents >= MAX_PENDING_INTERACTIVE_EVENTS) {
+      return Promise.reject(new PosixLoomError(
+        "TERMINAL_INPUT_BUFFER_FULL",
+        "Interactive input exceeded the pending delivery limit",
+        { pendingBytes: this.pendingBytes, pendingEvents: this.pendingEvents },
+      ));
     }
     this.pendingBytes += bytes;
+    this.pendingEvents += 1;
+    if (this.sink) return this.deliver(event, bytes);
     return new Promise<void>((resolve, reject) => this.pending.push({ event, bytes, resolve, reject }));
   }
 
-  private deliver(event: InteractiveControlEvent): Promise<void> {
+  private deliver(event: InteractiveControlEvent, bytes: number): Promise<void> {
     const sink = this.sink;
     if (!sink) return Promise.reject(new PosixLoomError("TERMINAL_NOT_ATTACHED", "Interactive process is not attached"));
     const delivery = this.lane.then(() => sink(event));
-    this.lane = delivery.catch(() => undefined);
-    return delivery;
+    const tracked = delivery.finally(() => {
+      this.pendingBytes -= bytes;
+      this.pendingEvents -= 1;
+    });
+    this.lane = tracked.catch(() => undefined);
+    return tracked;
   }
 
   /** 写入一段原始终端输入（单次上限 64 KiB）。 */
@@ -162,9 +176,18 @@ export class InteractiveProcessController {
 
   /** 通知子进程终端输入已结束。 */
   end(): Promise<void> {
-    if (this.inputEnded) return Promise.resolve();
+    if (this.endPromise) return this.endPromise;
     this.inputEnded = true;
-    return this.enqueue({ type: "eof" });
+    const attempt = this.enqueue({ type: "eof" });
+    const tracked = attempt.catch((error) => {
+      if (this.endPromise === tracked) {
+        this.inputEnded = false;
+        this.endPromise = undefined;
+      }
+      throw error;
+    });
+    this.endPromise = tracked;
+    return tracked;
   }
 
   /** 更新伪终端字符视口。 */
@@ -179,8 +202,7 @@ export class InteractiveProcessController {
     if (this.terminalError) throw this.terminalError;
     this.sink = sink;
     for (const pending of this.pending.splice(0)) {
-      this.pendingBytes -= pending.bytes;
-      void this.deliver(pending.event).then(pending.resolve, pending.reject);
+      void this.deliver(pending.event, pending.bytes).then(pending.resolve, pending.reject);
     }
   }
 
@@ -189,8 +211,11 @@ export class InteractiveProcessController {
     if (this.terminalError) return;
     this.terminalError = error;
     this.sink = undefined;
-    for (const pending of this.pending.splice(0)) pending.reject(error);
-    this.pendingBytes = 0;
+    for (const pending of this.pending.splice(0)) {
+      this.pendingBytes -= pending.bytes;
+      this.pendingEvents -= 1;
+      pending.reject(error);
+    }
   }
 }
 
@@ -420,17 +445,26 @@ class ProcessOutputForwarder {
 
 /**
  * 读取并删除报告文件。报告是一次性产物（state-report 落盘后即被消费），
- * 无论读取成功与否都强制清理，避免临时目录残留；文件不存在时返回
- * fallback（例如 reportFd 管道已收集到的内容）。
+ * 无论读取成功与否都尽力清理，避免临时目录残留；文件不存在时返回
+ * fallback（例如 reportFd 管道已收集到的内容）。IO 失败作为数据返回，
+ * 由执行收口映射为 REPORT_IO_FAILED，不能让结果 Promise 悬空。
  */
-function readAndRemoveReport(path: string | undefined, fallback = Buffer.alloc(0)): Buffer {
-  if (!path || !existsSync(path)) return fallback;
+function readAndRemoveReport(path: string | undefined, fallback = Buffer.alloc(0)): { data: Buffer; error?: unknown } {
+  if (!path || !existsSync(path)) return { data: fallback };
+  let data = fallback;
+  let failure: unknown;
   try {
-    return readFileSync(path);
-  } finally {
+    data = readFileSync(path);
+  } catch (error) {
+    failure = error;
+  }
+  try {
     // 读没读到都要删，防止下次执行读到上一次的旧报告。
     rmSync(path, { force: true });
+  } catch (error) {
+    failure ??= error;
   }
+  return { data, error: failure };
 }
 
 /**
@@ -631,10 +665,13 @@ async function runViaNativeHost(options: ProcessRunOptions): Promise<ProcessRunR
     options.signal?.removeEventListener("abort", abort);
     options.interactive?.terminate();
     void outputForwarder.drain().then(() => {
+      const report = readAndRemoveReport(options.reportPath);
       const finalOutcome = outputForwarder.failed
         ? { kind: "crashed" as const, errorCode: "OUTPUT_SINK_FAILED" }
-        : outcome;
-      resolvePromise(makeResult(finalOutcome, stdout, stderr, readAndRemoveReport(options.reportPath), "native-host"));
+        : report.error
+          ? { kind: "crashed" as const, errorCode: "REPORT_IO_FAILED" }
+          : outcome;
+      resolvePromise(makeResult(finalOutcome, stdout, stderr, report.data, "native-host"));
     });
   };
   // 写一帧到宿主 stdin；宿主可能已退出，先确认管道未销毁。
@@ -801,10 +838,13 @@ async function runViaNode(options: ProcessRunOptions): Promise<ProcessRunResult>
       if (graceTimer) clearTimeout(graceTimer);
       options.signal?.removeEventListener("abort", abort);
       void outputForwarder.drain().then(() => {
+        const report = readAndRemoveReport(options.reportPath, Buffer.concat(reportChunks));
         const finalOutcome = outputForwarder.failed
           ? { kind: "crashed" as const, errorCode: "OUTPUT_SINK_FAILED" }
-          : outcome;
-        resolve(makeResult(finalOutcome, stdout, stderr, readAndRemoveReport(options.reportPath, Buffer.concat(reportChunks)), "node-fallback"));
+          : report.error
+            ? { kind: "crashed" as const, errorCode: "REPORT_IO_FAILED" }
+            : outcome;
+        resolve(makeResult(finalOutcome, stdout, stderr, report.data, "node-fallback"));
       });
     };
     // 两级终止：先温和终止（Windows: taskkill 杀整棵进程树；其他平台:

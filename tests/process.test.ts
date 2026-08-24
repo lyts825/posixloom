@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { existsSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { InteractiveProcessController, NativeEventValidator, NativeFrameDecoder, OutputCollector, encodeNativeFrame, runProcess } from "../src/core/process.js";
@@ -47,6 +48,41 @@ test("process output observer streams binary-safe chunks before completion", asy
   assert.deepEqual(Buffer.concat(events.filter((event) => event.stream === "stderr").map((event) => event.data)), Buffer.from([255, 254]));
   assert.deepEqual(result.stdout, Buffer.from([0, 1, 2, 3]));
   assert.deepEqual(result.stderr, Buffer.from([255, 254]));
+});
+
+test("interactive delivery remains bounded after the native sink is attached", async () => {
+  const interactive = new InteractiveProcessController();
+  let release!: () => void;
+  const blocked = new Promise<void>((resolve) => { release = resolve; });
+  interactive.attach(() => blocked);
+  const accepted = Array.from({ length: 16 }, () => interactive.write(Buffer.alloc(64 * 1024)));
+  await assert.rejects(
+    () => interactive.write(Buffer.from("overflow")),
+    (error: any) => error?.code === "TERMINAL_INPUT_BUFFER_FULL",
+  );
+  release();
+  await Promise.all(accepted);
+  interactive.terminate();
+});
+
+test("report IO failures settle as a crashed outcome", async () => {
+  const fixture = mkdtempSync(join(tmpdir(), "posixloom-report-io-"));
+  const reportPath = join(fixture, "report-directory");
+  try {
+    mkdirSync(reportPath);
+    const result = await runProcess({
+      program: process.execPath,
+      args: ["-e", ""],
+      cwd: process.cwd(),
+      env: { ...process.env } as Record<string, string>,
+      timeoutMs: 5000,
+      maxOutputBytes: 1024,
+      reportPath,
+    });
+    assert.deepEqual(result.outcome, { kind: "crashed", errorCode: "REPORT_IO_FAILED" });
+  } finally {
+    rmSync(fixture, { recursive: true, force: true });
+  }
 });
 
 test("native protocol decoder accepts split length-prefixed frames", () => {

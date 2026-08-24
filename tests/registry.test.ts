@@ -66,3 +66,25 @@ test("ripgrep distinguishes patterns and option values from path positions", asy
   assert.ok(files);
   assert.equal(files.adapter.argv[2], runtime.config.workspace);
 });
+
+test("node translates an entrypoint after options without rewriting script arguments", async () => {
+  const runtime = await RuntimeManager.create(process.cwd());
+  const gate = new PolicyGate("trusted", runtime.config.runtime.policy.profiles.trusted, runtime.mountTable, runtime.snapshot);
+  const resolved = runtime.registry.resolve(
+    "node",
+    ["node", "--preserve-symlinks", "--require", "/workspace/preload.cjs", "/workspace/app.js", "/workspace/script-argument"],
+    runtime.snapshot,
+    runtime.mountTable,
+    gate,
+  );
+  assert.ok(resolved);
+  assert.equal(resolved.adapter.argv[3], join(runtime.config.workspace, "preload.cjs"));
+  assert.equal(resolved.adapter.argv[4], join(runtime.config.workspace, "app.js"));
+  assert.equal(resolved.adapter.argv[5], "/workspace/script-argument");
+  assert.deepEqual(resolved.adapter.decisions.map((decision) => decision.argumentIndex), [3, 4]);
+
+  const stdin = runtime.registry.resolve("node", ["node", "-", "/workspace/stdin-argument"], runtime.snapshot, runtime.mountTable, gate);
+  assert.ok(stdin);
+  assert.equal(stdin.adapter.argv[2], "/workspace/stdin-argument");
+  assert.deepEqual(stdin.adapter.decisions, []);
+});

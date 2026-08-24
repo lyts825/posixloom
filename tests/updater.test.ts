@@ -58,6 +58,11 @@ test("semantic version comparison keeps stable releases above prereleases", () =
   assert.equal(compareSemver("1.2.0", "1.1.9") > 0, true);
   assert.equal(compareSemver("1.2.0", "1.2.0-rc.1") > 0, true);
   assert.equal(compareSemver("1.2.0-rc.2", "1.2.0-rc.1") > 0, true);
+  assert.equal(compareSemver("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0, true);
+  assert.equal(compareSemver("1.0.0-beta.11", "1.0.0-rc.1") < 0, true);
+  assert.equal(compareSemver("9007199254740993.0.0", "9007199254740992.0.0") > 0, true);
+  assert.equal(compareSemver("1.2.3-trailing", "1.2.3-trailing-junk") < 0, true);
+  assert.equal(compareSemver("1.2.3garbage", "1.2.3") < 0, true);
 });
 
 test("Runtime update sequence orders environment rebuilds within one core version", () => {

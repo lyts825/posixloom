@@ -54,6 +54,9 @@ const PROTOCOL_VERSION: u32 = 1;
 /// 大块输出留出余量，又封顶了恶意/异常长度前缀可能触发的内存分配，
 /// 是协议层的资源耗尽防护。
 const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
+/// 交互控制与待写终端输入各自最多缓存的事件数。单个 input 帧上限 64 KiB，
+/// 两级有界通道把宿主内部积压限制在约 2 MiB，并把背压传回控制端管道。
+const MAX_PENDING_INTERACTIVE_EVENTS: usize = 16;
 
 /// 控制端发来的 exec 请求帧（stdin 上的首帧，JSON 反序列化目标）。
 /// 注意 env 是“完整环境”而非增量：宿主自身的环境变量不会泄漏给子进程。
@@ -359,6 +362,7 @@ mod windows_exec {
     ///   - 其余参数整体加双引号；双引号前按“前导反斜杠数 * 2 + 1”转义
     ///     （反斜杠只在紧邻引号时才有转义含义，偶数个保持字面量）；
     ///   - 末尾连续反斜杠因紧邻收尾引号，同样需要翻倍。
+    ///
     /// 引用一旦出错参数边界就会漂移，这是 Windows 上最经典的命令注入来源，
     /// 因此本函数被设计为纯函数并有独立单元测试覆盖。
     fn quote_arg(value: &str) -> String {
@@ -574,7 +578,7 @@ mod windows_exec {
         if attribute_bytes == 0 {
             return Err("InitializeProcThreadAttributeList did not report a size".to_string());
         }
-        let words = (attribute_bytes + size_of::<usize>() - 1) / size_of::<usize>();
+        let words = attribute_bytes.div_ceil(size_of::<usize>());
         let mut attribute_storage = vec![0usize; words];
         let attribute_list = attribute_storage.as_mut_ptr() as LPPROC_THREAD_ATTRIBUTE_LIST;
         if unsafe { InitializeProcThreadAttributeList(attribute_list, 1, 0, &mut attribute_bytes) }
@@ -667,26 +671,26 @@ mod windows_exec {
             unsafe { std::fs::File::from_raw_handle(output_read.take() as _) },
             "stdout",
         );
-        let (input_tx, input_rx) = std::sync::mpsc::channel::<Option<Vec<u8>>>();
+        let (input_tx, input_rx) =
+            std::sync::mpsc::sync_channel::<Vec<u8>>(MAX_PENDING_INTERACTIVE_EVENTS);
         let (input_finished_tx, input_finished_rx) = std::sync::mpsc::channel();
         let input_write_value = input_write.take() as usize;
         std::thread::spawn(move || {
             let mut stream = unsafe { std::fs::File::from_raw_handle(input_write_value as _) };
-            while let Ok(message) = input_rx.recv() {
-                match message {
-                    Some(bytes) => {
-                        if stream.write_all(&bytes).is_err() || stream.flush().is_err() {
-                            break;
-                        }
-                    }
-                    None => break,
+            while let Ok(bytes) = input_rx.recv() {
+                if stream.write_all(&bytes).is_err() || stream.flush().is_err() {
+                    break;
                 }
             }
             let _ = input_finished_tx.send(());
         });
         let mut input_sender = Some(input_tx);
         if !initial_input.is_empty() {
-            let _ = input_sender.as_ref().unwrap().send(Some(initial_input));
+            input_sender
+                .as_ref()
+                .unwrap()
+                .try_send(initial_input)
+                .map_err(|_| "ConPTY initial input channel closed".to_string())?;
         }
 
         let started = Instant::now();
@@ -696,9 +700,19 @@ mod windows_exec {
                 match control {
                     RuntimeControl::Input(bytes) => {
                         if let Some(sender) = input_sender.as_ref() {
-                            if sender.send(Some(bytes)).is_err() {
-                                control_error = Some("ConPTY input channel closed".to_string());
-                                break;
+                            match sender.try_send(bytes) {
+                                Ok(()) => {}
+                                Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                                    control_error = Some(
+                                        "ConPTY pending input exceeded the bounded queue"
+                                            .to_string(),
+                                    );
+                                    break;
+                                }
+                                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                                    control_error = Some("ConPTY input channel closed".to_string());
+                                    break;
+                                }
                             }
                         }
                     }
@@ -726,7 +740,20 @@ mod windows_exec {
                         // Ctrl+Z 是 Windows 控制台的文本 EOF 键，既能让行模式程序观测
                         // EOF，又不会拆掉伪终端会话。
                         if let Some(sender) = input_sender.as_ref() {
-                            let _ = sender.send(Some(vec![0x1a]));
+                            match sender.try_send(vec![0x1a]) {
+                                Ok(()) => {}
+                                Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                                    control_error = Some(
+                                        "ConPTY pending input exceeded the bounded queue"
+                                            .to_string(),
+                                    );
+                                    break;
+                                }
+                                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                                    control_error = Some("ConPTY input channel closed".to_string());
+                                    break;
+                                }
+                            }
                         }
                     }
                 }
@@ -756,9 +783,7 @@ mod windows_exec {
             unsafe { TerminateJobObject(job.0, 0) };
         }
         unsafe { WaitForSingleObject(process_info.hProcess, 5000) };
-        if let Some(sender) = input_sender.take() {
-            let _ = sender.send(None);
-        }
+        drop(input_sender.take());
 
         let mut exit_code = 1u32;
         let exit_code_ok = unsafe { GetExitCodeProcess(process_info.hProcess, &mut exit_code) };
@@ -791,6 +816,7 @@ mod windows_exec {
     ///   5. 后台线程写 stdin、排空并转发 stdout/stderr；
     ///   6. 主循环 50ms 轮询：正常退出 / 协作取消 / 超时 / 等待调用失败；
     ///   7. 终态收尾：强杀残余子进程、有界等待排水线程、读退出码、发 exit 事件。
+    ///
     /// 任一阶段失败都显式释放已创建的句柄并返回错误（错误帧 + 退出码 1），
     /// 保证没有句柄泄漏、没有进程逃出 Job。
     fn execute_pipe(request: ExecRequest, cancelled: Arc<AtomicBool>) -> Result<(), String> {
@@ -1166,6 +1192,7 @@ mod unix_exec {
 ///   - "launch"                       -> 角色 A 启动器（不返回）；
 ///   - "__exec-host --protocol-v1"    -> 角色 B 进程执行宿主；
 ///   - 其他（含缺省）                -> 打印用法并以退出码 2 结束。
+///
 /// 角色 B 的协议顺序固定：先发 hello（附 maxFrameBytes），再读 exec 请求，
 /// 通过校验后启动取消监听线程，最后进入平台执行后端。
 fn main() {
@@ -1214,7 +1241,8 @@ fn main() {
     let cancelled = Arc::new(AtomicBool::new(false));
     let listener_flag = cancelled.clone();
     let request_tty = request.tty;
-    let (control_tx, control_rx) = std::sync::mpsc::channel::<RuntimeControl>();
+    let (control_tx, control_rx) =
+        std::sync::mpsc::sync_channel::<RuntimeControl>(MAX_PENDING_INTERACTIVE_EVENTS);
     std::thread::spawn(move || {
         let stdin = std::io::stdin();
         let mut input = stdin.lock();
@@ -1461,6 +1489,7 @@ fn probe_writable_directory(directory: &std::path::Path) -> Result<(), String> {
 ///   2. RunRoot 下的 data/（真正的便携模式；写探测失败才继续回退）；
 ///   3. LOCALAPPDATA，或 USERPROFILE\.local\share，或 HOME/.local/share
 ///      下的 PosixLoom/data。
+///
 /// 便携目录优先于用户目录：只有便携盘不可写时才落到用户目录。
 fn selected_data_root(run_root: &std::path::Path) -> Result<std::path::PathBuf, String> {
     if let Some(value) = std::env::var("POSIXLOOM_DATA_ROOT")
@@ -1648,6 +1677,7 @@ fn sha256_file(path: &std::path::Path) -> Result<String, String> {
 ///      （不跟随链接）做判定，防止“校验的是 A、实际执行的是 B”的
 ///      链接替换攻击；
 ///   3. 实算哈希与期望值（统一转小写后）精确比较。
+///
 /// 任一环节失败都返回带 label 的错误信息。
 fn verify_hash(path: &std::path::Path, expected: &str, label: &str) -> Result<(), String> {
     if expected.len() != 64 || !expected.chars().all(|ch| ch.is_ascii_hexdigit()) {
@@ -1797,6 +1827,7 @@ fn collect_real_package_files(
 ///      磁盘上多出的文件（未被清单覆盖）与清单里多出的记录都算失败--
 ///      “精确覆盖”确保没有文件能躲在清单之外被加载，也没有死记录掩盖缺文件；
 ///   3. 扫描本身排除符号链接与逃逸路径（见 collect_real_package_files）。
+///
 /// 换言之：对 dist/config 的任何篡改、增删都会让启动在此失败。
 fn verify_package_application(run_root: &std::path::Path) -> Result<(), String> {
     let records = package_checksum_records(run_root)?;
@@ -1856,6 +1887,7 @@ fn verify_package_application(run_root: &std::path::Path) -> Result<(), String> 
 ///   - entrypoint 归一化为 '/' 后必须精确等于 node/node[.exe]，
 ///     且通过 safe_relative_path--禁止清单把入口指到 Runtime 之外；
 ///   - 组件必须声明 SHA-256 且实算一致（verify_hash 同时排除符号链接）。
+///
 /// 返回的路径是“此刻内容已验证”的；之后若被替换，下次校验仍会失败。
 fn release_node(
     runtime: &SelectedRuntime,
@@ -1992,6 +2024,7 @@ fn runtime_from_pointer(
 ///   2. 否则枚举 runtime/versions/ 下所有目录，按名称降序（最新优先）
 ///      逐个尝试能通过 manifest/runtimeId/模式/哈希校验的运行时；
 ///   3. 都不行返回 None，由调用方决定后续。
+///
 /// 这里的失败被静默跳过--恢复模式的目标是“尽力拉起”，但每一个最终
 /// 被选中的候选仍然必须通过全部校验，放宽的只是“指针必须有效”这一条。
 fn recovery_node_from_base(
@@ -2334,7 +2367,7 @@ mod tests {
             r#"{"runtimeId":"runtime-release","mode":"release"}"#,
         )
         .unwrap();
-        assert_eq!(release_runtime_present(&root).unwrap(), true);
+        assert!(release_runtime_present(&root).unwrap());
         assert!(select_launcher_node(root.to_str().unwrap()).is_err());
         std::fs::remove_dir_all(root).unwrap();
     }

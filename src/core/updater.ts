@@ -203,11 +203,27 @@ async function assertNoLinks(root: string): Promise<void> {
   }
 }
 
-/** 解析 semver 的主版本三元组与可选 prerelease；无法解析时按 0.0.0 处理并把原串留作 prerelease（排序时视为最低）。 */
-function semverParts(value: string): { core: number[]; prerelease?: string } {
-  const match = value.trim().replace(/^v/, "").match(/^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?/);
-  if (!match) return { core: [0, 0, 0], prerelease: value };
-  return { core: [Number(match[1]), Number(match[2]), Number(match[3])], prerelease: match[4] };
+interface SemverParts {
+  core: [string, string, string];
+  prerelease?: string[];
+}
+
+/** 解析完整 semver 主版本三元组与 prerelease 标识；无效或带尾随垃圾时返回 undefined。 */
+function semverParts(value: string): SemverParts | undefined {
+  const match = value.trim().replace(/^v/, "").match(/^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?$/);
+  if (!match) return undefined;
+  return {
+    core: [match[1], match[2], match[3]],
+    prerelease: match[4]?.split("."),
+  };
+}
+
+/** 比较任意长度的非负十进制整数，避免 Number 精度丢失让两个版本被误判相等。 */
+function compareNumericIdentifier(left: string, right: string): number {
+  const a = left.replace(/^0+(?=\d)/, "");
+  const b = right.replace(/^0+(?=\d)/, "");
+  if (a.length !== b.length) return a.length - b.length;
+  return a === b ? 0 : a < b ? -1 : 1;
 }
 
 /**
@@ -241,19 +257,39 @@ function isRuntimeRelease(value: unknown): value is RuntimeRelease {
 /**
  * 比较两个语义化版本。
  * @returns left < right 返回负数；相等返回 0；left > right 返回正数。
- * 规则：主三元组按数值比较；无 prerelease 者高于有 prerelease 者（1.0.0 > 1.0.0-rc.1）；
- * prerelease 之间按英文区域、数值感知的字符串比较。
+ * 规则：主三元组按任意精度十进制数比较；无 prerelease 者高于有 prerelease 者；
+ * prerelease 逐段比较，数字段低于非数字段，较短的相同前缀版本优先级更低。
  */
 export function compareSemver(left: string, right: string): number {
   const a = semverParts(left);
   const b = semverParts(right);
-  for (let index = 0; index < 3; index += 1) {
-    if (a.core[index] !== b.core[index]) return a.core[index] - b.core[index];
+  // 内部 feed 已经过 schema 校验；对导出 API 的无效输入仍给出稳定的最低排序，
+  // 而不是让部分匹配或 NaN 悄悄污染 Array.sort。
+  if (!a || !b) {
+    if (!a && !b) return left === right ? 0 : left < right ? -1 : 1;
+    return a ? 1 : -1;
   }
-  if (a.prerelease === b.prerelease) return 0;
+  for (let index = 0; index < 3; index += 1) {
+    const core = compareNumericIdentifier(a.core[index], b.core[index]);
+    if (core !== 0) return core;
+  }
+  if (a.prerelease === undefined && b.prerelease === undefined) return 0;
   if (a.prerelease === undefined) return 1;
   if (b.prerelease === undefined) return -1;
-  return a.prerelease.localeCompare(b.prerelease, "en", { numeric: true });
+  const count = Math.max(a.prerelease.length, b.prerelease.length);
+  for (let index = 0; index < count; index += 1) {
+    const leftIdentifier = a.prerelease[index];
+    const rightIdentifier = b.prerelease[index];
+    if (leftIdentifier === undefined) return -1;
+    if (rightIdentifier === undefined) return 1;
+    if (leftIdentifier === rightIdentifier) continue;
+    const leftNumeric = /^\d+$/.test(leftIdentifier);
+    const rightNumeric = /^\d+$/.test(rightIdentifier);
+    if (leftNumeric && rightNumeric) return compareNumericIdentifier(leftIdentifier, rightIdentifier);
+    if (leftNumeric !== rightNumeric) return leftNumeric ? -1 : 1;
+    return leftIdentifier < rightIdentifier ? -1 : 1;
+  }
+  return 0;
 }
 
 /**
