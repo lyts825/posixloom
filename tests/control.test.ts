@@ -121,6 +121,55 @@ test("control protocol previews plans and streams ordered binary output", async 
   await server;
 });
 
+test("control protocol drives a ConPTY with input and resize frames", { skip: process.platform !== "win32" }, async () => {
+  const runtime = await RuntimeManager.create(process.cwd());
+  const input = new PassThrough();
+  const output = new PassThrough();
+  const reader = new FrameReader(output);
+  const server = serveControlPlane(runtime, input, output);
+  const hello = await reader.next();
+  assert.equal(hello.capabilities.includes("pty-v1"), true);
+
+  input.write(encodeNativeFrame({ protocolVersion: 1, type: "session.create", id: "pty-session" }));
+  const sessionId = (await reader.next()).result.sessionId;
+  input.write(encodeNativeFrame({
+    protocolVersion: 1,
+    type: "execute",
+    id: "pty-execute",
+    sessionId,
+    stream: true,
+    terminal: { columns: 80, rows: 24 },
+    input: {
+      kind: "argv",
+      argv: ["node", "-e", "process.stdout.write('PTY_PROMPT>');process.stdin.once('data',d=>{process.stdout.write('PTY_GOT:'+d.toString().trim());process.exit(0)})"],
+    },
+  }));
+  const started = await reader.next();
+  assert.equal(started.event, "started");
+  input.write(encodeNativeFrame({ protocolVersion: 1, type: "terminal.resize", id: "pty-resize", targetId: "pty-execute", columns: 100, rows: 30 }));
+  input.write(encodeNativeFrame({ protocolVersion: 1, type: "terminal.input", id: "pty-input", targetId: "pty-execute", dataBase64: Buffer.from("hello-pty\r\n").toString("base64") }));
+
+  const frames: any[] = [started];
+  let completion: any;
+  let inputAccepted = false;
+  let resized = false;
+  while (!completion || !inputAccepted || !resized) {
+    const frame = await reader.next();
+    frames.push(frame);
+    if (frame.id === "pty-execute" && frame.type === "result") completion = frame;
+    if (frame.id === "pty-input" && frame.type === "result") inputAccepted = true;
+    if (frame.id === "pty-resize" && frame.type === "result") resized = true;
+  }
+  const terminalOutput = Buffer.concat(frames.filter((frame) => frame.event === "output").map((frame) => Buffer.from(frame.dataBase64, "base64")));
+  assert.equal(terminalOutput.includes(Buffer.from("PTY_PROMPT>")), true);
+  assert.equal(terminalOutput.includes(Buffer.from("PTY_GOT:hello-pty")), true);
+  assert.deepEqual(completion.result.command, { kind: "exited", exitCode: 0 });
+
+  input.write(encodeNativeFrame({ protocolVersion: 1, type: "shutdown", id: "pty-done" }));
+  await reader.next();
+  await server;
+});
+
 test("control cancellation uses an independent correlation id and reports the target", async () => {
   const runtime = await RuntimeManager.create(process.cwd());
   const input = new PassThrough();

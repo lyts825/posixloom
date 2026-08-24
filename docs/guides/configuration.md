@@ -17,7 +17,10 @@ posixloom config validate --json
 `config show` prints the normalized effective configuration after path templates and
 environment overrides have been resolved. Sessions are process-local: closing the
 control service discards their cwd and exported environment state. PosixLoom does not
-write session environment values to disk.
+write session environment values to disk. The previously declared but unimplemented
+`session.persistAcrossRestart` option is no longer supported: `true` fails validation
+with `CONFIG_UNSUPPORTED`; legacy `false` is tolerated and omitted from the effective
+configuration so existing non-persistent installations can migrate safely.
 
 ## Execution plan preview
 
@@ -55,3 +58,18 @@ policy profile, resolved Bash and Native Host paths, and Native Fast Path comman
 recording is disabled by default; enable `observability.writeTraceFile` in the user
 configuration when historical diagnostics are required. Trace records contain command
 metadata and outcomes, not command text or environment values.
+
+## Interactive terminal mode
+
+On Windows, `--pty` runs the command through ConPTY and forwards stdin, terminal
+resize events, ANSI color, and prompts. `--cols` and `--rows` set the initial
+viewport when no attached terminal size is available.
+
+```powershell
+posixloom exec --pty -- python -i
+posixloom shell --pty --cols 120 --rows 40 -c 'read -p "value: " value; echo "$value"'
+```
+
+PTY mode is intentionally separate from `--stdin`: interactive stdin remains attached
+until EOF, while `--stdin` first consumes a complete Shell script. Non-Windows hosts
+return `PTY_UNAVAILABLE` rather than silently falling back to ordinary pipes.

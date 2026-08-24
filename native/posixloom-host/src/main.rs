@@ -15,7 +15,7 @@
 //       PATH 上的 node，防止环境注入的解释器绕过一切校验接管启动；
 //     - release 运行时的 Node 可执行文件必须通过 manifest 声明的
 //       SHA-256 校验后才会被使用。
-//   恢复模式（runtime doctor/update/rollback）只放宽“如何挑一个可用运行时”，
+//   恢复模式（runtime doctor/info/update/rollback）只放宽“如何挑一个可用运行时”，
 //   不放宽完整性校验本身——修复坏指针的操作同样需要可信的应用包。
 //
 // 【角色 B：进程执行宿主（`posixloom __exec-host --protocol-v1`）】
@@ -80,6 +80,12 @@ struct ExecRequest {
     /// base64 编码的 stdin 初始载荷；None 表示不向子进程写入任何字节。
     #[serde(rename = "inputBase64")]
     input_base64: Option<String>,
+    /// true 时使用 Windows ConPTY；非 Windows 宿主会显式拒绝。
+    #[serde(default)]
+    tty: bool,
+    /// 伪终端初始字符列/行数。
+    columns: Option<u16>,
+    rows: Option<u16>,
 }
 
 /// 运行期间从 stdin 持续读取的控制帧；v1 只定义了 "cancel" 一种，
@@ -92,6 +98,18 @@ struct ControlRequest {
     /// 帧类型；合法值为 "cancel"。
     #[serde(rename = "type")]
     kind: String,
+    /// input 帧的规范 Base64 字节。
+    data: Option<String>,
+    /// resize 帧的新字符列/行数。
+    columns: Option<u16>,
+    rows: Option<u16>,
+}
+
+/// stdin 监听线程传给执行后端的运行期控制。
+enum RuntimeControl {
+    Input(Vec<u8>),
+    Resize(u16, u16),
+    Eof,
 }
 
 /// timeoutMs 字段的缺省值（30 秒），与 TS 侧 process.ts 的默认值保持一致。
@@ -260,6 +278,15 @@ fn validate_exec_request(request: &ExecRequest) -> Result<(), String> {
     if request.timeout_ms == 0 {
         return Err("timeoutMs must be greater than zero".to_string());
     }
+    if request.tty {
+        match (request.columns, request.rows) {
+            (Some(columns), Some(rows))
+                if columns > 0 && rows > 0 && columns <= 32767 && rows <= 32767 => {}
+            _ => return Err("tty requires columns and rows between 1 and 32767".to_string()),
+        }
+    } else if request.columns.is_some() || request.rows.is_some() {
+        return Err("columns and rows require tty=true".to_string());
+    }
     if request.args.iter().any(|argument| argument.contains('\0')) {
         return Err("arguments cannot contain NUL".to_string());
     }
@@ -299,6 +326,9 @@ mod windows_exec {
         CloseHandle, GetLastError, SetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT,
     };
     use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+    use windows_sys::Win32::System::Console::{
+        ClosePseudoConsole, CreatePseudoConsole, ResizePseudoConsole, COORD, HPCON,
+    };
     use windows_sys::Win32::System::JobObjects::{
         AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
         SetInformationJobObject, TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
@@ -306,9 +336,12 @@ mod windows_exec {
     };
     use windows_sys::Win32::System::Pipes::CreatePipe;
     use windows_sys::Win32::System::Threading::{
-        CreateProcessW, GetExitCodeProcess, ResumeThread, TerminateProcess, WaitForSingleObject,
-        CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, PROCESS_INFORMATION,
-        STARTF_USESTDHANDLES, STARTUPINFOW,
+        CreateProcessW, DeleteProcThreadAttributeList, GetExitCodeProcess,
+        InitializeProcThreadAttributeList, ResumeThread, TerminateProcess,
+        UpdateProcThreadAttribute, WaitForSingleObject, CREATE_NO_WINDOW, CREATE_SUSPENDED,
+        CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT, LPPROC_THREAD_ATTRIBUTE_LIST,
+        PROCESS_INFORMATION, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, STARTF_USESTDHANDLES,
+        STARTUPINFOEXW, STARTUPINFOW,
     };
 
     /// 把 UTF-8 字符串编码为 NUL 结尾的 UTF-16 宽字符向量，
@@ -393,6 +426,32 @@ mod windows_exec {
         }
     }
 
+    /// Win32 HANDLE 的通用 RAII 包装；转交给 File 时用 take 避免双重关闭。
+    struct OwnedHandle(HANDLE);
+    impl OwnedHandle {
+        fn take(&mut self) -> HANDLE {
+            std::mem::replace(&mut self.0, std::ptr::null_mut())
+        }
+    }
+    impl Drop for OwnedHandle {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe { CloseHandle(self.0) };
+            }
+        }
+    }
+
+    /// ConPTY 句柄的 RAII 包装。ClosePseudoConsole 可能产生最后一段终端输出，
+    /// 因此输出排水线程必须在关闭前已经运行。
+    struct PseudoConsole(HPCON);
+    impl Drop for PseudoConsole {
+        fn drop(&mut self) {
+            if self.0 != 0 {
+                unsafe { ClosePseudoConsole(self.0) };
+            }
+        }
+    }
+
     /// 在独立线程上持续读取一条输出管道，按 32KB 块逐段转发为流式事件，
     /// 返回“结束信号”接收端供主循环做有界等待。读错误一律按流结束处理：
     /// 管道破裂后继续等待只会永久阻塞排水线程。
@@ -415,6 +474,315 @@ mod windows_exec {
         finished_rx
     }
 
+    /// Windows ConPTY 执行路径：终端输出是一条包含 VT/ANSI 序列的合并字节流，
+    /// 统一以 stdout 事件转发。运行期 input/resize/eof 通过 controls 通道进入。
+    fn execute_pty(
+        request: ExecRequest,
+        cancelled: Arc<AtomicBool>,
+        controls: std::sync::mpsc::Receiver<RuntimeControl>,
+    ) -> Result<(), String> {
+        let initial_input = decode_input(request.input_base64.clone())?;
+        let columns = request.columns.ok_or("tty columns are missing")?;
+        let rows = request.rows.ok_or("tty rows are missing")?;
+
+        let job = Job(unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) });
+        if job.0.is_null() {
+            return Err(format!("CreateJobObjectW failed: {}", unsafe {
+                GetLastError()
+            }));
+        }
+        let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { zeroed() };
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if unsafe {
+            SetInformationJobObject(
+                job.0,
+                JobObjectExtendedLimitInformation,
+                &mut limits as *mut _ as *mut _,
+                size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+        } == 0
+        {
+            return Err(format!("SetInformationJobObject failed: {}", unsafe {
+                GetLastError()
+            }));
+        }
+
+        // ConPTY 需要两条同步管道：输入 read 端和输出 write 端交给 HPCON，
+        // 对端由本宿主的独立线程持续写/读，避免同步 IO 互相阻塞。
+        let mut input_read_raw: HANDLE = std::ptr::null_mut();
+        let mut input_write_raw: HANDLE = std::ptr::null_mut();
+        let mut output_read_raw: HANDLE = std::ptr::null_mut();
+        let mut output_write_raw: HANDLE = std::ptr::null_mut();
+        if unsafe {
+            CreatePipe(
+                &mut input_read_raw,
+                &mut input_write_raw,
+                std::ptr::null(),
+                0,
+            )
+        } == 0
+        {
+            return Err(format!("CreatePipe ConPTY input failed: {}", unsafe {
+                GetLastError()
+            }));
+        }
+        let input_read = OwnedHandle(input_read_raw);
+        let mut input_write = OwnedHandle(input_write_raw);
+        if unsafe {
+            CreatePipe(
+                &mut output_read_raw,
+                &mut output_write_raw,
+                std::ptr::null(),
+                0,
+            )
+        } == 0
+        {
+            return Err(format!("CreatePipe ConPTY output failed: {}", unsafe {
+                GetLastError()
+            }));
+        }
+        let mut output_read = OwnedHandle(output_read_raw);
+        let output_write = OwnedHandle(output_write_raw);
+
+        let mut hpc: HPCON = 0;
+        let create_pty = unsafe {
+            CreatePseudoConsole(
+                COORD {
+                    X: columns as i16,
+                    Y: rows as i16,
+                },
+                input_read.0,
+                output_write.0,
+                0,
+                &mut hpc,
+            )
+        };
+        if create_pty < 0 {
+            return Err(format!(
+                "CreatePseudoConsole failed: HRESULT 0x{:08x}",
+                create_pty as u32
+            ));
+        }
+        let pseudo = PseudoConsole(hpc);
+
+        // STARTUPINFOEX 的 attribute list 使用双调用获取尺寸，并用 usize
+        // 容器保证指针对齐。
+        let mut attribute_bytes = 0usize;
+        unsafe {
+            InitializeProcThreadAttributeList(std::ptr::null_mut(), 1, 0, &mut attribute_bytes)
+        };
+        if attribute_bytes == 0 {
+            return Err("InitializeProcThreadAttributeList did not report a size".to_string());
+        }
+        let words = (attribute_bytes + size_of::<usize>() - 1) / size_of::<usize>();
+        let mut attribute_storage = vec![0usize; words];
+        let attribute_list = attribute_storage.as_mut_ptr() as LPPROC_THREAD_ATTRIBUTE_LIST;
+        if unsafe { InitializeProcThreadAttributeList(attribute_list, 1, 0, &mut attribute_bytes) }
+            == 0
+        {
+            return Err(format!(
+                "InitializeProcThreadAttributeList failed: {}",
+                unsafe { GetLastError() }
+            ));
+        }
+        if unsafe {
+            UpdateProcThreadAttribute(
+                attribute_list,
+                0,
+                PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE as usize,
+                hpc as *const std::ffi::c_void,
+                size_of::<HPCON>(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            )
+        } == 0
+        {
+            let error = unsafe { GetLastError() };
+            unsafe { DeleteProcThreadAttributeList(attribute_list) };
+            return Err(format!("UpdateProcThreadAttribute failed: {error}"));
+        }
+
+        let command_line = std::iter::once(quote_arg(&request.program))
+            .chain(request.args.iter().map(|argument| quote_arg(argument)))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut command_w = wide(&command_line);
+        let cwd_w = wide(&request.cwd);
+        let mut environment = env_block(&request.env);
+        let mut startup: STARTUPINFOEXW = unsafe { zeroed() };
+        startup.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
+        // Native Host 自身的 stdio 是与 Node 相连的协议管道。Windows 可能在
+        // 创建 ConPTY 子进程时复制这些已重定向的标准句柄，导致用户输出
+        // 绕过伪终端并破坏帧协议。显式启用 STARTF_USESTDHANDLES 且保持
+        // hStd* 为 NULL，可禁止默认复制，随后由 PSEUDOCONSOLE attribute 建立终端句柄。
+        startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+        startup.lpAttributeList = attribute_list;
+        let mut process_info: PROCESS_INFORMATION = unsafe { zeroed() };
+        let created = unsafe {
+            CreateProcessW(
+                std::ptr::null(),
+                command_w.as_mut_ptr(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                0,
+                CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT,
+                environment.as_mut_ptr() as *mut _,
+                cwd_w.as_ptr(),
+                &startup.StartupInfo,
+                &mut process_info,
+            )
+        };
+        let create_error = (created == 0).then(|| unsafe { GetLastError() });
+        unsafe { DeleteProcThreadAttributeList(attribute_list) };
+        // CreateProcess 完成后本进程不再需要传给 HPCON 的两个管道端，
+        // 及时关闭才能让对端终止时正确观测到 broken pipe。
+        drop(input_read);
+        drop(output_write);
+        if let Some(error) = create_error {
+            return Err(format!("CreateProcessW ConPTY failed: {error}"));
+        }
+
+        if unsafe { AssignProcessToJobObject(job.0, process_info.hProcess) } == 0 {
+            let error = unsafe { GetLastError() };
+            unsafe {
+                TerminateProcess(process_info.hProcess, 1);
+                CloseHandle(process_info.hThread);
+                CloseHandle(process_info.hProcess);
+            }
+            return Err(format!("AssignProcessToJobObject failed: {error}"));
+        }
+        let resumed = unsafe { ResumeThread(process_info.hThread) };
+        let resume_error = (resumed == u32::MAX).then(|| unsafe { GetLastError() });
+        unsafe { CloseHandle(process_info.hThread) };
+        if let Some(error) = resume_error {
+            unsafe {
+                TerminateProcess(process_info.hProcess, 1);
+                CloseHandle(process_info.hProcess);
+            }
+            return Err(format!("ResumeThread failed: {error}"));
+        }
+        send_started(process_info.dwProcessId);
+
+        let output_finished = emit_stream(
+            unsafe { std::fs::File::from_raw_handle(output_read.take() as _) },
+            "stdout",
+        );
+        let (input_tx, input_rx) = std::sync::mpsc::channel::<Option<Vec<u8>>>();
+        let (input_finished_tx, input_finished_rx) = std::sync::mpsc::channel();
+        let input_write_value = input_write.take() as usize;
+        std::thread::spawn(move || {
+            let mut stream = unsafe { std::fs::File::from_raw_handle(input_write_value as _) };
+            while let Ok(message) = input_rx.recv() {
+                match message {
+                    Some(bytes) => {
+                        if stream.write_all(&bytes).is_err() || stream.flush().is_err() {
+                            break;
+                        }
+                    }
+                    None => break,
+                }
+            }
+            let _ = input_finished_tx.send(());
+        });
+        let mut input_sender = Some(input_tx);
+        if !initial_input.is_empty() {
+            let _ = input_sender.as_ref().unwrap().send(Some(initial_input));
+        }
+
+        let started = Instant::now();
+        let mut control_error: Option<String> = None;
+        let outcome = loop {
+            while let Ok(control) = controls.try_recv() {
+                match control {
+                    RuntimeControl::Input(bytes) => {
+                        if let Some(sender) = input_sender.as_ref() {
+                            if sender.send(Some(bytes)).is_err() {
+                                control_error = Some("ConPTY input channel closed".to_string());
+                                break;
+                            }
+                        }
+                    }
+                    RuntimeControl::Resize(new_columns, new_rows) => {
+                        let result = unsafe {
+                            ResizePseudoConsole(
+                                pseudo.0,
+                                COORD {
+                                    X: new_columns as i16,
+                                    Y: new_rows as i16,
+                                },
+                            )
+                        };
+                        if result < 0 {
+                            control_error = Some(format!(
+                                "ResizePseudoConsole failed: HRESULT 0x{:08x}",
+                                result as u32
+                            ));
+                            break;
+                        }
+                    }
+                    RuntimeControl::Eof => {
+                        // 不直接关闭 ConPTY 输入管道：Windows 会把连接断开解释为
+                        // console close/CTRL_C，子进程可能以 0xC000013A 异常终止。
+                        // Ctrl+Z 是 Windows 控制台的文本 EOF 键，既能让行模式程序观测
+                        // EOF，又不会拆掉伪终端会话。
+                        if let Some(sender) = input_sender.as_ref() {
+                            let _ = sender.send(Some(vec![0x1a]));
+                        }
+                    }
+                }
+            }
+            if control_error.is_some() {
+                unsafe { TerminateJobObject(job.0, 1) };
+                break "crashed";
+            }
+            let wait = unsafe { WaitForSingleObject(process_info.hProcess, 50) };
+            if wait == 0 {
+                break "exited";
+            }
+            if cancelled.load(Ordering::SeqCst) {
+                unsafe { TerminateJobObject(job.0, 130) };
+                break "cancelled";
+            }
+            if started.elapsed() >= Duration::from_millis(request.timeout_ms) {
+                unsafe { TerminateJobObject(job.0, 124) };
+                break "timed-out";
+            }
+            if wait == u32::MAX {
+                unsafe { TerminateJobObject(job.0, 1) };
+                break "crashed";
+            }
+        };
+        if outcome == "exited" {
+            unsafe { TerminateJobObject(job.0, 0) };
+        }
+        unsafe { WaitForSingleObject(process_info.hProcess, 5000) };
+        if let Some(sender) = input_sender.take() {
+            let _ = sender.send(None);
+        }
+
+        let mut exit_code = 1u32;
+        let exit_code_ok = unsafe { GetExitCodeProcess(process_info.hProcess, &mut exit_code) };
+        let exit_code_error = (exit_code_ok == 0).then(|| unsafe { GetLastError() });
+        unsafe { CloseHandle(process_info.hProcess) };
+        // 输出线程已在独立线程持续排水，此时关闭 HPCON 以便它收到最终 EOF。
+        drop(pseudo);
+        let _ = input_finished_rx.recv_timeout(Duration::from_secs(2));
+        let _ = output_finished.recv_timeout(Duration::from_secs(2));
+        if let Some(error) = exit_code_error {
+            return Err(format!("GetExitCodeProcess failed: {error}"));
+        }
+        if let Some(error) = control_error {
+            return Err(error);
+        }
+        if outcome == "timed-out" {
+            exit_code = 124;
+        } else if outcome == "cancelled" {
+            exit_code = 130;
+        }
+        send_exit(exit_code as i32, outcome);
+        Ok(())
+    }
+
     /// 执行一次 CommandJob 的完整生命周期：
     ///   1. 解码 stdin 初始载荷；
     ///   2. 创建启用 KILL_ON_JOB_CLOSE 的 Job Object（进程树管理锚点）；
@@ -425,7 +793,7 @@ mod windows_exec {
     ///   7. 终态收尾：强杀残余子进程、有界等待排水线程、读退出码、发 exit 事件。
     /// 任一阶段失败都显式释放已创建的句柄并返回错误（错误帧 + 退出码 1），
     /// 保证没有句柄泄漏、没有进程逃出 Job。
-    pub fn execute(request: ExecRequest, cancelled: Arc<AtomicBool>) -> Result<(), String> {
+    fn execute_pipe(request: ExecRequest, cancelled: Arc<AtomicBool>) -> Result<(), String> {
         if request.kind != "exec" {
             return Err("unsupported request type".to_string());
         }
@@ -664,6 +1032,20 @@ mod windows_exec {
         Ok(())
     }
 
+    /// 按 exec 请求选择普通管道或 ConPTY 后端。
+    pub fn execute(
+        request: ExecRequest,
+        cancelled: Arc<AtomicBool>,
+        controls: std::sync::mpsc::Receiver<RuntimeControl>,
+    ) -> Result<(), String> {
+        if request.tty {
+            execute_pty(request, cancelled, controls)
+        } else {
+            drop(controls);
+            execute_pipe(request, cancelled)
+        }
+    }
+
     // 纯函数单元测试：argv 引用规则与环境块构造，不涉及真实进程。
     #[cfg(test)]
     mod tests {
@@ -698,10 +1080,20 @@ mod unix_exec {
     /// 与 windows_exec::execute 同构的 Unix 实现：spawn 后轮询 try_wait，
     /// 期间响应协作取消与超时；三路 IO 各占一个线程，最后 join 排水
     /// 线程保证 exit 之前所有流式事件都已发出。
-    pub fn execute(request: ExecRequest, cancelled: Arc<AtomicBool>) -> Result<(), String> {
+    pub fn execute(
+        request: ExecRequest,
+        cancelled: Arc<AtomicBool>,
+        controls: std::sync::mpsc::Receiver<RuntimeControl>,
+    ) -> Result<(), String> {
         if request.kind != "exec" || request.protocol_version != PROTOCOL_VERSION {
             return Err("unsupported request or protocol version".to_string());
         }
+        if request.tty {
+            return Err(
+                "PTY_UNAVAILABLE: pseudoconsole execution is only supported on Windows".to_string(),
+            );
+        }
+        drop(controls);
         let input = decode_input(request.input_base64)?;
         let mut command = Command::new(&request.program);
         command
@@ -821,6 +1213,8 @@ fn main() {
     // 同样置位--宁可误杀子进程，也不让 CommandJob 悬挂到超时。
     let cancelled = Arc::new(AtomicBool::new(false));
     let listener_flag = cancelled.clone();
+    let request_tty = request.tty;
+    let (control_tx, control_rx) = std::sync::mpsc::channel::<RuntimeControl>();
     std::thread::spawn(move || {
         let stdin = std::io::stdin();
         let mut input = stdin.lock();
@@ -831,6 +1225,61 @@ fn main() {
                 {
                     listener_flag.store(true, Ordering::SeqCst);
                     break;
+                }
+                Ok(control)
+                    if request_tty
+                        && control.protocol_version == PROTOCOL_VERSION
+                        && control.kind == "input" =>
+                {
+                    let decoded = control.data.and_then(|value| {
+                        let bytes = BASE64.decode(&value).ok()?;
+                        (BASE64.encode(&bytes) == value).then_some(bytes)
+                    });
+                    match decoded {
+                        Some(bytes) if bytes.len() <= 64 * 1024 => {
+                            if control_tx.send(RuntimeControl::Input(bytes)).is_err() {
+                                listener_flag.store(true, Ordering::SeqCst);
+                                break;
+                            }
+                        }
+                        _ => {
+                            listener_flag.store(true, Ordering::SeqCst);
+                            break;
+                        }
+                    }
+                }
+                Ok(control)
+                    if request_tty
+                        && control.protocol_version == PROTOCOL_VERSION
+                        && control.kind == "resize" =>
+                {
+                    match (control.columns, control.rows) {
+                        (Some(columns), Some(rows))
+                            if columns > 0 && rows > 0 && columns <= 32767 && rows <= 32767 =>
+                        {
+                            if control_tx
+                                .send(RuntimeControl::Resize(columns, rows))
+                                .is_err()
+                            {
+                                listener_flag.store(true, Ordering::SeqCst);
+                                break;
+                            }
+                        }
+                        _ => {
+                            listener_flag.store(true, Ordering::SeqCst);
+                            break;
+                        }
+                    }
+                }
+                Ok(control)
+                    if request_tty
+                        && control.protocol_version == PROTOCOL_VERSION
+                        && control.kind == "eof" =>
+                {
+                    if control_tx.send(RuntimeControl::Eof).is_err() {
+                        listener_flag.store(true, Ordering::SeqCst);
+                        break;
+                    }
                 }
                 Ok(_) => {
                     listener_flag.store(true, Ordering::SeqCst);
@@ -846,9 +1295,9 @@ fn main() {
         }
     });
     #[cfg(windows)]
-    let result = windows_exec::execute(request, cancelled);
+    let result = windows_exec::execute(request, cancelled, control_rx);
     #[cfg(not(windows))]
-    let result = unix_exec::execute(request, cancelled);
+    let result = unix_exec::execute(request, cancelled, control_rx);
     if let Err(error) = result {
         send_error(error);
         std::process::exit(1);
@@ -877,12 +1326,12 @@ fn launch() -> ! {
     };
     // launch 之后的参数原样透传给 Node CLI。
     let forwarded: Vec<String> = std::env::args().skip(2).collect();
-    // 恢复命令判定：runtime doctor/update/rollback 需要能修复坏掉的运行时
+    // 恢复命令判定：runtime doctor/info/update/rollback 需要能诊断或修复坏掉的运行时
     // 指针，因此 Node 选择策略放宽（见 select_recovery_launcher_node）。
     let recovery_command = forwarded.first().map(String::as_str) == Some("runtime")
         && matches!(
             forwarded.get(1).map(String::as_str),
-            Some("doctor" | "update" | "rollback")
+            Some("doctor" | "info" | "update" | "rollback")
         );
     let node = match if recovery_command {
         select_recovery_launcher_node(&root)
@@ -1846,6 +2295,9 @@ mod tests {
             env: BTreeMap::new(),
             timeout_ms: 0,
             input_base64: None,
+            tty: false,
+            columns: None,
+            rows: None,
         };
         assert!(validate_exec_request(&request).is_err());
         request.timeout_ms = 1;
@@ -1856,6 +2308,15 @@ mod tests {
         request.env.clear();
         request.env.insert("Path".to_string(), "first".to_string());
         request.env.insert("PATH".to_string(), "second".to_string());
+        assert!(validate_exec_request(&request).is_err());
+
+        request.env.clear();
+        request.tty = true;
+        assert!(validate_exec_request(&request).is_err());
+        request.columns = Some(80);
+        request.rows = Some(24);
+        assert!(validate_exec_request(&request).is_ok());
+        request.rows = Some(32768);
         assert!(validate_exec_request(&request).is_err());
     }
 

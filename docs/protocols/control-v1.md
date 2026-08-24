@@ -22,7 +22,7 @@ Every message contains `protocolVersion: 1`. The server sends `hello` first:
 ```json
 {"protocolVersion":1,"type":"hello","maxFrameBytes":16777216,
  "capabilities":["session","argv","shell","cancel","runtime-doctor",
- "runtime-info","execute-plan","stream-output-v1","trace-list"]}
+ "runtime-info","execute-plan","stream-output-v1","trace-list","pty-v1"]}
 ```
 
 Terminal responses are asynchronous, so clients correlate them by `id`. Each request
@@ -45,8 +45,9 @@ The supported request types are:
   `{ "kind":"argv", "argv":[...] }` for an exact executable/argument vector,
   or `{ "kind":"text", "raw":"..." }` for one Shell script. Optional
   `cwd`, `envDelta`, `statePolicy` (`isolated` or `cwd-env`), `timeoutMs`, and
-  boolean `stream`
-  have the same meaning as the CLI.
+  boolean `stream`, and optional terminal dimensions
+  `{ "terminal": { "columns": 80, "rows": 24 } }` have the same meaning as
+  the CLI. Terminal execution requires `stream: true`.
 - `execute.plan`: validates and prepares the same execution plan as `execute`, but
   does not create a process or commit session state. The result includes the selected
   backend, sanitized argv, cwd translation, policy profile, and path decisions. It
@@ -60,6 +61,12 @@ The supported request types are:
   policy profile, and Native Registry command names without running an external command.
 - `trace.list`: returns recent in-memory trace events. Optional `limit` must be an
   integer from 1 through 5000 and defaults to 50.
+- `terminal.input`: requires its own correlation `id`, an in-flight terminal
+  execute request in `targetId`, and canonical Base64 bytes in `dataBase64`.
+  Each decoded input frame is limited to 64 KiB.
+- `terminal.resize`: requires `targetId`, `columns`, and `rows`; both dimensions
+  must be positive integers no greater than 32767.
+- `terminal.eof`: sends the platform terminal EOF indication to `targetId`.
 - `shutdown`: cancels in-flight work and asks the server to close after queued
   requests finish.
 
@@ -88,6 +95,18 @@ Base64 so arbitrary bytes remain lossless. The server waits for each event write
 before reading more process output, propagating backpressure to the child pipes. All
 output events are written before the terminal response. Cancellation, timeout, and
 connection-loss behavior is unchanged.
+
+## Interactive terminals
+
+The `pty-v1` capability exposes a Windows ConPTY session. The terminal keeps stdin
+open for `terminal.input`, accepts live `terminal.resize` requests, and preserves
+ANSI/control bytes. ConPTY produces one terminal output stream, so all interactive
+bytes are emitted as `stdout` events and the final `stderrBase64` is empty. A
+disconnect, cancellation, or timeout closes the associated Job Object and terminal.
+
+Terminal requests receive their own correlated success or error response. A client
+must wait for the execute request's final response after `terminal.eof`; EOF is not
+itself a process-completion acknowledgement.
 
 ## Execute result
 

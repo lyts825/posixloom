@@ -28,7 +28,7 @@
  */
 import type { Readable, Writable } from "node:stream";
 import { PosixLoomError, asPosixLoomError } from "./errors.js";
-import { NATIVE_MAX_FRAME_BYTES, NativeFrameDecoder, encodeNativeFrame } from "./process.js";
+import { InteractiveProcessController, NATIVE_MAX_FRAME_BYTES, NativeFrameDecoder, encodeNativeFrame, validateTerminalSize } from "./process.js";
 import { RuntimeManager } from "./runtime.js";
 import { PosixLoomService, type ExecuteOptions } from "./service.js";
 import type { CommandCompletion, StateOutcome } from "./types.js";
@@ -60,6 +60,13 @@ interface ControlRequest {
   stream?: boolean;
   /** trace.list 专用：返回最近多少条内存 trace。 */
   limit?: number;
+  /** execute/execute.plan 的 ConPTY 初始字符视口。 */
+  terminal?: { columns?: number; rows?: number };
+  /** terminal.input 的规范 Base64 输入字节。 */
+  dataBase64?: string;
+  /** terminal.resize 的字符视口。 */
+  columns?: number;
+  rows?: number;
   /** 状态提交策略：isolated 不提交会话状态；cwd-env 把 cwd/导出环境提交回会话。 */
   statePolicy?: "isolated" | "cwd-env";
   /** 环境变量增量：值为 string 表示设置，null 表示删除。 */
@@ -129,6 +136,14 @@ function validateExecuteRequest(request: ControlRequest): asserts request is Val
     invalidRequest("timeoutMs must be a positive integer");
   }
   if (request.stream !== undefined && typeof request.stream !== "boolean") invalidRequest("stream must be a boolean");
+  if (request.terminal !== undefined) {
+    if (!request.terminal || typeof request.terminal !== "object" || Array.isArray(request.terminal)) invalidRequest("terminal must be an object");
+    try {
+      validateTerminalSize({ columns: request.terminal.columns as number, rows: request.terminal.rows as number });
+    } catch (error) {
+      invalidRequest("terminal columns and rows must be integers between 1 and 32767", { cause: String(error) });
+    }
+  }
   if (request.statePolicy !== undefined && request.statePolicy !== "isolated" && request.statePolicy !== "cwd-env") {
     invalidRequest("statePolicy must be isolated or cwd-env");
   }
@@ -147,6 +162,17 @@ function validateExecuteRequest(request: ControlRequest): asserts request is Val
   } else if (request.input.kind === "text") {
     if (typeof request.input.raw !== "string") invalidRequest("text input requires a string raw script");
   } else invalidRequest("unsupported execute input kind");
+}
+
+/** 控制协议边界上的规范 Base64 解码，拒绝 URL-safe/省略填充等歧义形式。 */
+function decodeTerminalInput(value: unknown): Buffer {
+  if (typeof value !== "string" || value.length % 4 !== 0 || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value)) {
+    invalidRequest("dataBase64 must be canonical Base64");
+  }
+  const data = Buffer.from(value, "base64");
+  if (data.toString("base64") !== value) invalidRequest("dataBase64 must be canonical Base64");
+  if (data.length > 64 * 1024) invalidRequest("terminal input cannot exceed 64 KiB", { bytes: data.length });
+  return data;
 }
 
 /**
@@ -174,6 +200,8 @@ export async function serveControlPlane(runtime: RuntimeManager, input: Readable
   let closing = false;
   // 在途 execute：请求 id -> AbortController；cancel / shutdown / 断连时统一触发。
   const inflight = new Map<string, AbortController>();
+  // 当前连接上的交互终端：execute 请求 id -> 运行期输入控制器。
+  const terminals = new Map<string, InteractiveProcessController>();
   // 本连接已用过的请求 id，用于同连接去重（重试语义由 Harness 换新 id 保证）。
   const requestIds = new Set<string>();
   // 全部在途请求任务（fire-and-forget），退出前用 allSettled 等待落定。
@@ -263,7 +291,7 @@ export async function serveControlPlane(runtime: RuntimeManager, input: Readable
         await send({ type: "result", id, result: { ...state, version: state.version.toString() } });
         return;
       }
-      // 关闭会话：由服务层负责清理会话的持久化状态。
+      // 关闭会话：由服务层负责清理当前进程内的 cwd / exported env 状态。
       if (request.type === "session.close") {
         if (!validId(request.sessionId)) invalidRequest("sessionId is required");
         service.sessions.close(request.sessionId);
@@ -291,22 +319,56 @@ export async function serveControlPlane(runtime: RuntimeManager, input: Readable
       if (request.type === "execute.plan") {
         validateExecuteRequest(request);
         const options: ExecuteOptions = request.input.kind === "argv"
-          ? { kind: "argv", argv: request.input.argv, sessionId: request.sessionId, cwd: request.cwd, envDelta: request.envDelta, statePolicy: request.statePolicy, timeoutMs: request.timeoutMs }
-          : { kind: "text", raw: request.input.raw, sessionId: request.sessionId, cwd: request.cwd, envDelta: request.envDelta, statePolicy: request.statePolicy, timeoutMs: request.timeoutMs };
+          ? { kind: "argv", argv: request.input.argv, sessionId: request.sessionId, cwd: request.cwd, envDelta: request.envDelta, statePolicy: request.statePolicy, timeoutMs: request.timeoutMs, terminal: request.terminal as { columns: number; rows: number } | undefined }
+          : { kind: "text", raw: request.input.raw, sessionId: request.sessionId, cwd: request.cwd, envDelta: request.envDelta, statePolicy: request.statePolicy, timeoutMs: request.timeoutMs, terminal: request.terminal as { columns: number; rows: number } | undefined };
         await send({ type: "result", id, result: await service.explain(options) });
+        return;
+      }
+      // 交互终端的运行期输入：targetId 指向尚在运行的 execute 请求。
+      if (request.type === "terminal.input") {
+        if (!validId(request.targetId)) invalidRequest("terminal.input requires targetId");
+        const terminal = terminals.get(request.targetId);
+        if (!terminal) throw new PosixLoomError("TERMINAL_NOT_FOUND", `No interactive terminal for request: ${request.targetId}`);
+        const data = decodeTerminalInput(request.dataBase64);
+        await terminal.write(data);
+        await send({ type: "result", id, result: { targetId: request.targetId, acceptedBytes: data.length } });
+        return;
+      }
+      if (request.type === "terminal.resize") {
+        if (!validId(request.targetId)) invalidRequest("terminal.resize requires targetId");
+        const terminal = terminals.get(request.targetId);
+        if (!terminal) throw new PosixLoomError("TERMINAL_NOT_FOUND", `No interactive terminal for request: ${request.targetId}`);
+        try {
+          validateTerminalSize({ columns: request.columns as number, rows: request.rows as number });
+        } catch (error) {
+          invalidRequest("columns and rows must be integers between 1 and 32767", { cause: String(error) });
+        }
+        await terminal.resize(request.columns!, request.rows!);
+        await send({ type: "result", id, result: { targetId: request.targetId, resized: true } });
+        return;
+      }
+      if (request.type === "terminal.eof") {
+        if (!validId(request.targetId)) invalidRequest("terminal.eof requires targetId");
+        const terminal = terminals.get(request.targetId);
+        if (!terminal) throw new PosixLoomError("TERMINAL_NOT_FOUND", `No interactive terminal for request: ${request.targetId}`);
+        await terminal.end();
+        await send({ type: "result", id, result: { targetId: request.targetId, closed: true } });
         return;
       }
       // execute：核心命令执行。先做全字段校验，再注册取消句柄，最后按输入
       // 形态构造执行选项（argv 与 text 是判别联合，各自映射到对应的执行选项）。
       if (request.type === "execute") {
         validateExecuteRequest(request);
+        if (request.terminal && request.stream !== true) invalidRequest("interactive terminal execution requires stream=true");
         // 注册 AbortController，使 cancel / shutdown / 断连都能中止这条在途命令。
         const controller = new AbortController();
         inflight.set(id, controller);
+        const interactive = request.terminal ? new InteractiveProcessController() : undefined;
+        if (interactive) terminals.set(id, interactive);
         // argv：逐参数精确透传；text：脚本文本，唯一启用 Shell 语法。其余选项原样透传。
         const options: ExecuteOptions = request.input.kind === "argv"
-          ? { kind: "argv", argv: request.input.argv, sessionId: request.sessionId, cwd: request.cwd, envDelta: request.envDelta, statePolicy: request.statePolicy, timeoutMs: request.timeoutMs, signal: controller.signal }
-          : { kind: "text", raw: request.input.raw, sessionId: request.sessionId, cwd: request.cwd, envDelta: request.envDelta, statePolicy: request.statePolicy, timeoutMs: request.timeoutMs, signal: controller.signal };
+          ? { kind: "argv", argv: request.input.argv, sessionId: request.sessionId, cwd: request.cwd, envDelta: request.envDelta, statePolicy: request.statePolicy, timeoutMs: request.timeoutMs, signal: controller.signal, terminal: request.terminal as { columns: number; rows: number } | undefined, interactive }
+          : { kind: "text", raw: request.input.raw, sessionId: request.sessionId, cwd: request.cwd, envDelta: request.envDelta, statePolicy: request.statePolicy, timeoutMs: request.timeoutMs, signal: controller.signal, terminal: request.terminal as { columns: number; rows: number } | undefined, interactive };
         try {
           const completion = await service.execute(options, request.stream
             ? {
@@ -332,6 +394,8 @@ export async function serveControlPlane(runtime: RuntimeManager, input: Readable
         } finally {
           // 命令结束（完成或失败）后注销取消句柄，避免 cancel 命中已完成的请求。
           inflight.delete(id);
+          terminals.delete(id);
+          interactive?.terminate();
         }
         return;
       }
@@ -369,7 +433,7 @@ export async function serveControlPlane(runtime: RuntimeManager, input: Readable
     await send({
       type: "hello",
       maxFrameBytes: NATIVE_MAX_FRAME_BYTES,
-      capabilities: ["session", "argv", "shell", "cancel", "runtime-doctor", "runtime-info", "execute-plan", "stream-output-v1", "trace-list"],
+      capabilities: ["session", "argv", "shell", "cancel", "runtime-doctor", "runtime-info", "execute-plan", "stream-output-v1", "trace-list", "pty-v1"],
     });
     controlLoop: for await (const chunk of input) {
       // 已进入收尾（shutdown / 输出失效）则不再读取新数据。

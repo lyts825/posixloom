@@ -31,6 +31,8 @@ import { RuntimeManager } from "../core/runtime.js";
 import { RuntimeUpdater } from "../core/updater.js";
 import { serveControlPlane } from "../core/control.js";
 import { readTraceEvents, traceFilePath } from "../core/trace.js";
+import { InteractiveProcessController } from "../core/process.js";
+import type { TerminalSize } from "../core/types.js";
 
 // dist/src/cli/main.js → project root is three levels up.
 // 应用根目录：从编译产物（dist/src/cli/main.js）向上三级回到项目根，
@@ -39,7 +41,7 @@ const appRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 
 /** 打印用法帮助到 stdout；不设置退出码，供 help 与未知命令两个分支共用。 */
 function printUsage(): void {
-  console.log(`PosixLoom Runtime\n\nUsage:\n  posixloom exec [--dry-run] [--json] -- <program> [args...]\n  posixloom exec [--cwd /path] [--isolated] [--timeout ms] -- <program> [args...]\n  posixloom shell [--dry-run] [--json] [--cwd /path] [--isolated] [--timeout ms] -c <script>\n  posixloom shell [--cwd /path] [--isolated] [--timeout ms] --stdin\n  posixloom explain [--json] exec [options] -- <program> [args...]\n  posixloom explain [--json] shell [options] -c <script>\n  posixloom repl\n  posixloom serve --stdio\n  posixloom config path|show|validate [--json]\n  posixloom runtime doctor|info [--json]\n  posixloom runtime update [--check] [--force] [--json]\n  posixloom runtime rollback [--json]\n  posixloom trace list [--limit n] [--json]\n  posixloom version`);
+  console.log(`PosixLoom Runtime\n\nUsage:\n  posixloom exec [--dry-run] [--json] -- <program> [args...]\n  posixloom exec [--pty] [--cols n] [--rows n] [--cwd /path] [--isolated] [--timeout ms] -- <program> [args...]\n  posixloom shell [--dry-run] [--json] [--cwd /path] [--isolated] [--timeout ms] -c <script>\n  posixloom shell [--pty] [--cols n] [--rows n] [--cwd /path] [--isolated] [--timeout ms] -c <script>\n  posixloom shell [--cwd /path] [--isolated] [--timeout ms] --stdin\n  posixloom explain [--json] exec [options] -- <program> [args...]\n  posixloom explain [--json] shell [options] -c <script>\n  posixloom repl\n  posixloom serve --stdio\n  posixloom config path|show|validate [--json]\n  posixloom runtime doctor|info [--json]\n  posixloom runtime update [--check] [--force] [--json]\n  posixloom runtime rollback [--json]\n  posixloom trace list [--limit n] [--json]\n  posixloom version`);
 }
 
 /** 把 explain 预览打印为紧凑的人类可读摘要。 */
@@ -50,6 +52,7 @@ function printPreview(preview: Awaited<ReturnType<PosixLoomService["explain"]>>)
   console.log(`argv: ${JSON.stringify(preview.argv)}`);
   console.log(`cwd: ${preview.cwdVirtual} -> ${preview.cwdHost}`);
   console.log(`policy: ${preview.policyProfile}; state: ${preview.statePolicy}; timeout: ${preview.timeoutMs}ms`);
+  if (preview.terminal) console.log(`terminal: ${preview.terminal.columns}x${preview.terminal.rows}`);
   for (const decision of preview.pathDecisions) {
     console.log(`path[${decision.argumentIndex}]: ${decision.virtualInput ?? "-"} -> ${decision.hostOutput ?? "-"} (${decision.intent}/${decision.physicalCheck})`);
   }
@@ -68,6 +71,10 @@ interface ParsedCommandOptions {
   dryRun: boolean;
   /** 诊断结果使用 JSON 输出（仅与 dry-run 搭配）。 */
   json: boolean;
+  /** 使用 ConPTY 交互终端。 */
+  pty: boolean;
+  columns?: number;
+  rows?: number;
 }
 
 /**
@@ -84,6 +91,9 @@ function parseExec(args: string[]): ParsedCommandOptions & { argv: string[] } {
   let timeoutMs: number | undefined;
   let dryRun = false;
   let json = false;
+  let pty = false;
+  let columns: number | undefined;
+  let rows: number | undefined;
   const command: string[] = [];
   // 见到 `--` 后停止选项解析，其余参数一律进入 command。
   let afterSeparator = false;
@@ -95,12 +105,18 @@ function parseExec(args: string[]): ParsedCommandOptions & { argv: string[] } {
     if (!afterSeparator && arg === "--timeout") { timeoutMs = Number(args[++index]); continue; }
     if (!afterSeparator && arg === "--dry-run") { dryRun = true; continue; }
     if (!afterSeparator && arg === "--json") { json = true; continue; }
+    if (!afterSeparator && (arg === "--pty" || arg === "--interactive")) { pty = true; continue; }
+    if (!afterSeparator && arg === "--cols") { columns = Number(args[++index]); continue; }
+    if (!afterSeparator && arg === "--rows") { rows = Number(args[++index]); continue; }
     command.push(arg);
   }
   if (!command.length) throw new Error("Missing command. Use: posixloom exec -- <command>");
   if (timeoutMs !== undefined && (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0)) throw new Error("--timeout must be a positive integer");
   if (json && !dryRun) throw new Error("--json is only valid with --dry-run");
-  return { argv: command, cwd, isolated, timeoutMs, dryRun, json };
+  if ((columns !== undefined || rows !== undefined) && !pty) throw new Error("--cols/--rows require --pty");
+  if (columns !== undefined && (!Number.isSafeInteger(columns) || columns <= 0 || columns > 32767)) throw new Error("--cols must be an integer between 1 and 32767");
+  if (rows !== undefined && (!Number.isSafeInteger(rows) || rows <= 0 || rows > 32767)) throw new Error("--rows must be an integer between 1 and 32767");
+  return { argv: command, cwd, isolated, timeoutMs, dryRun, json, pty, columns, rows };
 }
 
 /**
@@ -118,6 +134,9 @@ function parseShell(args: string[]): ParsedCommandOptions & { raw?: string; stdi
   let timeoutMs: number | undefined;
   let dryRun = false;
   let json = false;
+  let pty = false;
+  let columns: number | undefined;
+  let rows: number | undefined;
   let raw: string | undefined;
   let stdin = false;
   for (let index = 0; index < args.length; index += 1) {
@@ -127,6 +146,9 @@ function parseShell(args: string[]): ParsedCommandOptions & { raw?: string; stdi
     if (arg === "--timeout") { timeoutMs = Number(args[++index]); continue; }
     if (arg === "--dry-run") { dryRun = true; continue; }
     if (arg === "--json") { json = true; continue; }
+    if (arg === "--pty" || arg === "--interactive") { pty = true; continue; }
+    if (arg === "--cols") { columns = Number(args[++index]); continue; }
+    if (arg === "--rows") { rows = Number(args[++index]); continue; }
     // --stdin 必须是最后一个选项：其后不允许再出现任何参数。
     if (arg === "--stdin") {
       stdin = true;
@@ -146,7 +168,35 @@ function parseShell(args: string[]): ParsedCommandOptions & { raw?: string; stdi
   if (raw !== undefined && stdin) throw new Error("Use either shell -c or shell --stdin, not both");
   if (timeoutMs !== undefined && (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0)) throw new Error("--timeout must be a positive integer");
   if (json && !dryRun) throw new Error("--json is only valid with --dry-run");
-  return { raw, stdin, cwd, isolated, timeoutMs, dryRun, json };
+  if (stdin && pty) throw new Error("shell --stdin cannot be combined with --pty; use -c so stdin remains attached to the terminal");
+  if ((columns !== undefined || rows !== undefined) && !pty) throw new Error("--cols/--rows require --pty");
+  if (columns !== undefined && (!Number.isSafeInteger(columns) || columns <= 0 || columns > 32767)) throw new Error("--cols must be an integer between 1 and 32767");
+  if (rows !== undefined && (!Number.isSafeInteger(rows) || rows <= 0 || rows > 32767)) throw new Error("--rows must be an integer between 1 and 32767");
+  return { raw, stdin, cwd, isolated, timeoutMs, dryRun, json, pty, columns, rows };
+}
+
+/** 把 CLI 选项解析为带合理缺省值的字符视口。 */
+function terminalSize(options: ParsedCommandOptions): TerminalSize | undefined {
+  if (!options.pty) return undefined;
+  return {
+    columns: options.columns ?? process.stdout.columns ?? 80,
+    rows: options.rows ?? process.stdout.rows ?? 24,
+  };
+}
+
+/** 将一段子进程输出写到当前终端，并把 drain 背压传回进程层。 */
+async function writeTerminalOutput(data: Buffer): Promise<void> {
+  if (process.stdout.write(data)) return;
+  await new Promise<void>((resolve, reject) => {
+    const onDrain = (): void => { cleanup(); resolve(); };
+    const onError = (error: Error): void => { cleanup(); reject(error); };
+    const cleanup = (): void => {
+      process.stdout.off("drain", onDrain);
+      process.stdout.off("error", onError);
+    };
+    process.stdout.once("drain", onDrain);
+    process.stdout.once("error", onError);
+  });
 }
 
 /**
@@ -367,6 +417,7 @@ async function main(): Promise<void> {
       cwd: parsed.cwd,
       statePolicy: parsed.isolated ? "isolated" : undefined,
       timeoutMs: parsed.timeoutMs,
+      terminal: terminalSize(parsed),
     });
     if (json) console.log(JSON.stringify(preview, null, 2));
     else printPreview(preview);
@@ -392,6 +443,7 @@ async function main(): Promise<void> {
       cwd: parsed.cwd,
       statePolicy: parsed.isolated ? "isolated" : undefined,
       timeoutMs: parsed.timeoutMs,
+      terminal: terminalSize(parsed),
     });
     if (parsed.json) console.log(JSON.stringify(preview, null, 2));
     else printPreview(preview);
@@ -399,17 +451,60 @@ async function main(): Promise<void> {
   }
   // exec 走 argv 精确模式，shell 走 text 脚本模式；--isolated 映射为
   // statePolicy:isolated（不提交会话状态），其余选项原样透传。
-  const completion = await service.execute({
-    ...(args[0] === "shell" ? { kind: "text" as const, raw: shellRaw! } : { kind: "argv" as const, argv: (parsed as ReturnType<typeof parseExec>).argv }),
-    sessionId,
-    cwd: parsed.cwd,
-    statePolicy: parsed.isolated ? "isolated" : undefined,
-    timeoutMs: parsed.timeoutMs,
-  });
+  const terminal = terminalSize(parsed);
+  let completion;
+  if (terminal) {
+    const interactive = new InteractiveProcessController();
+    const abort = new AbortController();
+    const input = process.stdin;
+    const wasRaw = Boolean(input.isRaw);
+    const onData = (chunk: Buffer | string): void => {
+      input.pause();
+      void interactive.write(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)).then(
+        () => input.resume(),
+        () => abort.abort(),
+      );
+    };
+    const onEnd = (): void => { void interactive.end().catch(() => undefined); };
+    const onResize = (): void => {
+      void interactive.resize(process.stdout.columns ?? terminal.columns, process.stdout.rows ?? terminal.rows).catch(() => undefined);
+    };
+    input.on("data", onData);
+    input.once("end", onEnd);
+    process.stdout.on("resize", onResize);
+    if (input.isTTY && typeof input.setRawMode === "function") input.setRawMode(true);
+    input.resume();
+    try {
+      completion = await service.execute({
+        ...(args[0] === "shell" ? { kind: "text" as const, raw: shellRaw! } : { kind: "argv" as const, argv: (parsed as ReturnType<typeof parseExec>).argv }),
+        sessionId,
+        cwd: parsed.cwd,
+        statePolicy: parsed.isolated ? "isolated" : undefined,
+        timeoutMs: parsed.timeoutMs,
+        terminal,
+        interactive,
+        signal: abort.signal,
+      }, { onOutput: (event) => writeTerminalOutput(event.data) });
+    } finally {
+      input.off("data", onData);
+      input.off("end", onEnd);
+      process.stdout.off("resize", onResize);
+      if (input.isTTY && typeof input.setRawMode === "function") input.setRawMode(wasRaw);
+      input.pause();
+    }
+  } else {
+    completion = await service.execute({
+      ...(args[0] === "shell" ? { kind: "text" as const, raw: shellRaw! } : { kind: "argv" as const, argv: (parsed as ReturnType<typeof parseExec>).argv }),
+      sessionId,
+      cwd: parsed.cwd,
+      statePolicy: parsed.isolated ? "isolated" : undefined,
+      timeoutMs: parsed.timeoutMs,
+    });
+  }
   // 命令输出原样写到对应流；trace 仅在 POSIXLOOM_RUNTIME_TRACE=1 时输出到 stderr，
   // 供排障使用。
-  if (completion.stdout.length) process.stdout.write(completion.stdout);
-  if (completion.stderr.length) process.stderr.write(completion.stderr);
+  if (!terminal && completion.stdout.length) process.stdout.write(completion.stdout);
+  if (!terminal && completion.stderr.length) process.stderr.write(completion.stderr);
   if (process.env.POSIXLOOM_RUNTIME_TRACE === "1") console.error(`\n[PosixLoom TRACE] ${JSON.stringify(completion.trace)}`);
   // 退出码映射：正常退出透传；超时 124（对齐 GNU timeout）；取消 130
   //（128 + SIGINT 惯例）；其余异常形态（spawn 失败 / 崩溃等）统一 1。

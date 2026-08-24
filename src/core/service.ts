@@ -31,7 +31,7 @@ import { buildNativeEnv, buildPosixEnv, canonicalEnvKey, diffExportedEnv } from 
 import { classify } from "./classifier.js";
 import { PolicyGate } from "./policy.js";
 import { NativeRegistry } from "./registry.js";
-import { runProcess, type ProcessOutputEvent, type ProcessRunResult } from "./process.js";
+import { runProcess, type InteractiveProcessController, type ProcessOutputEvent, type ProcessRunResult } from "./process.js";
 import { RuntimeManager } from "./runtime.js";
 import { isSafeExistingDirectory, normalizeVirtual } from "./path.js";
 import { SessionStateStore } from "./session.js";
@@ -50,6 +50,7 @@ import type {
   StateOutcome,
   StatePatch,
   StatePolicy,
+  TerminalSize,
 } from "./types.js";
 
 /**
@@ -254,6 +255,10 @@ interface ExecuteBaseOptions {
   statePolicy?: "isolated" | "cwd-env";
   timeoutMs?: number;
   signal?: AbortSignal;
+  /** 创建伪终端并使命令以交互模式运行。 */
+  terminal?: TerminalSize;
+  /** terminal 模式的运行期输入/缩放通道。 */
+  interactive?: InteractiveProcessController;
 }
 
 /** 文本输入形态：raw 交给分类器，可表达复合 shell 命令。 */
@@ -418,6 +423,8 @@ export class PosixLoomService {
         signal: options.signal,
         maxOutputBytes: this.runtime.config.runtime.process.maxOutputBytes,
         onOutput: observer.onOutput,
+        terminal: plan.terminal,
+        interactive: options.interactive,
       });
       await this.runtime.assertRuntimeIntegrity("post-command");
       return this.nativeCompletion(plan, result, prepared.reason, started);
@@ -427,17 +434,19 @@ export class PosixLoomService {
     try {
       result = await runProcess({
         program: plan.bashExecutable,
-        args: ["--noprofile", "--norc", "-s"],
+        args: plan.terminal ? ["--noprofile", "--norc", "-c", buildShellScript(plan)] : ["--noprofile", "--norc", "-s"],
         cwd: prepared.cwdHost,
         env: plan.envPosix,
         timeoutMs: plan.timeoutMs,
         cancelGraceMs: this.runtime.config.runtime.process.cancelGraceMs,
-        input: buildShellScript(plan),
+        input: plan.terminal ? undefined : buildShellScript(plan),
         reportPath: plan.stateReportPath,
         hostPath: prepared.hostPath,
         signal: options.signal,
         maxOutputBytes: this.runtime.config.runtime.process.maxOutputBytes,
         onOutput: observer.onOutput,
+        terminal: plan.terminal,
+        interactive: options.interactive,
       });
     } finally {
       rmSync(plan.stateReportPath, { force: true });
@@ -513,7 +522,7 @@ export class PosixLoomService {
       commandKind: prepared.commandKind,
       reason: prepared.reason,
       executable: native ? plan.executable : plan.bashExecutable,
-      argv: native ? [...plan.argv] : ["--noprofile", "--norc", "-s"],
+      argv: native ? [...plan.argv] : plan.terminal ? ["--noprofile", "--norc", "-c", "<generated-wrapper>"] : ["--noprofile", "--norc", "-s"],
       cwdVirtual: prepared.cwdVirtual,
       cwdHost: prepared.cwdHost,
       timeoutMs: plan.timeoutMs,
@@ -529,6 +538,7 @@ export class PosixLoomService {
           "The preview is non-binding; execution replans and revalidates against current runtime and session state.",
         ],
       replayable: false,
+      terminal: plan.terminal ? { ...plan.terminal } : undefined,
     };
   }
 
@@ -610,6 +620,7 @@ export class PosixLoomService {
       timeoutMs,
       detached: false,
       policyProfile: this.runtime.config.runtime.policy.defaultProfile,
+      terminal: options.terminal ? { ...options.terminal } : undefined,
       executable: template.executable,
       argv: template.argv.slice(1),
       cwdHost,
@@ -646,6 +657,7 @@ export class PosixLoomService {
       timeoutMs,
       detached: false,
       policyProfile: this.runtime.config.runtime.policy.defaultProfile,
+      terminal: options.terminal ? { ...options.terminal } : undefined,
       bashExecutable: bash,
       commandBody,
       cwdVirtual: virtualCwd,

@@ -82,6 +82,12 @@ export type Backend = "native" | "msys2";
  */
 export type StatePolicy = "isolated" | "cwd-env";
 
+/** 伪终端视口大小，单位为字符单元。 */
+export interface TerminalSize {
+  columns: number;
+  rows: number;
+}
+
 /** 一条虚拟到宿主的挂载映射，是 MountTable（path.ts）的最小组成单元。 */
 export interface MountSpec {
   /** 虚拟侧挂载点（POSIX 绝对路径，如 "/workspace"）。 */
@@ -291,8 +297,8 @@ export interface VirtualCommand {
   statePolicy: StatePolicy;
   /** 是否脱离宿主进程生命周期独立运行。 */
   detached: boolean;
-  /** 伪终端支持：当前协议恒为 false（在类型层面显式关闭 tty）。 */
-  tty: false;
+  /** false 使用普通管道；对象形式要求 Native Host 创建伪终端。 */
+  tty: false | TerminalSize;
 }
 
 /**
@@ -433,6 +439,8 @@ export interface BaseExecutionPlan {
   detached: boolean;
   /** 计划执行时启用的策略档案。 */
   policyProfile: "trusted" | "workspace-guard";
+  /** 缺省使用普通管道；提供时由 Native Host 创建 ConPTY。 */
+  terminal?: TerminalSize;
 }
 
 /**
@@ -541,6 +549,8 @@ export interface ExecutionPreview {
   limitations: string[];
   /** 预览不是可重放的授权令牌；真正执行会重新规划与校验。 */
   replayable: false;
+  /** 本计划是否使用伪终端，以及初始视口大小。 */
+  terminal?: TerminalSize;
 }
 
 /**

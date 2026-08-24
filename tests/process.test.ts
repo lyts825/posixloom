@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import test from "node:test";
-import { NativeEventValidator, NativeFrameDecoder, OutputCollector, encodeNativeFrame, runProcess } from "../src/core/process.js";
+import { InteractiveProcessController, NativeEventValidator, NativeFrameDecoder, OutputCollector, encodeNativeFrame, runProcess } from "../src/core/process.js";
 
 test("output collector preserves every byte up to the configured limit", () => {
   for (const size of [1, 4, 5, 8]) {
@@ -137,4 +137,27 @@ test("native host handles cooperative cancellation", { skip: !existsSync(hostPat
   });
   setTimeout(() => controller.abort(), 100);
   assert.deepEqual((await pending).outcome, { kind: "cancelled" });
+});
+
+test("native host ConPTY accepts interactive input and resize events", { skip: process.platform !== "win32" || !existsSync(hostPath) }, async () => {
+  const interactive = new InteractiveProcessController();
+  const pending = runProcess({
+    program: join(process.env.SystemRoot ?? "C:\\Windows", "System32", "cmd.exe"),
+    args: ["/d", "/q"],
+    cwd: process.cwd(),
+    env: { ...process.env } as Record<string, string>,
+    timeoutMs: 5000,
+    cancelGraceMs: 1000,
+    hostPath,
+    terminal: { columns: 80, rows: 24 },
+    interactive,
+    maxOutputBytes: 1024 * 1024,
+  });
+  await interactive.resize(100, 30);
+  await interactive.write("echo POSIXLOOM_CONPTY_OK\r\nexit\r\n");
+  const result = await pending;
+  assert.deepEqual(result.outcome, { kind: "exited", exitCode: 0 });
+  assert.equal(result.stdout.includes(Buffer.from("POSIXLOOM_CONPTY_OK")), true);
+  assert.equal(result.stderr.length, 0);
+  assert.equal(result.stdout.includes(Buffer.from("\u001b[")), true);
 });

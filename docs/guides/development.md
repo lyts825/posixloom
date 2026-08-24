@@ -42,6 +42,14 @@ npm run posixloom -- exec -- node -p 'process.platform'
 
 # 覆盖虚拟工作目录
 npm run posixloom -- exec --cwd /workspace -- rg TODO src
+
+# 预览完整计划，不创建目标进程
+npm run posixloom -- explain --json exec -- rg TODO /workspace/src
+
+# 只读部署诊断
+npm run posixloom -- config validate
+npm run posixloom -- runtime info
+npm run posixloom -- trace list --limit 50
 ```
 
 直接运行编译产物也可以跳过 npm 包装：
@@ -75,6 +83,9 @@ cd /workspace/tests
 export POSIXLOOM_DEMO=yes
 printf '%s\n' "$POSIXLOOM_DEMO"
 '@ | npm run posixloom -- repl
+
+# ConPTY 交互模式：保留提示、颜色、按键和终端尺寸
+npm run posixloom -- shell --pty -c 'read -p "name: " name; printf "hello %s\n" "$name"'
 ```
 
 ## 测试与质量门禁

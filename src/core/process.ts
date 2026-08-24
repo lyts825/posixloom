@@ -44,7 +44,7 @@ import { existsSync, readFileSync, rmSync } from "node:fs";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import type { Readable } from "node:stream";
 import { PosixLoomError } from "./errors.js";
-import type { CommandOutcome, HostPath } from "./types.js";
+import type { CommandOutcome, HostPath, TerminalSize } from "./types.js";
 
 /**
  * Native Host 帧协议版本。双方在每个事件帧的 protocolVersion 字段上互验，
@@ -89,6 +89,10 @@ export interface ProcessRunOptions {
    * 从而把下游写入速度作为背压传回进程管道。
    */
   onOutput?: (event: ProcessOutputEvent) => void | Promise<void>;
+  /** 伪终端初始大小；提供时必须同时提供 Native Host。 */
+  terminal?: TerminalSize;
+  /** 运行期标准输入/EOF/窗口大小控制通道。 */
+  interactive?: InteractiveProcessController;
 }
 
 /** 实时输出事件；sequence 在 stdout/stderr 两路之间统一单调递增。 */
@@ -96,6 +100,105 @@ export interface ProcessOutputEvent {
   sequence: number;
   stream: "stdout" | "stderr";
   data: Buffer;
+}
+
+/** Native Host 在进程运行期接受的交互控制事件。 */
+export type InteractiveControlEvent =
+  | { type: "input"; data: Buffer }
+  | { type: "resize"; columns: number; rows: number }
+  | { type: "eof" };
+
+type InteractiveSink = (event: InteractiveControlEvent) => void | Promise<void>;
+
+interface PendingInteractiveEvent {
+  event: InteractiveControlEvent;
+  bytes: number;
+  resolve: () => void;
+  reject: (error: unknown) => void;
+}
+
+/**
+ * 可在命令启动前接收输入的交互控制器。
+ * CLI/Harness 与进程启动是并发的，因此在 Native Host 附加 sink 前
+ * 到达的少量输入会有界缓冲；超过 1 MiB 则拒绝，防止对端在子进程
+ * 尚未就绪时无限堆积内存。附加后所有事件经 Promise lane 严格保序。
+ */
+export class InteractiveProcessController {
+  private sink?: InteractiveSink;
+  private readonly pending: PendingInteractiveEvent[] = [];
+  private pendingBytes = 0;
+  private lane: Promise<void> = Promise.resolve();
+  private inputEnded = false;
+  private terminalError?: Error;
+
+  private enqueue(event: InteractiveControlEvent, bytes = 0): Promise<void> {
+    if (this.terminalError) return Promise.reject(this.terminalError);
+    if (this.sink) return this.deliver(event);
+    if (this.pendingBytes + bytes > 1024 * 1024) {
+      return Promise.reject(new PosixLoomError("TERMINAL_INPUT_BUFFER_FULL", "Interactive input exceeded the pre-start buffer limit"));
+    }
+    this.pendingBytes += bytes;
+    return new Promise<void>((resolve, reject) => this.pending.push({ event, bytes, resolve, reject }));
+  }
+
+  private deliver(event: InteractiveControlEvent): Promise<void> {
+    const sink = this.sink;
+    if (!sink) return Promise.reject(new PosixLoomError("TERMINAL_NOT_ATTACHED", "Interactive process is not attached"));
+    const delivery = this.lane.then(() => sink(event));
+    this.lane = delivery.catch(() => undefined);
+    return delivery;
+  }
+
+  /** 写入一段原始终端输入（单次上限 64 KiB）。 */
+  write(data: Buffer | string): Promise<void> {
+    if (this.inputEnded) return Promise.reject(new PosixLoomError("TERMINAL_INPUT_CLOSED", "Interactive input is already closed"));
+    const chunk = Buffer.isBuffer(data) ? Buffer.from(data) : Buffer.from(data);
+    if (!chunk.length) return Promise.resolve();
+    if (chunk.length > MAX_STREAM_CHUNK_BYTES) {
+      return Promise.reject(new PosixLoomError("TERMINAL_INPUT_TOO_LARGE", "A terminal input event cannot exceed 64 KiB", { bytes: chunk.length }));
+    }
+    return this.enqueue({ type: "input", data: chunk }, chunk.length);
+  }
+
+  /** 通知子进程终端输入已结束。 */
+  end(): Promise<void> {
+    if (this.inputEnded) return Promise.resolve();
+    this.inputEnded = true;
+    return this.enqueue({ type: "eof" });
+  }
+
+  /** 更新伪终端字符视口。 */
+  resize(columns: number, rows: number): Promise<void> {
+    validateTerminalSize({ columns, rows });
+    return this.enqueue({ type: "resize", columns, rows });
+  }
+
+  /** @internal 由进程后端附加唯一 sink，并冲刷启动前队列。 */
+  attach(sink: InteractiveSink): void {
+    if (this.sink) throw new PosixLoomError("TERMINAL_ALREADY_ATTACHED", "Interactive controller is already attached");
+    if (this.terminalError) throw this.terminalError;
+    this.sink = sink;
+    for (const pending of this.pending.splice(0)) {
+      this.pendingBytes -= pending.bytes;
+      void this.deliver(pending.event).then(pending.resolve, pending.reject);
+    }
+  }
+
+  /** @internal 终止控制器并拒绝所有尚未送达的输入。 */
+  terminate(error: Error = new PosixLoomError("TERMINAL_CLOSED", "Interactive process has ended")): void {
+    if (this.terminalError) return;
+    this.terminalError = error;
+    this.sink = undefined;
+    for (const pending of this.pending.splice(0)) pending.reject(error);
+    this.pendingBytes = 0;
+  }
+}
+
+/** 校验 ConPTY 支持的正整数字符视口。 */
+export function validateTerminalSize(size: TerminalSize): void {
+  if (!Number.isSafeInteger(size.columns) || !Number.isSafeInteger(size.rows) || size.columns <= 0 || size.rows <= 0 || size.columns > 32767 || size.rows > 32767) {
+    throw new PosixLoomError("TERMINAL_SIZE_INVALID", "Terminal columns and rows must be integers between 1 and 32767", { ...size });
+  }
 }
 
 /**
@@ -481,6 +584,9 @@ async function runViaNativeHost(options: ProcessRunOptions): Promise<ProcessRunR
     env: options.env,
     timeoutMs: options.timeoutMs,
     inputBase64: options.input === undefined ? undefined : Buffer.from(options.input).toString("base64"),
+    tty: Boolean(options.terminal),
+    columns: options.terminal?.columns,
+    rows: options.terminal?.rows,
   });
   // 预先编码 cancel 帧，abort 时直接复用（提前编码也能在执行前暴露超限错误）。
   const cancelFrame = encodeNativeFrame({ protocolVersion: NATIVE_PROTOCOL_VERSION, type: "cancel" });
@@ -523,6 +629,7 @@ async function runViaNativeHost(options: ProcessRunOptions): Promise<ProcessRunR
     settled = true;
     if (watchdog) clearTimeout(watchdog);
     options.signal?.removeEventListener("abort", abort);
+    options.interactive?.terminate();
     void outputForwarder.drain().then(() => {
       const finalOutcome = outputForwarder.failed
         ? { kind: "crashed" as const, errorCode: "OUTPUT_SINK_FAILED" }
@@ -606,6 +713,21 @@ async function runViaNativeHost(options: ProcessRunOptions): Promise<ProcessRunR
   // 下发 exec 帧；写入失败（如宿主刚启动就死亡）则 kill 后原样抛出。
   try {
     send(execFrame);
+    options.interactive?.attach(async (event) => {
+      const value = event.type === "input"
+        ? { protocolVersion: NATIVE_PROTOCOL_VERSION, type: "input", data: event.data.toString("base64") }
+        : event.type === "resize"
+          ? { protocolVersion: NATIVE_PROTOCOL_VERSION, type: "resize", columns: event.columns, rows: event.rows }
+          : { protocolVersion: NATIVE_PROTOCOL_VERSION, type: "eof" };
+      const frame = encodeNativeFrame(value);
+      await new Promise<void>((resolve, reject) => {
+        if (host.stdin.destroyed) {
+          reject(new PosixLoomError("TERMINAL_CLOSED", "Native Host input is unavailable"));
+          return;
+        }
+        host.stdin.write(frame, (error) => error ? reject(error) : resolve());
+      });
+    });
   } catch (error) {
     host.kill();
     throw error;
@@ -767,6 +889,11 @@ function makeResult(
  * 报告文件/数据由 service 层在进程结束后读取。
  */
 export async function runProcess(options: ProcessRunOptions): Promise<ProcessRunResult> {
+  if (options.terminal) {
+    validateTerminalSize(options.terminal);
+    if (!options.hostPath) throw new PosixLoomError("PTY_UNAVAILABLE", "Interactive terminal execution requires the Native Host");
+  }
+  if (options.interactive && !options.terminal) throw new PosixLoomError("TERMINAL_MODE_REQUIRED", "Interactive input requires terminal mode");
   if (options.hostPath && !options.reportFd) return runViaNativeHost(options);
   return runViaNode(options);
 }

@@ -63,6 +63,14 @@ npm run posixloom -- shell -c 'printf "%s\n" "hello" | grep hello'
 
 # PowerShell 中的复杂脚本建议通过 stdin 传递
 'printf "%s\n" "hello from stdin"' | npm run posixloom -- shell --stdin
+
+# Windows ConPTY 交互模式（透传按键、终端尺寸、ANSI 颜色）
+npm run posixloom -- shell --pty -c 'read -p "name: " name; printf "hello %s\n" "$name"'
+
+# 配置、运行时与 trace 诊断
+npm run posixloom -- config validate
+npm run posixloom -- runtime info
+npm run posixloom -- trace list --limit 50
 ```
 
 启动 Harness 控制面：
@@ -99,7 +107,7 @@ npm run posixloom -- serve --stdio
 
 ## 当前边界
 
-项目目前处于 `0.1.0` 开发阶段，目标平台为 Windows 10/11 x64。默认策略提供的是防误操作 Guardrail，不是针对恶意本地代码的 OS 级安全沙箱。发布前应执行完整门禁：
+项目目前处于 `0.1.0` 开发阶段，目标平台为 Windows 10/11 x64。Session 仅在当前 CLI/Harness 进程内保存，进程退出后不会恢复；配置中的历史字段 `session.persistAcrossRestart: true` 会被明确拒绝。默认策略提供的是防误操作 Guardrail，不是针对恶意本地代码的 OS 级安全沙箱。发布前应执行完整门禁：
 
 ```powershell
 npm run verify
