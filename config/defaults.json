@@ -13,12 +13,16 @@
     "/posixloom/runtime": "$RUNTIME_ROOT"
   },
   "session": {
-    "defaultStatePolicy": "cwd-env"
+    "defaultStatePolicy": "cwd-env",
+    "maxSessions": 1024,
+    "idleTimeoutMs": 1800000
   },
   "process": {
     "defaultTimeoutMs": 30000,
     "cancelGraceMs": 2000,
-    "maxOutputBytes": 8388608
+    "maxOutputBytes": 8388608,
+    "outputDrainTimeoutMs": 5000,
+    "maxReportBytes": 1048576
   },
   "policy": {
     "defaultProfile": "workspace-guard",

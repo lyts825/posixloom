@@ -12,7 +12,7 @@ DataRoot/tmp/posixloom-<commandId>.report
   → Node 删除文件
 ```
 
-报告缺失、截断、权限异常、版本错误、非规范编码或进程终态不是 `exited` 时，SessionState 不变。
+报告缺失、截断、权限异常、版本错误、非规范编码或进程终态不是 `exited` 时，SessionState 不变。文件与兼容 fd 通道都受 `process.maxReportBytes` 独立硬上限约束；读取器每次只取有界分片，不会先把超大文件整体载入内存。
 
 ## 格式
 

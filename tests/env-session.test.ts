@@ -30,3 +30,38 @@ test("PATH preserves complete runtime entries and cannot be removed", () => {
   assert.throws(() => store.commit(id, { baseStateVersion: 0n, setEnv: { PATH: "/posixloom/bin:/usr/bin-evil" }, removeEnv: [] }, "cwd-env"), /complete/);
   assert.throws(() => store.commit(id, { baseStateVersion: 0n, setEnv: {}, removeEnv: ["PATH"] }, "cwd-env"), /cannot be removed/);
 });
+
+test("session store expires idle records and evicts the least recently used inactive session", () => {
+  let now = 0;
+  const store = new SessionStateStore({ maxSessions: 2, idleTimeoutMs: 10, now: () => now });
+  const first = store.create("/workspace", {});
+  now = 1;
+  const second = store.create("/workspace", {});
+  now = 2;
+  store.snapshot(first);
+  const third = store.create("/workspace", {});
+  assert.throws(() => store.snapshot(second), (error: any) => error?.code === "SESSION_NOT_FOUND");
+  assert.equal(store.snapshot(first).cwd, "/workspace");
+  assert.equal(store.snapshot(third).cwd, "/workspace");
+
+  now = 12;
+  assert.deepEqual(store.list(), []);
+});
+
+test("active session lanes cannot be evicted to satisfy the capacity limit", async () => {
+  let now = 0;
+  const store = new SessionStateStore({ maxSessions: 1, idleTimeoutMs: 10, now: () => now });
+  const id = store.create("/workspace", {});
+  let release!: () => void;
+  let started!: () => void;
+  const hasStarted = new Promise<void>((resolve) => { started = resolve; });
+  const blocked = new Promise<void>((resolve) => { release = resolve; });
+  const running = store.inStateLane(id, async () => { started(); await blocked; });
+  await hasStarted;
+  now = 20;
+  assert.throws(() => store.create("/workspace", {}), (error: any) => error?.code === "SESSION_LIMIT_REACHED");
+  release();
+  await running;
+  now = 31;
+  assert.equal(store.list().length, 0);
+});

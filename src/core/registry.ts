@@ -21,10 +21,10 @@
  *   同名可执行文件来源不可控。宁可让命令回退 MSYS2，也不执行未经校验的二进制；
  *   development 模式允许回退 PATH，便于本机开发调试。
  */
-import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import { PosixLoomError } from "./errors.js";
+import { findOnPath } from "./executable.js";
 import { MountTable, translatePathToken } from "./path.js";
 import { PolicyGate } from "./policy.js";
 import type { HostPath, NativeCommandDescriptor, PathDecision, PathIntent, RuntimeSnapshot } from "./types.js";
@@ -39,21 +39,6 @@ export interface AdapterResult {
 export interface NativeCommandAdapter {
   id: string;
   adapt(argv: string[], table: MountTable, gate: PolicyGate): AdapterResult;
-}
-
-/**
- * 在宿主 PATH 上查找命令的第一个匹配项（Windows 用 where.exe，POSIX 用 which）。
- * 任何失败（命令不存在、查找器异常）都被吞掉并返回 undefined。
- * 仅作为 development 模式下找不到打包可执行文件时的回退手段。
- */
-function findOnPath(command: string): string | undefined {
-  try {
-    const finder = process.platform === "win32" ? "where.exe" : "which";
-    const result = execFileSync(finder, [command], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim().split(/\r?\n/)[0];
-    return result || undefined;
-  } catch {
-    return undefined;
-  }
 }
 
 /**

@@ -40,7 +40,7 @@
  *    保证 runProcess 永远会 settle，不会把调用方吊死。
  */
 import { spawn } from "node:child_process";
-import { existsSync, readFileSync, rmSync } from "node:fs";
+import { closeSync, fstatSync, lstatSync, openSync, readSync, rmSync } from "node:fs";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import type { Readable } from "node:stream";
 import { PosixLoomError } from "./errors.js";
@@ -70,6 +70,8 @@ export const NATIVE_MAX_FRAME_BYTES = 16 * 1024 * 1024;
  * - hostPath：Rust Native Host 可执行文件路径；提供且无需 reportFd 时走原生路径。
  * - signal：外部取消信号，触发即取消整次执行。
  * - maxOutputBytes：stdout/stderr 各自的采集上限，超出按头尾截断策略丢弃。
+ * - outputDrainTimeoutMs：进程退出后等待异步输出接收器的硬上限。
+ * - maxReportBytes：StateReport 文件或 fd 数据的硬上限。
  */
 export interface ProcessRunOptions {
   program: HostPath;
@@ -84,6 +86,8 @@ export interface ProcessRunOptions {
   hostPath?: HostPath;
   signal?: AbortSignal;
   maxOutputBytes: number;
+  outputDrainTimeoutMs?: number;
+  maxReportBytes?: number;
   /**
    * 可选的实时输出接收器。返回的 Promise 在读取更多子进程输出前被等待，
    * 从而把下游写入速度作为背压传回进程管道。
@@ -391,6 +395,8 @@ function pipeReadable(stream: Readable | null, collector: { push(chunk: Buffer):
 
 /** 单个控制协议输出事件的最大原始字节数，Base64 后仍远低于 16 MiB 帧上限。 */
 const MAX_STREAM_CHUNK_BYTES = 64 * 1024;
+const DEFAULT_OUTPUT_DRAIN_TIMEOUT_MS = 5000;
+const DEFAULT_MAX_REPORT_BYTES = 1024 * 1024;
 
 /**
  * 把同步到达的 stdout/stderr 分片串行转发给异步接收器。
@@ -412,6 +418,12 @@ class ProcessOutputForwarder {
     private readonly onFailure: (error: unknown) => void,
   ) {}
 
+  private fail(error: unknown): void {
+    if (this.sinkFailure !== undefined) return;
+    this.sinkFailure = error;
+    this.onFailure(error);
+  }
+
   push(stream: ProcessOutputEvent["stream"], data: Buffer): void {
     if (!this.sink || !data.length || this.sinkFailure) return;
     for (let offset = 0; offset < data.length; offset += MAX_STREAM_CHUNK_BYTES) {
@@ -422,10 +434,7 @@ class ProcessOutputForwarder {
       this.lane = this.lane
         .then(() => this.sinkFailure === undefined ? this.sink?.(event) : undefined)
         .catch((error) => {
-          if (this.sinkFailure === undefined) {
-            this.sinkFailure = error;
-            this.onFailure(error);
-          }
+          this.fail(error);
         })
         .then(() => {
           this.pending -= 1;
@@ -434,8 +443,22 @@ class ProcessOutputForwarder {
     }
   }
 
-  async drain(): Promise<void> {
-    await this.lane;
+  async drain(timeoutMs: number): Promise<void> {
+    if (this.pending === 0) {
+      await this.lane;
+      return;
+    }
+    let timer: NodeJS.Timeout | undefined;
+    await Promise.race([
+      this.lane,
+      new Promise<void>((resolve) => {
+        timer = setTimeout(() => {
+          this.fail(new PosixLoomError("OUTPUT_SINK_TIMEOUT", "Output sink did not drain before the configured deadline", { timeoutMs }));
+          resolve();
+        }, timeoutMs);
+      }),
+    ]);
+    if (timer) clearTimeout(timer);
   }
 
   get failed(): boolean {
@@ -449,15 +472,57 @@ class ProcessOutputForwarder {
  * fallback（例如 reportFd 管道已收集到的内容）。IO 失败作为数据返回，
  * 由执行收口映射为 REPORT_IO_FAILED，不能让结果 Promise 悬空。
  */
-function readAndRemoveReport(path: string | undefined, fallback = Buffer.alloc(0)): { data: Buffer; error?: unknown } {
-  if (!path || !existsSync(path)) return { data: fallback };
+function reportTooLarge(bytes: number, maximum: number): PosixLoomError {
+  return new PosixLoomError("REPORT_TOO_LARGE", "StateReport exceeds the configured byte limit", { bytes, maximum });
+}
+
+function readAndRemoveReport(
+  path: string | undefined,
+  fallback = Buffer.alloc(0),
+  maximum = DEFAULT_MAX_REPORT_BYTES,
+  fallbackError?: unknown,
+): { data: Buffer; error?: unknown } {
   let data = fallback;
-  let failure: unknown;
-  try {
-    data = readFileSync(path);
-  } catch (error) {
-    failure = error;
+  let failure = fallbackError;
+  if (fallback.length > maximum) {
+    data = Buffer.alloc(0);
+    failure ??= reportTooLarge(fallback.length, maximum);
   }
+  if (!path) return { data, error: failure };
+  let descriptor: number | undefined;
+  let missing = false;
+  try {
+    const metadata = lstatSync(path);
+    if (!metadata.isFile()) throw new PosixLoomError("REPORT_FILE_INVALID", "StateReport path must be a regular file", { path });
+    if (metadata.size > maximum) throw reportTooLarge(metadata.size, maximum);
+    descriptor = openSync(path, "r");
+    const openedMetadata = fstatSync(descriptor);
+    if (!openedMetadata.isFile()) throw new PosixLoomError("REPORT_FILE_INVALID", "StateReport path must open as a regular file", { path });
+    if (openedMetadata.size > maximum) throw reportTooLarge(openedMetadata.size, maximum);
+    const chunks: Buffer[] = [];
+    const scratch = Buffer.allocUnsafe(Math.min(64 * 1024, maximum + 1));
+    let bytes = 0;
+    while (true) {
+      const read = readSync(descriptor, scratch, 0, scratch.length, null);
+      if (read === 0) break;
+      bytes += read;
+      if (bytes > maximum) throw reportTooLarge(bytes, maximum);
+      chunks.push(Buffer.from(scratch.subarray(0, read)));
+    }
+    data = Buffer.concat(chunks, bytes);
+    failure = undefined;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") missing = true;
+    else failure = error;
+  }
+  if (descriptor !== undefined) {
+    try {
+      closeSync(descriptor);
+    } catch (error) {
+      failure ??= error;
+    }
+  }
+  if (missing) return { data, error: failure };
   try {
     // 读没读到都要删，防止下次执行读到上一次的旧报告。
     rmSync(path, { force: true });
@@ -664,8 +729,8 @@ async function runViaNativeHost(options: ProcessRunOptions): Promise<ProcessRunR
     if (watchdog) clearTimeout(watchdog);
     options.signal?.removeEventListener("abort", abort);
     options.interactive?.terminate();
-    void outputForwarder.drain().then(() => {
-      const report = readAndRemoveReport(options.reportPath);
+    void outputForwarder.drain(options.outputDrainTimeoutMs ?? DEFAULT_OUTPUT_DRAIN_TIMEOUT_MS).then(() => {
+      const report = readAndRemoveReport(options.reportPath, Buffer.alloc(0), options.maxReportBytes ?? DEFAULT_MAX_REPORT_BYTES);
       const finalOutcome = outputForwarder.failed
         ? { kind: "crashed" as const, errorCode: "OUTPUT_SINK_FAILED" }
         : report.error
@@ -809,13 +874,17 @@ async function runViaNode(options: ProcessRunOptions): Promise<ProcessRunResult>
     }) as ChildProcessWithoutNullStreams;
     const stdout = new OutputCollector(options.maxOutputBytes);
     const stderr = new OutputCollector(options.maxOutputBytes);
-    // 报告通道不做截断，原样缓存全部分片。
+    const maximumReportBytes = options.maxReportBytes ?? DEFAULT_MAX_REPORT_BYTES;
+    // 报告通道按独立上限收集，避免 fd=3 被恶意子进程用于无界占用内存。
     const reportChunks: Buffer[] = [];
+    let reportBytes = 0;
+    let reportFailure: unknown;
     const grace = options.cancelGraceMs ?? 2000;
     // finished 保证 Promise 只 resolve 一次；forced 记录是被取消还是超时强制
     // 终止，供 close 事件决定最终 outcome；graceTimer 为宽限期强杀定时器。
     let finished = false;
     let forced: "cancelled" | "timed-out" | undefined;
+    let inputFailure: unknown;
     let graceTimer: NodeJS.Timeout | undefined;
     const outputForwarder = new ProcessOutputForwarder(
       options.onOutput,
@@ -837,13 +906,16 @@ async function runViaNode(options: ProcessRunOptions): Promise<ProcessRunResult>
       clearTimeout(timer);
       if (graceTimer) clearTimeout(graceTimer);
       options.signal?.removeEventListener("abort", abort);
-      void outputForwarder.drain().then(() => {
-        const report = readAndRemoveReport(options.reportPath, Buffer.concat(reportChunks));
+      void outputForwarder.drain(options.outputDrainTimeoutMs ?? DEFAULT_OUTPUT_DRAIN_TIMEOUT_MS).then(() => {
+        const report = readAndRemoveReport(options.reportPath, Buffer.concat(reportChunks), maximumReportBytes, reportFailure);
+        const processOutcome = inputFailure && outcome.kind === "exited"
+          ? { kind: "crashed" as const, errorCode: "INPUT_WRITE_FAILED" }
+          : outcome;
         const finalOutcome = outputForwarder.failed
           ? { kind: "crashed" as const, errorCode: "OUTPUT_SINK_FAILED" }
           : report.error
             ? { kind: "crashed" as const, errorCode: "REPORT_IO_FAILED" }
-            : outcome;
+            : processOutcome;
         resolve(makeResult(finalOutcome, stdout, stderr, report.data, "node-fallback"));
       });
     };
@@ -883,14 +955,29 @@ async function runViaNode(options: ProcessRunOptions): Promise<ProcessRunResult>
         outputForwarder.push("stderr", chunk);
       },
     });
-    if (options.reportFd) pipeReadable(child.stdio[3] as Readable | null, { push: (chunk: Buffer) => reportChunks.push(chunk) });
+    if (options.reportFd) pipeReadable(child.stdio[3] as Readable | null, {
+      push: (chunk: Buffer) => {
+        reportBytes += chunk.length;
+        if (reportBytes > maximumReportBytes) {
+          reportFailure ??= reportTooLarge(reportBytes, maximumReportBytes);
+          return;
+        }
+        reportChunks.push(chunk);
+      },
+    });
+    // stdin may reject a buffered write after the child has already closed its read end.
+    // Always consume that error; when input was requested, fail the command deterministically.
+    child.stdin.on("error", (error) => {
+      if (options.input === undefined) return;
+      inputFailure ??= error;
+      if (!finished) child.kill();
+    });
     // spawn 失败（程序不存在、权限不足等）：收敛为 spawn-failed，错误码取系统 errno。
     child.once("error", (error) => finish({ kind: "spawn-failed", errorCode: (error as NodeJS.ErrnoException).code ?? "SPAWN_FAILED" }));
     // 正常退出：若是被强制终止（forced）则 outcome 取终止原因而非退出码。
     child.once("close", (code) => finish(forced ? { kind: forced } : { kind: "exited", exitCode: code ?? 1 }));
     // 注入 stdin 后关闭写入端，让子进程读到 EOF。
-    if (options.input !== undefined) child.stdin.write(options.input);
-    child.stdin.end();
+    child.stdin.end(options.input);
   });
 }
 
@@ -929,6 +1016,14 @@ function makeResult(
  * 报告文件/数据由 service 层在进程结束后读取。
  */
 export async function runProcess(options: ProcessRunOptions): Promise<ProcessRunResult> {
+  const outputDrainTimeoutMs = options.outputDrainTimeoutMs ?? DEFAULT_OUTPUT_DRAIN_TIMEOUT_MS;
+  const maxReportBytes = options.maxReportBytes ?? DEFAULT_MAX_REPORT_BYTES;
+  if (!Number.isSafeInteger(outputDrainTimeoutMs) || outputDrainTimeoutMs <= 0) {
+    throw new PosixLoomError("OUTPUT_DRAIN_TIMEOUT_INVALID", "outputDrainTimeoutMs must be a positive integer", { outputDrainTimeoutMs });
+  }
+  if (!Number.isSafeInteger(maxReportBytes) || maxReportBytes <= 0) {
+    throw new PosixLoomError("REPORT_LIMIT_INVALID", "maxReportBytes must be a positive integer", { maxReportBytes });
+  }
   if (options.terminal) {
     validateTerminalSize(options.terminal);
     if (!options.hostPath) throw new PosixLoomError("PTY_UNAVAILABLE", "Interactive terminal execution requires the Native Host");

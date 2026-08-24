@@ -11,7 +11,10 @@ Authorization: Bearer <token>
 X-PosixLoom-Token: <token>
 ```
 
-非 loopback 监听没有 Token 会在启动阶段失败。带 `Origin` 的请求只有同源或精确命中 `--cors-origin` 才会被接受；预检支持 `GET, POST, DELETE, OPTIONS`。
+非 loopback 监听没有 Token 会在启动阶段失败。无 Token 的 loopback 监听还会
+拒绝不属于实际服务地址的 `Host`，包括预检与健康请求。带 `Origin` 的请求只有
+命中服务端确定的监听来源或精确命中 `--cors-origin` 才会被接受；预检支持
+`GET, POST, DELETE, OPTIONS`。
 
 ## 基础端点
 
@@ -40,7 +43,9 @@ Content-Type: application/json
 | `GET` | `/sessions/{id}` | 会话快照 |
 | `DELETE` | `/sessions/{id}` | 关闭会话 |
 
-会话与服务进程同生命周期，不跨重启恢复。
+会话不跨重启恢复，初始 cwd 必须是规范化、策略允许且真实存在的虚拟目录。
+空闲会话按 `session.idleTimeoutMs` 过期，总量受 `session.maxSessions` 限制；达到
+上限时会回收最久未使用的非活动会话，所有会话都在活动时返回 `429`。
 
 ## 计划与执行
 
@@ -71,7 +76,10 @@ Content-Type: application/json
 {"type":"completed","result":{...}}
 ```
 
-输出按 `sequence` 排序并提供背压。客户端关闭响应连接时，服务会取消关联的进程树。若响应头发出后失败，最后一行改为 `type: "error"`。
+输出按 `sequence` 排序并提供背压。客户端关闭响应连接时，服务会取消关联的
+进程树。输出接收器超过 `process.outputDrainTimeoutMs` 仍未排空时，服务终止响应
+连接，命令内部终态为 `OUTPUT_SINK_FAILED`，不会继续等待或尝试写完成帧。若响应头
+发出后发生其他失败，最后一行改为 `type: "error"`。
 
 ## 可选扩展
 
@@ -101,5 +109,4 @@ HTTP 实现只暴露通用扩展端口，不引用任何扩展实现。CLI 装�
 }
 ```
 
-边界错误使用 `400/401/403/404/405/409/413`；未识别异常收敛为 `500`，不会返回堆栈。
-
+边界错误使用 `400/401/403/404/405/409/413/429`；未识别异常收敛为 `500`，不会返回堆栈。

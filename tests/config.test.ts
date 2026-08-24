@@ -24,4 +24,11 @@ test("config paths remain discoverable and reject the unimplemented persistence 
   await writeFile(paths.userConfigPath, JSON.stringify({ session: { persistAcrossRestart: false } }), "utf8");
   const loaded = await loadConfig(process.cwd());
   assert.equal("persistAcrossRestart" in loaded.runtime.session, false);
+  assert.equal(loaded.runtime.session.maxSessions, 1024);
+  assert.equal(loaded.runtime.session.idleTimeoutMs, 1_800_000);
+  assert.equal(loaded.runtime.process.outputDrainTimeoutMs, 5000);
+  assert.equal(loaded.runtime.process.maxReportBytes, 1024 * 1024);
+
+  await writeFile(paths.userConfigPath, JSON.stringify({ session: { maxSessions: 0 } }), "utf8");
+  await assert.rejects(loadConfig(process.cwd()), (error: any) => error?.code === "CONFIG_INVALID");
 });

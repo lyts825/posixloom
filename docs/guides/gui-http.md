@@ -52,6 +52,10 @@ npm run posixloom -- serve --http `
 
 非 loopback 监听强制要求至少 16 字节的 Bearer Token。客户端通过 `Authorization: Bearer <token>` 或 `X-PosixLoom-Token` 发送；GUI 只把 Token 放在当前标签页的 `sessionStorage`，不会写进 URL 或服务端配置。
 
+无 Token 的 loopback 服务还会把请求 `Host` 限定为实际监听端口上的 loopback
+地址（含 `localhost`、`127.0.0.1` 和 `::1`），并用这组服务端来源校验
+`Origin`。因此浏览器请求不能通过伪造的重绑定域名把攻击者来源冒充为同源。
+
 HTTP 服务不内置 TLS。跨主机部署应放在 HTTPS 反向代理之后，并只配置确切的 `--cors-origin`。健康端点公开但只返回最小状态；其余 API 在配置 Token 时都需要鉴权。
 
 ## 环境变量
@@ -66,4 +70,3 @@ HTTP 服务不内置 TLS。跨主机部署应放在 HTTPS 反向代理之后，�
 | `POSIXLOOM_MARKETPLACE_URL` | 空 | 可选 HTTPS 插件目录 |
 
 完整端点与流格式见 [HTTP API v1](../protocols/http-v1.md)。
-

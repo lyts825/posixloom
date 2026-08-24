@@ -22,6 +22,30 @@ write session environment values to disk. The previously declared but unimplemen
 with `CONFIG_UNSUPPORTED`; legacy `false` is tolerated and omitted from the effective
 configuration so existing non-persistent installations can migrate safely.
 
+## Resource boundaries
+
+The packaged defaults keep process-local state and child-process data bounded:
+
+```json
+{
+  "session": {
+    "maxSessions": 1024,
+    "idleTimeoutMs": 1800000
+  },
+  "process": {
+    "maxOutputBytes": 8388608,
+    "outputDrainTimeoutMs": 5000,
+    "maxReportBytes": 1048576
+  }
+}
+```
+
+Expired sessions are reclaimed lazily. At capacity, the least recently used inactive
+session is reclaimed; if every slot is executing or queued, creation fails with
+`SESSION_LIMIT_REACHED`. `maxOutputBytes` applies independently to stdout and stderr,
+`outputDrainTimeoutMs` prevents a stalled streaming client from holding completion
+open forever, and `maxReportBytes` is a separate hard limit for StateReport data.
+
 ## Execution plan preview
 
 Use `explain` to run the same integrity, cwd, policy, classification, Native Registry,

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { request as httpRequest } from "node:http";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -12,6 +13,29 @@ const TOKEN = "0123456789abcdef-test-token";
 
 function authHeaders(extra: Record<string, string> = {}): Record<string, string> {
   return { authorization: `Bearer ${TOKEN}`, ...extra };
+}
+
+function rawLoopbackRequest(port: number, options: { method?: string; path?: string; host: string; origin?: string; body?: string }): Promise<{ status: number; body: string }> {
+  return new Promise((resolve, reject) => {
+    const request = httpRequest({
+      hostname: "127.0.0.1",
+      port,
+      path: options.path ?? "/api/v1/sessions",
+      method: options.method ?? "GET",
+      headers: {
+        host: options.host,
+        ...(options.origin ? { origin: options.origin } : {}),
+        ...(options.body ? { "content-type": "application/json", "content-length": Buffer.byteLength(options.body) } : {}),
+        connection: "close",
+      },
+    }, (response) => {
+      const chunks: Buffer[] = [];
+      response.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+      response.on("end", () => resolve({ status: response.statusCode ?? 0, body: Buffer.concat(chunks).toString("utf8") }));
+    });
+    request.once("error", reject);
+    request.end(options.body);
+  });
 }
 
 test("remote HTTP service authenticates, manages sessions, executes, and streams NDJSON", async (context) => {
@@ -97,4 +121,39 @@ test("remote HTTP service enforces non-loopback auth and explicit CORS", async (
 
   const forbidden = await fetch(`${server.origin}/api/v1/capabilities`, { headers: authHeaders({ origin: "https://evil.example" }) });
   assert.equal(forbidden.status, 403);
+});
+
+test("tokenless loopback HTTP rejects DNS-rebinding Host headers and invalid session cwd", async (context) => {
+  const runtime = await RuntimeManager.create(process.cwd());
+  const server = await startRemoteHttpServer(runtime, { host: "127.0.0.1", port: 0 });
+  context.after(() => server.close());
+  const hostileOrigin = `http://attacker.example:${server.port}`;
+  const rebound = await rawLoopbackRequest(server.port, {
+    method: "POST",
+    host: `attacker.example:${server.port}`,
+    origin: hostileOrigin,
+    body: JSON.stringify({ cwd: "/workspace" }),
+  });
+  assert.equal(rebound.status, 403);
+
+  const preflight = await rawLoopbackRequest(server.port, {
+    method: "OPTIONS",
+    host: `attacker.example:${server.port}`,
+    origin: hostileOrigin,
+  });
+  assert.equal(preflight.status, 403);
+
+  const created = await fetch(`${server.origin}/api/v1/sessions`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ cwd: "/workspace" }),
+  });
+  assert.equal(created.status, 201);
+
+  const invalidCwd = await fetch(`${server.origin}/api/v1/sessions`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ cwd: "/workspace/../workspace" }),
+  });
+  assert.equal(invalidCwd.status, 400);
 });

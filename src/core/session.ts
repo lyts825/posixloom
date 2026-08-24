@@ -30,6 +30,22 @@ import type { SessionState, StatePatch, StatePolicy } from "./types.js";
 interface SessionRecord {
   state: SessionState;
   lane: Promise<unknown>;
+  lastAccessedAt: number;
+  activeOperations: number;
+}
+
+export interface SessionStateStoreOptions {
+  /** Maximum number of live sessions retained by this process. */
+  maxSessions?: number;
+  /** Inactive sessions older than this many milliseconds are reclaimed lazily. */
+  idleTimeoutMs?: number;
+  /** Injectable monotonic-enough clock used by deterministic tests. */
+  now?: () => number;
+}
+
+export interface SessionStateEntry {
+  sessionId: string;
+  state: SessionState;
 }
 
 /**
@@ -39,6 +55,40 @@ interface SessionRecord {
  */
 export class SessionStateStore {
   private readonly sessions = new Map<string, SessionRecord>();
+  private readonly maxSessions: number;
+  private readonly idleTimeoutMs: number;
+  private readonly now: () => number;
+
+  constructor(options: SessionStateStoreOptions = {}) {
+    this.maxSessions = options.maxSessions ?? 1024;
+    this.idleTimeoutMs = options.idleTimeoutMs ?? 30 * 60 * 1000;
+    this.now = options.now ?? Date.now;
+    if (!Number.isSafeInteger(this.maxSessions) || this.maxSessions <= 0) {
+      throw new PosixLoomError("SESSION_OPTIONS_INVALID", "maxSessions must be a positive integer", { maxSessions: this.maxSessions });
+    }
+    if (!Number.isSafeInteger(this.idleTimeoutMs) || this.idleTimeoutMs <= 0) {
+      throw new PosixLoomError("SESSION_OPTIONS_INVALID", "idleTimeoutMs must be a positive integer", { idleTimeoutMs: this.idleTimeoutMs });
+    }
+  }
+
+  private cloneState(state: SessionState): SessionState {
+    return { version: state.version, cwd: state.cwd, exportedEnv: { ...state.exportedEnv } };
+  }
+
+  private pruneExpired(now = this.now()): void {
+    for (const [sessionId, record] of this.sessions) {
+      if (record.activeOperations === 0 && now - record.lastAccessedAt >= this.idleTimeoutMs) this.sessions.delete(sessionId);
+    }
+  }
+
+  private requireRecord(sessionId: string): SessionRecord {
+    const now = this.now();
+    this.pruneExpired(now);
+    const record = this.sessions.get(sessionId);
+    if (!record) throw new PosixLoomError("SESSION_NOT_FOUND", `Unknown session: ${sessionId}`);
+    record.lastAccessedAt = now;
+    return record;
+  }
 
   /**
    * 创建新会话并返回其 sessionId（UUID，与宿主路径、进程标识完全解耦）。
@@ -48,11 +98,35 @@ export class SessionStateStore {
    * @returns 新会话的 sessionId
    */
   create(cwd = "/workspace", exportedEnv = initialSessionEnv()): string {
+    const now = this.now();
+    this.pruneExpired(now);
+    if (this.sessions.size >= this.maxSessions) {
+      let oldest: { sessionId: string; lastAccessedAt: number } | undefined;
+      for (const [sessionId, record] of this.sessions) {
+        if (record.activeOperations !== 0) continue;
+        if (!oldest || record.lastAccessedAt < oldest.lastAccessedAt) oldest = { sessionId, lastAccessedAt: record.lastAccessedAt };
+      }
+      if (!oldest) {
+        throw new PosixLoomError("SESSION_LIMIT_REACHED", "All session slots are currently active", { maximum: this.maxSessions });
+      }
+      this.sessions.delete(oldest.sessionId);
+    }
     const id = randomUUID();
     // exportedEnv 做一层浅拷贝与调用方对象解耦；版本号从 0n 起步；
     // lane 初始化为已完成的 Promise，使第一个 inStateLane 任务入队时无需等待
-    this.sessions.set(id, { state: { version: 0n, cwd, exportedEnv: { ...exportedEnv } }, lane: Promise.resolve() });
+    this.sessions.set(id, {
+      state: { version: 0n, cwd, exportedEnv: { ...exportedEnv } },
+      lane: Promise.resolve(),
+      lastAccessedAt: now,
+      activeOperations: 0,
+    });
     return id;
+  }
+
+  /** Return snapshots of all live sessions without extending their idle lifetime. */
+  list(): SessionStateEntry[] {
+    this.pruneExpired();
+    return [...this.sessions].map(([sessionId, record]) => ({ sessionId, state: this.cloneState(record.state) }));
   }
 
   /**
@@ -61,6 +135,7 @@ export class SessionStateStore {
    * @throws PosixLoomError("SESSION_NOT_FOUND") 会话不存在时抛出
    */
   close(sessionId: string): void {
+    this.pruneExpired();
     if (!this.sessions.delete(sessionId)) throw new PosixLoomError("SESSION_NOT_FOUND", `Unknown session: ${sessionId}`);
   }
 
@@ -74,13 +149,8 @@ export class SessionStateStore {
    * @throws PosixLoomError("SESSION_NOT_FOUND") 会话不存在时抛出
    */
   snapshot(sessionId: string): SessionState {
-    const record = this.sessions.get(sessionId);
-    if (!record) throw new PosixLoomError("SESSION_NOT_FOUND", `Unknown session: ${sessionId}`);
-    return {
-      version: record.state.version,
-      cwd: record.state.cwd,
-      exportedEnv: { ...record.state.exportedEnv },
-    };
+    const record = this.requireRecord(sessionId);
+    return this.cloneState(record.state);
   }
 
   /**
@@ -100,8 +170,7 @@ export class SessionStateStore {
    * @throws PosixLoomError("SESSION_NOT_FOUND" / "STATE_CONFLICT" / "STATE_PATCH_REJECTED")
    */
   commit(sessionId: string, patch: StatePatch, policy: StatePolicy): SessionState {
-    const record = this.sessions.get(sessionId);
-    if (!record) throw new PosixLoomError("SESSION_NOT_FOUND", `Unknown session: ${sessionId}`);
+    const record = this.requireRecord(sessionId);
     validateStatePatch(patch, record.state, policy);
     // isolated：不做任何状态变更，补丁被有意丢弃，仅回当前快照
     if (policy === "isolated") return this.snapshot(sessionId);
@@ -137,8 +206,8 @@ export class SessionStateStore {
    * @throws PosixLoomError("SESSION_NOT_FOUND") 会话不存在时抛出
    */
   async inStateLane<T>(sessionId: string, operation: () => Promise<T>): Promise<T> {
-    const record = this.sessions.get(sessionId);
-    if (!record) throw new PosixLoomError("SESSION_NOT_FOUND", `Unknown session: ${sessionId}`);
+    const record = this.requireRecord(sessionId);
+    record.activeOperations += 1;
     // 记下当前队列尾部：本次 operation 必须排在它之后
     const previous = record.lane;
     let release!: () => void;
@@ -149,6 +218,8 @@ export class SessionStateStore {
       return await operation();
     } finally {
       // 无论成功失败都放行下一个等待者，避免队列死锁
+      record.activeOperations -= 1;
+      record.lastAccessedAt = this.now();
       release();
     }
   }

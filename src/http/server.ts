@@ -101,6 +101,7 @@ function statusFor(error: PosixLoomError): number {
   if (error.code === "HTTP_METHOD_NOT_ALLOWED") return 405;
   if (error.code === "HTTP_BODY_TOO_LARGE") return 413;
   if (error.code === "STATE_CONFLICT") return 409;
+  if (error.code === "SESSION_LIMIT_REACHED") return 429;
   if (error.code.startsWith("HTTP_") || error.code.endsWith("_INVALID") || error.code === "TIMEOUT_INVALID") return 400;
   return 500;
 }
@@ -138,17 +139,48 @@ function tokenMatches(expected: string, request: IncomingMessage): boolean {
   return timingSafeEqual(expectedHash, presentedHash);
 }
 
-function sameOrigin(request: IncomingMessage, origin: string): boolean {
-  const host = request.headers.host;
-  if (!host) return false;
-  return origin === `http://${host}`;
+function canonicalAuthority(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  try {
+    const url = new URL(`http://${value}`);
+    if (url.username || url.password || url.pathname !== "/" || url.search || url.hash) return undefined;
+    return url.host.toLocaleLowerCase();
+  } catch {
+    return undefined;
+  }
 }
 
-function applyCors(request: IncomingMessage, response: ServerResponse, origins: ReadonlySet<string>): void {
+function httpOrigin(host: string, port: number): string {
+  const normalized = host.replace(/^\[|\]$/g, "");
+  const displayHost = normalized.includes(":") ? `[${normalized}]` : normalized;
+  return new URL(`http://${displayHost}:${port}`).origin;
+}
+
+function normalizedOrigin(value: string): string | undefined {
+  try {
+    const url = new URL(value);
+    if (url.protocol !== "http:" && url.protocol !== "https:") return undefined;
+    return url.origin;
+  } catch {
+    return undefined;
+  }
+}
+
+function originAllowed(origin: string, serverOrigins: ReadonlySet<string>, corsOrigins: ReadonlySet<string>): boolean {
+  const normalized = normalizedOrigin(origin);
+  return normalized !== undefined && (serverOrigins.has(normalized) || corsOrigins.has(normalized));
+}
+
+function applyCors(
+  request: IncomingMessage,
+  response: ServerResponse,
+  serverOrigins: ReadonlySet<string>,
+  corsOrigins: ReadonlySet<string>,
+): void {
   const origin = request.headers.origin;
   if (!origin) return;
   response.setHeader("vary", "Origin");
-  if (sameOrigin(request, origin) || origins.has(origin)) {
+  if (originAllowed(origin, serverOrigins, corsOrigins)) {
     response.setHeader("access-control-allow-origin", origin);
     response.setHeader("access-control-allow-methods", "GET, POST, DELETE, OPTIONS");
     response.setHeader("access-control-allow-headers", "authorization, content-type, x-posixloom-token");
@@ -258,22 +290,35 @@ export async function startRemoteHttpServer(runtime: RuntimeManager, options: Re
   if (!Number.isSafeInteger(maximumBody) || maximumBody <= 0) throw new PosixLoomError("HTTP_OPTIONS_INVALID", "maxBodyBytes must be a positive integer");
   if (token !== undefined && Buffer.byteLength(token) < 16) throw new PosixLoomError("HTTP_OPTIONS_INVALID", "HTTP bearer token must be at least 16 bytes");
   if (!loopbackHost(host) && !token) throw new PosixLoomError("HTTP_AUTH_REQUIRED", "A bearer token is required when binding the HTTP service beyond loopback", { host });
-  const corsOrigins = new Set((options.corsOrigins ?? []).map((origin) => new URL(origin).origin));
+  const corsOrigins = new Set<string>();
+  for (const origin of options.corsOrigins ?? []) {
+    const normalized = normalizedOrigin(origin);
+    if (!normalized) throw new PosixLoomError("HTTP_OPTIONS_INVALID", "CORS origins must be absolute HTTP(S) origins", { origin });
+    corsOrigins.add(normalized);
+  }
   const service = new PosixLoomService(runtime);
-  const sessions = new Set<string>();
   const inflight = new Set<AbortController>();
   const startedAt = Date.now();
+  const serverOrigins = new Set<string>();
+  const allowedAuthorities = new Set<string>();
+  let serverOrigin = "";
 
   const server: Server = createServer((request, response) => {
     const requestId = randomUUID();
     response.setHeader("x-request-id", requestId);
-    applyCors(request, response, corsOrigins);
     const run = async (): Promise<void> => {
+      if (!token) {
+        const authority = canonicalAuthority(request.headers.host);
+        if (!authority || !allowedAuthorities.has(authority)) {
+          throw new PosixLoomError("HTTP_FORBIDDEN", "Request Host is not one of the HTTP service's loopback origins", { host: request.headers.host });
+        }
+      }
+      applyCors(request, response, serverOrigins, corsOrigins);
       const origin = request.headers.origin;
-      if (origin && !sameOrigin(request, origin) && !corsOrigins.has(origin)) throw new PosixLoomError("HTTP_FORBIDDEN", "Cross-origin request is not allowed", { origin });
+      if (origin && !originAllowed(origin, serverOrigins, corsOrigins)) throw new PosixLoomError("HTTP_FORBIDDEN", "Cross-origin request is not allowed", { origin });
       let url: URL;
       try {
-        url = new URL(request.url ?? "/", `http://${request.headers.host ?? `${host}:${requestedPort}`}`);
+        url = new URL(request.url ?? "/", serverOrigin);
       } catch {
         throw new PosixLoomError("HTTP_PATH_INVALID", "Request URL is invalid");
       }
@@ -310,7 +355,7 @@ export async function startRemoteHttpServer(runtime: RuntimeManager, options: Re
         return;
       }
       if (url.pathname === "/api/v1/sessions" && method === "GET") {
-        const result = [...sessions].map((sessionId) => ({ sessionId, state: jsonState(service.sessionSnapshot(sessionId)) }));
+        const result = service.listSessions().map(({ sessionId, state }) => ({ sessionId, state: jsonState(state) }));
         sendJson(response, 200, { sessions: result, requestId });
         return;
       }
@@ -318,7 +363,6 @@ export async function startRemoteHttpServer(runtime: RuntimeManager, options: Re
         const body = await readJson(request, maximumBody, true);
         if (body.cwd !== undefined && typeof body.cwd !== "string") throw new PosixLoomError("HTTP_SESSION_INVALID", "cwd must be a string");
         const sessionId = service.createSession((body.cwd as string | undefined) ?? "/workspace");
-        sessions.add(sessionId);
         sendJson(response, 201, { sessionId, state: jsonState(service.sessionSnapshot(sessionId)), requestId });
         return;
       }
@@ -332,7 +376,6 @@ export async function startRemoteHttpServer(runtime: RuntimeManager, options: Re
         }
         if (method === "DELETE") {
           service.sessions.close(sessionId);
-          sessions.delete(sessionId);
           sendJson(response, 200, { closed: true, sessionId, requestId });
           return;
         }
@@ -370,6 +413,10 @@ export async function startRemoteHttpServer(runtime: RuntimeManager, options: Re
             onStarted: (preview) => sendEvent({ type: "started", preview, requestId }),
             onOutput: (event: ProcessOutputEvent) => sendEvent({ type: "output", stream: event.stream, sequence: sequence++, dataBase64: event.data.toString("base64"), requestId }),
           });
+          if (completion.command.kind === "crashed" && completion.command.errorCode === "OUTPUT_SINK_FAILED") {
+            response.destroy();
+            return;
+          }
           await sendEvent({ type: "completed", result: jsonCompletion(completion), requestId });
           response.end();
         } catch (error) {
@@ -408,7 +455,17 @@ export async function startRemoteHttpServer(runtime: RuntimeManager, options: Re
     server.listen(requestedPort, host);
   });
   const address = server.address() as AddressInfo;
-  const displayHost = address.family === "IPv6" ? `[${address.address}]` : address.address;
+  serverOrigin = httpOrigin(address.address, address.port);
+  serverOrigins.add(serverOrigin);
+  if (loopbackHost(host)) {
+    for (const alias of new Set([host, address.address, "localhost", "127.0.0.1", "::1"])) {
+      const origin = httpOrigin(alias, address.port);
+      serverOrigins.add(origin);
+      allowedAuthorities.add(new URL(origin).host.toLocaleLowerCase());
+    }
+  } else {
+    allowedAuthorities.add(new URL(serverOrigin).host.toLocaleLowerCase());
+  }
   let resolveClosed!: () => void;
   const closed = new Promise<void>((resolve) => { resolveClosed = resolve; });
   server.once("close", resolveClosed);
@@ -416,7 +473,7 @@ export async function startRemoteHttpServer(runtime: RuntimeManager, options: Re
   return {
     host: address.address,
     port: address.port,
-    origin: `http://${displayHost}:${address.port}`,
+    origin: serverOrigin,
     closed,
     close(): Promise<void> {
       if (closePromise) return closePromise;

@@ -156,6 +156,7 @@ const BUILTIN_PLUGINS: PluginManifest[] = [
     ],
   },
 ];
+const BUILTIN_BY_ID = new Map(BUILTIN_PLUGINS.map((manifest) => [manifest.id, manifest]));
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
@@ -311,8 +312,28 @@ export class PluginMarketplace {
       if (!response.ok) throw new PosixLoomError("PLUGIN_MARKETPLACE_FAILED", `Marketplace returned HTTP ${response.status}`, { url: this.marketplaceUrl.toString(), status: response.status });
       const declaredLength = Number(response.headers.get("content-length") ?? "0");
       if (declaredLength > this.maxCatalogBytes) throw new PosixLoomError("PLUGIN_MARKETPLACE_TOO_LARGE", "Marketplace catalog exceeds the configured byte limit", { declaredLength, maximum: this.maxCatalogBytes });
-      const bytes = Buffer.from(await response.arrayBuffer());
-      if (bytes.length > this.maxCatalogBytes) throw new PosixLoomError("PLUGIN_MARKETPLACE_TOO_LARGE", "Marketplace catalog exceeds the configured byte limit", { bytes: bytes.length, maximum: this.maxCatalogBytes });
+      const chunks: Buffer[] = [];
+      let receivedBytes = 0;
+      const reader = response.body?.getReader();
+      if (reader) {
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            receivedBytes += value.byteLength;
+            if (receivedBytes > this.maxCatalogBytes) {
+              const error = new PosixLoomError("PLUGIN_MARKETPLACE_TOO_LARGE", "Marketplace catalog exceeds the configured byte limit", { bytes: receivedBytes, maximum: this.maxCatalogBytes });
+              controller.abort();
+              await reader.cancel().catch(() => undefined);
+              throw error;
+            }
+            chunks.push(Buffer.from(value));
+          }
+        } finally {
+          reader.releaseLock();
+        }
+      }
+      const bytes = Buffer.concat(chunks, receivedBytes);
       let parsed: unknown;
       try {
         parsed = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
@@ -322,7 +343,16 @@ export class PluginMarketplace {
       if (!isRecord(parsed) || parsed.schemaVersion !== 1 || !Array.isArray(parsed.plugins) || parsed.plugins.length > 500) {
         throw new PosixLoomError("PLUGIN_MARKETPLACE_INVALID", "Marketplace catalog must use schemaVersion 1 and contain at most 500 plugins");
       }
-      return parsed.plugins.map((plugin) => ({ manifest: validatePluginManifest(plugin), source: this.marketplaceUrl!.toString() }));
+      const seen = new Set<string>();
+      return parsed.plugins.map((plugin) => {
+        const manifest = validatePluginManifest(plugin);
+        if (BUILTIN_BY_ID.has(manifest.id)) {
+          throw new PosixLoomError("PLUGIN_MARKETPLACE_INVALID", "Remote marketplace cannot redefine a built-in plugin id", { id: manifest.id });
+        }
+        if (seen.has(manifest.id)) throw new PosixLoomError("PLUGIN_MARKETPLACE_INVALID", "Remote marketplace plugin ids must be unique", { id: manifest.id });
+        seen.add(manifest.id);
+        return { manifest, source: this.marketplaceUrl!.toString() };
+      });
     } catch (error) {
       if (error instanceof PosixLoomError) throw error;
       if (controller.signal.aborted) throw new PosixLoomError("PLUGIN_MARKETPLACE_TIMEOUT", "Marketplace request timed out", { url: this.marketplaceUrl.toString(), timeoutMs: this.requestTimeoutMs });
@@ -349,7 +379,11 @@ export class PluginMarketplace {
       }
       const manifest = validatePluginManifest(value.manifest);
       if (`${manifest.id}.json` !== entry.name) throw new PosixLoomError("PLUGIN_RECORD_INVALID", "Installed plugin filename does not match its id", { path, id: manifest.id });
-      records.set(manifest.id, { recordVersion: 1, installedAt: value.installedAt, source: value.source, manifest });
+      const builtin = BUILTIN_BY_ID.get(manifest.id);
+      if (builtin) {
+        if (value.source !== "builtin") throw new PosixLoomError("PLUGIN_RECORD_INVALID", "A built-in plugin id cannot be supplied by another source", { path, id: manifest.id, source: value.source });
+        records.set(manifest.id, { recordVersion: 1, installedAt: value.installedAt, source: "builtin", manifest: cloneManifest(builtin) });
+      } else records.set(manifest.id, { recordVersion: 1, installedAt: value.installedAt, source: value.source, manifest });
     }
     return records;
   }
@@ -408,10 +442,11 @@ export class PluginMarketplace {
       try {
         await rename(temporary, target);
       } catch (error) {
-        const code = (error as NodeJS.ErrnoException).code;
-        if (code !== "EEXIST" && code !== "EPERM") throw error;
-        await rm(target, { force: true });
-        await rename(temporary, target);
+        throw new PosixLoomError("PLUGIN_INSTALL_ATOMIC_REPLACE_FAILED", "Plugin record could not be replaced atomically; the existing installation was preserved", {
+          pluginId,
+          code: (error as NodeJS.ErrnoException).code,
+          cause: String(error),
+        });
       }
     } finally {
       await rm(temporary, { force: true }).catch(() => undefined);

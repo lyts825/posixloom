@@ -1,11 +1,25 @@
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { PluginMarketplace, validatePluginManifest } from "../src/plugins/marketplace.js";
+
+function remoteManifest(id: string, version = "1.0.0"): Record<string, unknown> {
+  return {
+    manifestVersion: 1,
+    id,
+    name: "Remote Test",
+    version,
+    description: "Remote test plugin",
+    author: "Tests",
+    category: "Testing",
+    tags: ["remote"],
+    commands: [{ id: "run", title: "Run", description: "Run", input: { kind: "argv", argv: ["node", "--version"] } }],
+  };
+}
 
 test("plugin marketplace installs declarative built-ins without executing them", async (context) => {
   const dataRoot = await mkdtemp(join(tmpdir(), "posixloom-plugins-"));
@@ -96,3 +110,43 @@ test("plugin marketplace discovers an explicitly configured loopback catalog", a
   assert.throws(() => new PluginMarketplace(dataRoot, { marketplaceUrl: "http://example.com/catalog.json" }), (error: any) => error?.code === "PLUGIN_MARKETPLACE_URL_INVALID");
 });
 
+test("remote catalogs are streamed under a byte limit and cannot redefine built-in ids", async (context) => {
+  const dataRoot = await mkdtemp(join(tmpdir(), "posixloom-bounded-catalog-"));
+  context.after(() => rm(dataRoot, { recursive: true, force: true }));
+  let emittedBytes = 0;
+  const oversizedFetch = (async () => new Response(new ReadableStream<Uint8Array>({
+    pull(controller) {
+      emittedBytes += 512;
+      controller.enqueue(new Uint8Array(512));
+    },
+  }, { highWaterMark: 0 }), { status: 200 })) as typeof fetch;
+  const bounded = new PluginMarketplace(dataRoot, {
+    marketplaceUrl: "https://marketplace.example/catalog.json",
+    maxCatalogBytes: 1024,
+    fetch: oversizedFetch,
+  });
+  await assert.rejects(bounded.catalog(), (error: any) => error?.code === "PLUGIN_MARKETPLACE_TOO_LARGE");
+  assert.equal(emittedBytes, 1536);
+
+  const shadowCatalog = JSON.stringify({ schemaVersion: 1, plugins: [remoteManifest("workspace-inspector", "999.0.0")] });
+  const shadowing = new PluginMarketplace(dataRoot, {
+    marketplaceUrl: "https://marketplace.example/catalog.json",
+    fetch: (async () => new Response(shadowCatalog, { status: 200, headers: { "content-type": "application/json" } })) as typeof fetch,
+  });
+  await assert.rejects(shadowing.catalog(), (error: any) => error?.code === "PLUGIN_MARKETPLACE_INVALID");
+});
+
+test("installed records cannot assign a built-in id to a remote source", async (context) => {
+  const dataRoot = await mkdtemp(join(tmpdir(), "posixloom-plugin-record-shadow-"));
+  context.after(() => rm(dataRoot, { recursive: true, force: true }));
+  const installedRoot = join(dataRoot, "plugins", "installed");
+  await mkdir(installedRoot, { recursive: true });
+  await writeFile(join(installedRoot, "workspace-inspector.json"), JSON.stringify({
+    recordVersion: 1,
+    installedAt: new Date(0).toISOString(),
+    source: "https://attacker.example/catalog.json",
+    manifest: remoteManifest("workspace-inspector", "999.0.0"),
+  }), "utf8");
+  const marketplace = new PluginMarketplace(dataRoot);
+  await assert.rejects(marketplace.installed(), (error: any) => error?.code === "PLUGIN_RECORD_INVALID");
+});

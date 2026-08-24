@@ -34,7 +34,7 @@ import type { InteractiveProcessController, ProcessOutputEvent, ProcessRunResult
 import { RuntimeManager } from "./runtime.js";
 import { parseStateReport, quotePosix, toMixedPath } from "./shell.js";
 import { isSafeExistingDirectory, normalizeVirtual } from "./path.js";
-import { SessionStateStore } from "./session.js";
+import { SessionStateStore, type SessionStateEntry } from "./session.js";
 import { TraceRecorder, type TraceEvent } from "./trace.js";
 import {
   COMMAND_CLASSIFIERS,
@@ -136,7 +136,7 @@ interface PreparedExecution {
  */
 export class PosixLoomService {
   /** 会话状态存储；公开暴露供上层创建会话、取快照、关闭会话。 */
-  readonly sessions = new SessionStateStore();
+  readonly sessions: SessionStateStore;
   /** native 命令注册表（与 RuntimeManager 共享同一实例）。 */
   private readonly registry: NativeRegistry;
   /** 路径 / 可执行文件策略门。 */
@@ -149,6 +149,10 @@ export class PosixLoomService {
    * 挂载表、快照、DataRoot 与可观测性配置来装配内部组件。
    */
   constructor(readonly runtime: RuntimeManager) {
+    this.sessions = new SessionStateStore({
+      maxSessions: runtime.config.runtime.session.maxSessions,
+      idleTimeoutMs: runtime.config.runtime.session.idleTimeoutMs,
+    });
     this.registry = runtime.registry;
     const profileName = runtime.config.runtime.policy.defaultProfile;
     this.policy = new PolicyGate(profileName, runtime.config.runtime.policy.profiles[profileName], runtime.mountTable, runtime.snapshot);
@@ -157,7 +161,29 @@ export class PosixLoomService {
 
   /** 创建新会话（默认虚拟 cwd 为 /workspace），返回会话 ID。 */
   createSession(cwd = "/workspace"): string {
-    return this.sessions.create(cwd);
+    let normalizedCwd: string;
+    try {
+      normalizedCwd = normalizeVirtual(cwd);
+    } catch (error) {
+      throw new PosixLoomError("SESSION_CWD_INVALID", "Session cwd must be a normalized absolute virtual path", { cwd, cause: String(error) });
+    }
+    if (!normalizedCwd.startsWith("/") || normalizedCwd !== cwd) {
+      throw new PosixLoomError("SESSION_CWD_INVALID", "Session cwd must be a normalized absolute virtual path", { cwd });
+    }
+    let cwdHost: string;
+    try {
+      cwdHost = this.runtime.mountTable.toHost(normalizedCwd);
+      this.policy.assertCwd(normalizedCwd, cwdHost);
+      if (!isSafeExistingDirectory(cwdHost)) throw new Error("not an existing directory");
+    } catch (error) {
+      throw new PosixLoomError("SESSION_CWD_INVALID", "Session cwd does not resolve to an allowed existing directory", { cwd: normalizedCwd, cause: String(error) });
+    }
+    return this.sessions.create(normalizedCwd);
+  }
+
+  /** List live process-local sessions without extending their idle lifetime. */
+  listSessions(): SessionStateEntry[] {
+    return this.sessions.list();
   }
 
   /** 取会话状态快照（cwd / 导出环境 / 版本号）；会话不存在时抛 SESSION_NOT_FOUND。 */
@@ -582,7 +608,7 @@ export class PosixLoomService {
             } catch (error) {
               // STATE_CONFLICT（版本过期）或其他补丁校验拒绝都映射为 rejected 并附原因。
               const posixloomError = asPosixLoomError(error, "STATE_PATCH_REJECTED");
-              state = { kind: posixloomError.code === "STATE_CONFLICT" ? "rejected" : "rejected", reason: `${posixloomError.code}: ${posixloomError.message}` };
+              state = { kind: "rejected", reason: `${posixloomError.code}: ${posixloomError.message}` };
             }
           }
         }

@@ -109,12 +109,16 @@ export interface RuntimeConfig {
   runtime: { workspace: string };
   /** 挂载表：虚拟挂载点 -> 宿主目录；值支持 $RUNTIME_ROOT / $DATA / $RUN 等变量替换。 */
   mounts: Record<string, string>;
-  /** 会话块：新建会话使用的默认状态策略。 */
+  /** 会话块：默认状态策略与进程内会话资源边界。 */
   session: {
     /** 新建会话默认使用的 StatePolicy。 */
     defaultStatePolicy: StatePolicy;
+    /** 单个服务进程最多保留的会话数。 */
+    maxSessions: number;
+    /** 会话无活动多久后可被回收（毫秒）。 */
+    idleTimeoutMs: number;
   };
-  /** 进程块：超时、取消宽限与输出限额，构成命令执行的资源安全边界。 */
+  /** 进程块：超时、取消宽限与数据限额，构成命令执行的资源安全边界。 */
   process: {
     /** 单命令默认超时（毫秒），可被 VirtualCommand.timeoutMs 覆盖。 */
     defaultTimeoutMs: number;
@@ -122,6 +126,10 @@ export interface RuntimeConfig {
     cancelGraceMs: number;
     /** stdout / stderr 各自的缓存字节上限，超出即截断并置 truncated。 */
     maxOutputBytes: number;
+    /** 命令退出后等待实时输出接收器排空的最长时间（毫秒）。 */
+    outputDrainTimeoutMs: number;
+    /** 单份 StateReport 的最大字节数。 */
+    maxReportBytes: number;
   };
   /** 策略块：默认档案与 trusted / workspace-guard 两个档案的定义。 */
   policy: {

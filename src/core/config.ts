@@ -363,15 +363,19 @@ export async function loadConfig(runRoot: string, options: { allowInvalidRuntime
     version: positiveNumber(merged.version, 1, "version"),
     runtime: { workspace },
     mounts,
-    // 会话状态策略仅认显式 "isolated"，其余一律回落默认 "cwd-env"。
+    // 会话状态与资源边界：进程内最多 1024 个会话，空闲 30 分钟后回收。
     session: {
       defaultStatePolicy: enumValue(merged.session?.defaultStatePolicy, ["isolated", "cwd-env"] as const, "cwd-env", "session.defaultStatePolicy"),
+      maxSessions: positiveNumber(merged.session?.maxSessions, 1024, "session.maxSessions"),
+      idleTimeoutMs: positiveNumber(merged.session?.idleTimeoutMs, 30 * 60 * 1000, "session.idleTimeoutMs"),
     },
-    // 进程默认约束：超时 30s、取消宽限 2s、输出上限 8MB，均可被配置覆盖。
+    // 进程默认约束：超时 30s、取消宽限 2s、输出 8 MiB、输出排空 5s、报告 1 MiB。
     process: {
       defaultTimeoutMs: positiveNumber(merged.process?.defaultTimeoutMs, 30000, "process.defaultTimeoutMs"),
       cancelGraceMs: positiveNumber(merged.process?.cancelGraceMs, 2000, "process.cancelGraceMs", { minimum: 0 }),
       maxOutputBytes: positiveNumber(merged.process?.maxOutputBytes, 8 * 1024 * 1024, "process.maxOutputBytes"),
+      outputDrainTimeoutMs: positiveNumber(merged.process?.outputDrainTimeoutMs, 5000, "process.outputDrainTimeoutMs"),
+      maxReportBytes: positiveNumber(merged.process?.maxReportBytes, 1024 * 1024, "process.maxReportBytes"),
     },
     // 默认 profile 为 workspace-guard（runtime 只读，读写限定在已知虚拟根内）；
     // trusted 需显式指定，且默认不设任何已知根（即无额外放行）。

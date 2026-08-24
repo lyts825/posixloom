@@ -28,11 +28,11 @@
  *   同时不启用运行时完整性监听（恢复态下的运行时本就不可信）。
  */
 import { createHash } from "node:crypto";
-import { execFileSync } from "node:child_process";
 import { existsSync, lstatSync, readdirSync, readFileSync, watch, type FSWatcher } from "node:fs";
 import { basename, dirname, join, resolve, sep } from "node:path";
 import { isSafeRuntimeId, loadConfig, type LoadedConfig } from "./config.js";
 import { PosixLoomError } from "./errors.js";
+import { findAllOnPath, findOnPath } from "./executable.js";
 import { MountTable } from "./path.js";
 import { NativeRegistry } from "./registry.js";
 import { createBuiltinRuntimePlugins } from "../plugins/builtins.js";
@@ -61,27 +61,6 @@ const RELEASE_COMPONENT_LAYOUTS: Record<string, { root: string; entrypoint: stri
 /** 对文本取 SHA-256 十六进制摘要，用于合成各路内容哈希与 snapshotId。 */
 function hashText(text: string): string {
   return createHash("sha256").update(text).digest("hex");
-}
-
-/** 在 PATH 上查找命令的第一个命中路径；找不到或查找器执行失败时返回 undefined。 */
-function findOnPath(command: string): string | undefined {
-  try {
-    const finder = process.platform === "win32" ? "where.exe" : "which";
-    return execFileSync(finder, [command], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim().split(/\r?\n/)[0] || undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-/** 返回命令在 PATH 上的全部命中路径（按 PATH 顺序）；找不到时返回空数组。 */
-function findAllOnPath(command: string): string[] {
-  try {
-    const finder = process.platform === "win32" ? "where.exe" : "which";
-    return execFileSync(finder, [command], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] })
-      .trim().split(/\r?\n/).filter(Boolean);
-  } catch {
-    return [];
-  }
 }
 
 /**

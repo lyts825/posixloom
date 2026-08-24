@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -50,6 +50,35 @@ test("process output observer streams binary-safe chunks before completion", asy
   assert.deepEqual(result.stderr, Buffer.from([255, 254]));
 });
 
+test("process completion has a hard deadline when an output sink never settles", async () => {
+  const startedAt = Date.now();
+  const result = await runProcess({
+    program: process.execPath,
+    args: ["-e", "process.stdout.write('blocked')"],
+    cwd: process.cwd(),
+    env: { ...process.env } as Record<string, string>,
+    timeoutMs: 5000,
+    maxOutputBytes: 1024,
+    outputDrainTimeoutMs: 50,
+    onOutput: () => new Promise<void>(() => undefined),
+  });
+  assert.deepEqual(result.outcome, { kind: "crashed", errorCode: "OUTPUT_SINK_FAILED" });
+  assert.equal(Date.now() - startedAt < 2000, true);
+});
+
+test("early stdin closure is consumed and reported instead of becoming an uncaught EPIPE", async () => {
+  const result = await runProcess({
+    program: process.execPath,
+    args: ["-e", "process.stdin.destroy();setTimeout(()=>{},1000)"],
+    cwd: process.cwd(),
+    env: { ...process.env } as Record<string, string>,
+    timeoutMs: 5000,
+    input: Buffer.alloc(8 * 1024 * 1024),
+    maxOutputBytes: 1024,
+  });
+  assert.deepEqual(result.outcome, { kind: "crashed", errorCode: "INPUT_WRITE_FAILED" });
+});
+
 test("interactive delivery remains bounded after the native sink is attached", async () => {
   const interactive = new InteractiveProcessController();
   let release!: () => void;
@@ -80,6 +109,41 @@ test("report IO failures settle as a crashed outcome", async () => {
       reportPath,
     });
     assert.deepEqual(result.outcome, { kind: "crashed", errorCode: "REPORT_IO_FAILED" });
+  } finally {
+    rmSync(fixture, { recursive: true, force: true });
+  }
+});
+
+test("StateReport files and fd streams are rejected before they can exceed their own limit", async () => {
+  const fixture = mkdtempSync(join(tmpdir(), "posixloom-report-limit-"));
+  const reportPath = join(fixture, "oversized.report");
+  try {
+    writeFileSync(reportPath, Buffer.alloc(2048));
+    const fileResult = await runProcess({
+      program: process.execPath,
+      args: ["-e", ""],
+      cwd: process.cwd(),
+      env: { ...process.env } as Record<string, string>,
+      timeoutMs: 5000,
+      maxOutputBytes: 1024,
+      maxReportBytes: 1024,
+      reportPath,
+    });
+    assert.deepEqual(fileResult.outcome, { kind: "crashed", errorCode: "REPORT_IO_FAILED" });
+    assert.equal(existsSync(reportPath), false);
+
+    const fdResult = await runProcess({
+      program: process.execPath,
+      args: ["-e", "require('node:fs').writeSync(3,Buffer.alloc(4096))"],
+      cwd: process.cwd(),
+      env: { ...process.env } as Record<string, string>,
+      timeoutMs: 5000,
+      maxOutputBytes: 1024,
+      maxReportBytes: 1024,
+      reportFd: true,
+    });
+    assert.deepEqual(fdResult.outcome, { kind: "crashed", errorCode: "REPORT_IO_FAILED" });
+    assert.equal(fdResult.report.length <= 1024, true);
   } finally {
     rmSync(fixture, { recursive: true, force: true });
   }
