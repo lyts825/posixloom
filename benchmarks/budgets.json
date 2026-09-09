@@ -1,0 +1,46 @@
+{
+  "schemaVersion": 2,
+  "description": "Milliseconds. Broad regression guardrails, not performance claims or SLAs. Use same-machine baselines for tighter comparisons.",
+  "profiles": {
+    "development": {
+      "cold.runtime-info": 800,
+      "cold.explain": 800,
+      "cold.native": 1000,
+      "cold.shell": 2000,
+      "launcher.runtime-info": 1500,
+      "launcher.explain": 1500,
+      "launcher.native": 2000,
+      "launcher.shell": 3000,
+      "warm.initialize": 100,
+      "warm.explain": 50,
+      "warm.native": 300,
+      "warm.shell": 900,
+      "warm.shell-cwd-env": 1200,
+      "buffer.output-64mib": 250,
+      "load.native-concurrent-8": 4000,
+      "load.output-64mib": 15000,
+      "load.http-output-64mib": 20000,
+      "load.http-delayed-reader-1mib": 10000
+    },
+    "release": {
+      "cold.runtime-info": 10000,
+      "cold.explain": 10000,
+      "cold.native": 10000,
+      "cold.shell": 10000,
+      "launcher.runtime-info": 15000,
+      "launcher.explain": 15000,
+      "launcher.native": 15000,
+      "launcher.shell": 15000,
+      "warm.initialize": 8000,
+      "warm.explain": 200,
+      "warm.native": 600,
+      "warm.shell": 1500,
+      "warm.shell-cwd-env": 1800,
+      "buffer.output-64mib": 250,
+      "load.native-concurrent-8": 6000,
+      "load.output-64mib": 15000,
+      "load.http-output-64mib": 20000,
+      "load.http-delayed-reader-1mib": 10000
+    }
+  }
+}

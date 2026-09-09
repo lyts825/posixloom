@@ -6,8 +6,12 @@
  */
 import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import type { AddressInfo } from "node:net";
+import type { AddressInfo, Socket } from "node:net";
 import { PosixLoomError, asPosixLoomError } from "../core/errors.js";
+import { parseExecutionRequest, executionRequestSchema, type ExecutionRequest } from "../core/execution-request.js";
+import { IdempotencyStore, requestFingerprint, type Receipt } from "./idempotency.js";
+import { openApiDocument } from "./openapi.js";
+import { summarizeTraces } from "../core/trace-summary.js";
 import type { ProcessOutputEvent } from "../core/process.js";
 import { RuntimeManager } from "../core/runtime.js";
 import { PosixLoomService, type ExecuteOptions } from "../core/service.js";
@@ -49,14 +53,7 @@ export interface RemoteHttpServer {
   close(): Promise<void>;
 }
 
-interface ExecuteBody {
-  input: { kind: "text"; raw: string } | { kind: "argv"; argv: string[] };
-  cwd?: string;
-  envDelta?: Record<string, string | null>;
-  statePolicy?: "isolated" | "cwd-env";
-  timeoutMs?: number;
-  stream: boolean;
-}
+type ExecuteBody = ExecutionRequest;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
@@ -100,7 +97,8 @@ function statusFor(error: PosixLoomError): number {
   if (error.code === "HTTP_NOT_FOUND" || error.code === "SESSION_NOT_FOUND" || error.code.endsWith("_NOT_FOUND") || error.code.endsWith("_NOT_INSTALLED")) return 404;
   if (error.code === "HTTP_METHOD_NOT_ALLOWED") return 405;
   if (error.code === "HTTP_BODY_TOO_LARGE") return 413;
-  if (error.code === "STATE_CONFLICT") return 409;
+  if (error.code === "STATE_CONFLICT" || error.code === "SESSION_BUSY" || error.code.startsWith("IDEMPOTENCY_")) return 409;
+  if (error.code === "SERVER_BUSY" || error.code === "QUEUE_TIMEOUT") return 429;
   if (error.code === "SESSION_LIMIT_REACHED") return 429;
   if (error.code.startsWith("HTTP_") || error.code.endsWith("_INVALID") || error.code === "TIMEOUT_INVALID") return 400;
   return 500;
@@ -113,19 +111,20 @@ function setCommonHeaders(response: ServerResponse): void {
   response.setHeader("cross-origin-resource-policy", "same-origin");
 }
 
-function sendJson(response: ServerResponse, status: number, value: unknown, extraHeaders: Record<string, string> = {}): void {
+async function writeJson(response: ServerResponse, status: number, value: unknown, timeoutMs: number, signal: AbortSignal, extraHeaders: Record<string, string> = {}): Promise<void> {
   if (response.destroyed || response.writableEnded) return;
   setCommonHeaders(response);
   response.writeHead(status, { "content-type": "application/json; charset=utf-8", ...extraHeaders });
-  response.end(`${jsonText(value)}\n`);
+  await writeResponse(response, `${jsonText(value)}\n`, timeoutMs, signal, true);
 }
 
-function sendError(response: ServerResponse, error: unknown, requestId: string): void {
+async function writeError(response: ServerResponse, error: unknown, requestId: string, timeoutMs: number, signal: AbortSignal): Promise<void> {
+  if (response.headersSent) { response.destroy(); return; }
   const normalized = asPosixLoomError(error, "HTTP_INTERNAL_ERROR");
-  sendJson(response, statusFor(normalized), {
+  await writeJson(response, statusFor(normalized), {
     error: { code: normalized.code, message: normalized.message, details: normalized.details },
     requestId,
-  }, normalized.code === "HTTP_UNAUTHORIZED" ? { "www-authenticate": "Bearer realm=\"PosixLoom\"" } : {});
+  }, timeoutMs, signal, normalized.code === "HTTP_UNAUTHORIZED" ? { "www-authenticate": "Bearer realm=\"PosixLoom\"" } : statusFor(normalized) === 429 || normalized.code === "IDEMPOTENCY_IN_PROGRESS" ? { "retry-after": "1" } : {});
 }
 
 function tokenMatches(expected: string, request: IncomingMessage): boolean {
@@ -183,8 +182,9 @@ function applyCors(
   if (originAllowed(origin, serverOrigins, corsOrigins)) {
     response.setHeader("access-control-allow-origin", origin);
     response.setHeader("access-control-allow-methods", "GET, POST, DELETE, OPTIONS");
-    response.setHeader("access-control-allow-headers", "authorization, content-type, x-posixloom-token");
+    response.setHeader("access-control-allow-headers", "authorization, content-type, x-posixloom-token, idempotency-key");
     response.setHeader("access-control-max-age", "600");
+    response.setHeader("access-control-expose-headers", "x-request-id, idempotency-replayed, retry-after");
   }
 }
 
@@ -214,57 +214,44 @@ async function readJson(request: IncomingMessage, maximum: number, allowEmpty = 
 }
 
 function parseExecuteBody(body: Record<string, unknown>, accept: string | undefined): ExecuteBody {
-  if (!isRecord(body.input)) throw new PosixLoomError("HTTP_EXECUTE_INVALID", "execute requires an input object");
-  let input: ExecuteBody["input"];
-  if (body.input.kind === "text") {
-    if (typeof body.input.raw !== "string" || body.input.raw.length > 1024 * 1024) throw new PosixLoomError("HTTP_EXECUTE_INVALID", "text input requires a raw string of at most 1 MiB");
-    input = { kind: "text", raw: body.input.raw };
-  } else if (body.input.kind === "argv") {
-    if (!Array.isArray(body.input.argv) || body.input.argv.length === 0 || body.input.argv.length > 4096 || body.input.argv.some((argument) => typeof argument !== "string" || argument.length > 32_768)) {
-      throw new PosixLoomError("HTTP_EXECUTE_INVALID", "argv input requires 1 to 4096 string arguments");
-    }
-    input = { kind: "argv", argv: [...body.input.argv] as string[] };
-  } else throw new PosixLoomError("HTTP_EXECUTE_INVALID", "input.kind must be text or argv");
-  const cwd = body.cwd;
-  if (cwd !== undefined && typeof cwd !== "string") throw new PosixLoomError("HTTP_EXECUTE_INVALID", "cwd must be a string");
-  const timeoutMs = body.timeoutMs;
-  if (timeoutMs !== undefined && (!Number.isSafeInteger(timeoutMs) || (timeoutMs as number) <= 0)) throw new PosixLoomError("HTTP_EXECUTE_INVALID", "timeoutMs must be a positive integer");
-  const statePolicy = body.statePolicy;
-  if (statePolicy !== undefined && statePolicy !== "isolated" && statePolicy !== "cwd-env") throw new PosixLoomError("HTTP_EXECUTE_INVALID", "statePolicy must be isolated or cwd-env");
-  let envDelta: Record<string, string | null> | undefined;
-  if (body.envDelta !== undefined) {
-    if (!isRecord(body.envDelta)) throw new PosixLoomError("HTTP_EXECUTE_INVALID", "envDelta must be an object");
-    envDelta = {};
-    for (const [key, value] of Object.entries(body.envDelta)) {
-      if (typeof value !== "string" && value !== null) throw new PosixLoomError("HTTP_EXECUTE_INVALID", "envDelta values must be strings or null", { key });
-      envDelta[key] = value;
-    }
-  }
-  const streamRequested = body.stream === true || accept?.split(",").some((value) => value.trim().startsWith("application/x-ndjson")) === true;
-  if (body.stream !== undefined && typeof body.stream !== "boolean") throw new PosixLoomError("HTTP_EXECUTE_INVALID", "stream must be a boolean");
-  return { input, cwd: cwd as string | undefined, envDelta, statePolicy: statePolicy as ExecuteBody["statePolicy"], timeoutMs: timeoutMs as number | undefined, stream: streamRequested };
+  const parsed = parseExecutionRequest(body, { code: "HTTP_EXECUTE_INVALID", allowTerminal: false });
+  return { ...parsed, stream: parsed.stream || accept?.split(",").some((value) => value.trim().startsWith("application/x-ndjson")) === true };
 }
 
-function executeOptions(sessionId: string, body: ExecuteBody, signal?: AbortSignal): ExecuteOptions {
-  const common = { sessionId, cwd: body.cwd, envDelta: body.envDelta, statePolicy: body.statePolicy, timeoutMs: body.timeoutMs, signal };
+function executeOptions(sessionId: string, body: ExecuteBody, signal?: AbortSignal, clientId?: string): ExecuteOptions {
+  const common = { sessionId, cwd: body.cwd, envDelta: body.envDelta, statePolicy: body.statePolicy, timeoutMs: body.timeoutMs, signal, clientId };
   return body.input.kind === "argv" ? { ...common, kind: "argv", argv: body.input.argv } : { ...common, kind: "text", raw: body.input.raw };
 }
 
-async function writeResponse(response: ServerResponse, text: string): Promise<void> {
-  if (response.destroyed || response.writableEnded) throw new PosixLoomError("HTTP_CLIENT_CLOSED", "HTTP client closed the response stream");
-  if (response.write(text)) return;
+async function writeResponse(response: ServerResponse, text: string, timeoutMs: number, signal: AbortSignal, end = false): Promise<void> {
+  if (response.destroyed || response.writableEnded || signal.aborted) throw new PosixLoomError("HTTP_CLIENT_CLOSED", "HTTP client closed the response stream");
   await new Promise<void>((resolve, reject) => {
+    let settled = false;
+    let timer: NodeJS.Timeout | undefined;
     const cleanup = (): void => {
-      response.off("drain", onDrain);
+      if (timer) clearTimeout(timer);
       response.off("error", onError);
       response.off("close", onClose);
+      signal.removeEventListener("abort", onClose);
     };
-    const onDrain = (): void => { cleanup(); resolve(); };
-    const onError = (error: Error): void => { cleanup(); reject(error); };
-    const onClose = (): void => { cleanup(); reject(new PosixLoomError("HTTP_CLIENT_CLOSED", "HTTP client closed the response stream")); };
-    response.once("drain", onDrain);
+    const finish = (error?: Error): void => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      if (error) reject(error); else resolve();
+    };
+    const onError = (error: Error): void => finish(error);
+    const onClose = (): void => finish(new PosixLoomError("HTTP_CLIENT_CLOSED", "HTTP client closed the response stream"));
     response.once("error", onError);
     response.once("close", onClose);
+    signal.addEventListener("abort", onClose, { once: true });
+    try {
+      timer = setTimeout(() => finish(new PosixLoomError("HTTP_OUTPUT_TIMEOUT", "HTTP response did not drain before the configured deadline", { timeoutMs })), timeoutMs);
+      // Await the write callback even below the high-water mark: HTTP/1 pipelining
+      // can buffer a response behind another response on the same socket.
+      if (end) response.end(text, () => finish());
+      else response.write(text, (error) => finish(error ?? undefined));
+    } catch (error) { finish(error instanceof Error ? error : new Error(String(error))); }
   });
 }
 
@@ -298,6 +285,13 @@ export async function startRemoteHttpServer(runtime: RuntimeManager, options: Re
   }
   const service = new PosixLoomService(runtime);
   const inflight = new Set<AbortController>();
+  const limits = runtime.config.runtime.protocol;
+  const receipts = new IdempotencyStore(limits.idempotencyMaxEntries, limits.idempotencyTtlMs, limits.idempotencyMaxBytes);
+  const requestTasks = new Set<Promise<void>>();
+  const responses = new Map<ServerResponse, { socket: Socket; close(): void }>();
+  let pendingRequests = 0;
+  let rejectedRequests = 0;
+  let closing = false;
   const startedAt = Date.now();
   const serverOrigins = new Set<string>();
   const allowedAuthorities = new Set<string>();
@@ -305,7 +299,39 @@ export async function startRemoteHttpServer(runtime: RuntimeManager, options: Re
 
   const server: Server = createServer((request, response) => {
     const requestId = randomUUID();
+    const responseClosed = new AbortController();
+    const outputTimeout = runtime.config.runtime.process.outputDrainTimeoutMs;
+    const sendJson = (target: ServerResponse, status: number, value: unknown, headers: Record<string, string> = {}): Promise<void> =>
+      writeJson(target, status, value, outputTimeout, responseClosed.signal, headers);
+    const sendError = (target: ServerResponse, error: unknown, id: string): Promise<void> =>
+      writeError(target, error, id, outputTimeout, responseClosed.signal);
+    const endResponse = (): Promise<void> => writeResponse(response, "", outputTimeout, responseClosed.signal, true);
+    if (closing || pendingRequests >= limits.maxPendingRequests) {
+      rejectedRequests += 1;
+      response.setHeader("connection", "close");
+      void sendError(response, new PosixLoomError("SERVER_BUSY", "HTTP request capacity exhausted"), requestId).catch(() => response.destroy());
+      return;
+    }
+    pendingRequests += 1;
+    const closeResponse = (): void => {
+      responseClosed.abort();
+      responses.delete(response);
+      response.off("close", closeResponse);
+    };
+    responses.set(response, { socket: request.socket, close: closeResponse });
+    response.once("close", closeResponse);
+    const clientId = `http:${request.socket.remoteAddress ?? "unknown"}`;
     response.setHeader("x-request-id", requestId);
+    const writeStreamEvent = async (event: unknown): Promise<void> => {
+      try {
+        await writeResponse(response, `${jsonText(event)}\n`, runtime.config.runtime.process.outputDrainTimeoutMs, responseClosed.signal);
+      } catch (error) {
+        closeResponse();
+        response.destroy();
+        request.socket.destroy();
+        throw error;
+      }
+    };
     const run = async (): Promise<void> => {
       if (!token) {
         const authority = canonicalAuthority(request.headers.host);
@@ -325,11 +351,11 @@ export async function startRemoteHttpServer(runtime: RuntimeManager, options: Re
       const method = request.method ?? "GET";
       if (method === "OPTIONS") {
         response.writeHead(204);
-        response.end();
+        await endResponse();
         return;
       }
       if (url.pathname === "/api/v1/health" && method === "GET") {
-        sendJson(response, 200, { status: "ok", apiVersion: HTTP_API_VERSION, runtimeId: runtime.snapshot.runtimeId, uptimeSeconds: Math.floor((Date.now() - startedAt) / 1000), requestId });
+        await sendJson(response, 200, { status: "ok", apiVersion: HTTP_API_VERSION, runtimeId: runtime.snapshot.runtimeId, uptimeSeconds: Math.floor((Date.now() - startedAt) / 1000), requestId });
         return;
       }
       if (!url.pathname.startsWith("/api/v1")) throw new PosixLoomError("HTTP_NOT_FOUND", "HTTP endpoint not found", { path: url.pathname });
@@ -337,33 +363,39 @@ export async function startRemoteHttpServer(runtime: RuntimeManager, options: Re
 
       if ((url.pathname === "/api/v1" || url.pathname === "/api/v1/capabilities") && method === "GET") {
         const extensionCapabilities = (options.extensions ?? []).flatMap((extension) => extension.capabilities);
-        sendJson(response, 200, { apiVersion: HTTP_API_VERSION, transport: "http-json", streaming: "application/x-ndjson", capabilities: ["sessions", "execute", "execute-plan", "stream-output", "runtime", "traces", ...new Set(extensionCapabilities)], requestId });
+        await sendJson(response, 200, { apiVersion: HTTP_API_VERSION, transport: "http-json", streaming: "application/x-ndjson", capabilities: ["sessions", "execute", "execute-plan", "stream-output", "runtime", "traces", "trace-summary", "metrics", "idempotency-v1", "schema", ...new Set(extensionCapabilities)], limits: { ...limits, ...runtime.config.runtime.process }, requestId });
         return;
       }
+      if (url.pathname === "/api/v1/metrics" && method === "GET") {
+        await sendJson(response, 200, { ...service.metrics(), http: { pendingRequests, rejectedRequests, executions: inflight.size }, idempotency: receipts.snapshot(), requestId }); return;
+      }
+      if (url.pathname === "/api/v1/schema" && method === "GET") { await sendJson(response, 200, { ...executionRequestSchema, properties: { ...executionRequestSchema.properties, terminal: false } }); return; }
+      if (url.pathname === "/api/v1/openapi.json" && method === "GET") { await sendJson(response, 200, openApiDocument); return; }
       if (url.pathname === "/api/v1/runtime" && method === "GET") {
-        sendJson(response, 200, { runtime: runtime.info(), requestId });
+        await sendJson(response, 200, { runtime: runtime.info(), requestId });
         return;
       }
       if (url.pathname === "/api/v1/runtime/doctor" && method === "GET") {
-        sendJson(response, 200, { report: runtime.doctor(), requestId });
+        await sendJson(response, 200, { report: runtime.doctor(), requestId });
         return;
       }
-      if (url.pathname === "/api/v1/traces" && method === "GET") {
+      if ((url.pathname === "/api/v1/traces" || url.pathname === "/api/v1/traces/summary") && method === "GET") {
         const limit = Number(url.searchParams.get("limit") ?? "50");
         if (!Number.isSafeInteger(limit) || limit <= 0 || limit > 5000) throw new PosixLoomError("HTTP_QUERY_INVALID", "trace limit must be an integer between 1 and 5000");
-        sendJson(response, 200, { events: service.traces().slice(-limit), requestId });
+        const events = service.traces(limit);
+        await sendJson(response, 200, url.pathname.endsWith("/summary") ? { summary: summarizeTraces(events), requestId } : { events, requestId });
         return;
       }
       if (url.pathname === "/api/v1/sessions" && method === "GET") {
         const result = service.listSessions().map(({ sessionId, state }) => ({ sessionId, state: jsonState(state) }));
-        sendJson(response, 200, { sessions: result, requestId });
+        await sendJson(response, 200, { sessions: result, requestId });
         return;
       }
       if (url.pathname === "/api/v1/sessions" && method === "POST") {
         const body = await readJson(request, maximumBody, true);
         if (body.cwd !== undefined && typeof body.cwd !== "string") throw new PosixLoomError("HTTP_SESSION_INVALID", "cwd must be a string");
         const sessionId = service.createSession((body.cwd as string | undefined) ?? "/workspace");
-        sendJson(response, 201, { sessionId, state: jsonState(service.sessionSnapshot(sessionId)), requestId });
+        await sendJson(response, 201, { sessionId, state: jsonState(service.sessionSnapshot(sessionId)), requestId });
         return;
       }
 
@@ -371,12 +403,12 @@ export async function startRemoteHttpServer(runtime: RuntimeManager, options: Re
       if (session) {
         const sessionId = validSegment(session[1], "sessionId");
         if (method === "GET") {
-          sendJson(response, 200, { sessionId, state: jsonState(service.sessionSnapshot(sessionId)), requestId });
+          await sendJson(response, 200, { sessionId, state: jsonState(service.sessionSnapshot(sessionId)), requestId });
           return;
         }
         if (method === "DELETE") {
           service.sessions.close(sessionId);
-          sendJson(response, 200, { closed: true, sessionId, requestId });
+          await sendJson(response, 200, { closed: true, sessionId, requestId });
           return;
         }
         throw new PosixLoomError("HTTP_METHOD_NOT_ALLOWED", "Method is not allowed for this session endpoint");
@@ -386,8 +418,15 @@ export async function startRemoteHttpServer(runtime: RuntimeManager, options: Re
       if (explain && method === "POST") {
         const sessionId = validSegment(explain[1], "sessionId");
         const body = parseExecuteBody(await readJson(request, maximumBody), request.headers.accept);
-        const preview = await service.explain(executeOptions(sessionId, { ...body, stream: false }));
-        sendJson(response, 200, { preview, requestId });
+        const controller = new AbortController();
+        inflight.add(controller);
+        const onClose = (): void => { if (!response.writableEnded) controller.abort(); };
+        responseClosed.signal.addEventListener("abort", onClose, { once: true });
+        if (responseClosed.signal.aborted || response.destroyed || request.aborted || closing) controller.abort();
+        let preview;
+        try { preview = await service.explain(executeOptions(sessionId, { ...body, stream: false }, controller.signal, clientId)); }
+        finally { inflight.delete(controller); responseClosed.signal.removeEventListener("abort", onClose); }
+        await sendJson(response, 200, { preview, requestId });
         return;
       }
 
@@ -395,39 +434,66 @@ export async function startRemoteHttpServer(runtime: RuntimeManager, options: Re
       if (execute && method === "POST") {
         const sessionId = validSegment(execute[1], "sessionId");
         const body = parseExecuteBody(await readJson(request, maximumBody), request.headers.accept);
-        if (!body.stream) {
-          const completion = await service.execute(executeOptions(sessionId, body));
-          sendJson(response, 200, { result: jsonCompletion(completion), requestId });
-          return;
+        const headerKey = request.headers["idempotency-key"];
+        if (headerKey !== undefined && typeof headerKey !== "string") throw new PosixLoomError("HTTP_IDEMPOTENCY_INVALID", "Idempotency-Key must be a single header");
+        const key = headerKey;
+        if (key !== undefined) {
+          const { stream: _stream, ...identity } = body;
+          const existing = receipts.begin(key, requestFingerprint({ sessionId, ...identity }));
+          if (existing.replayed) {
+            response.setHeader("idempotency-replayed", "true");
+            const receipt = existing.receipt!;
+            if (body.stream && receipt.status === 200) {
+              setCommonHeaders(response);
+              response.writeHead(200, { "content-type": "application/x-ndjson; charset=utf-8" });
+              await writeStreamEvent({ type: "completed", ...receipt.body, replayed: true, requestId });
+              await endResponse();
+            } else await sendJson(response, receipt.status, { ...receipt.body, requestId });
+            return;
+          }
         }
         const controller = new AbortController();
         inflight.add(controller);
         const onClose = (): void => { if (!response.writableEnded) controller.abort(); };
-        response.once("close", onClose);
-        setCommonHeaders(response);
-        response.writeHead(200, { "content-type": "application/x-ndjson; charset=utf-8", "x-accel-buffering": "no" });
+        responseClosed.signal.addEventListener("abort", onClose, { once: true });
+        if (responseClosed.signal.aborted || response.destroyed || request.aborted || closing) controller.abort();
+        const save = (receipt: Receipt): void => { if (key !== undefined) receipts.complete(key, receipt); };
+        let admitted = false;
         let sequence = 0;
-        const sendEvent = (event: unknown): Promise<void> => writeResponse(response, `${jsonText(event)}\n`);
-        try {
-          const completion = await service.execute(executeOptions(sessionId, body, controller.signal), {
-            onStarted: (preview) => sendEvent({ type: "started", preview, requestId }),
-            onOutput: (event: ProcessOutputEvent) => sendEvent({ type: "output", stream: event.stream, sequence: sequence++, dataBase64: event.data.toString("base64"), requestId }),
-          });
-          if (completion.command.kind === "crashed" && completion.command.errorCode === "OUTPUT_SINK_FAILED") {
-            response.destroy();
-            return;
+        const sendEvent = (event: unknown): Promise<void> => {
+          if (!response.headersSent) {
+            setCommonHeaders(response);
+            response.writeHead(200, { "content-type": "application/x-ndjson; charset=utf-8", "x-accel-buffering": "no" });
           }
-          await sendEvent({ type: "completed", result: jsonCompletion(completion), requestId });
-          response.end();
+          return writeStreamEvent(event);
+        };
+        try {
+          const completion = await service.execute(executeOptions(sessionId, body, controller.signal, clientId), {
+            onAdmitted: () => { admitted = true; },
+            ...(body.stream ? {
+              onStarted: (preview) => sendEvent({ type: "started", preview, requestId }),
+              onOutput: (event: ProcessOutputEvent) => sendEvent({ type: "output", stream: event.stream, sequence: sequence++, dataBase64: event.data.toString("base64"), requestId }),
+            } : {}),
+          });
+          const result = jsonCompletion(completion);
+          save({ status: 200, body: { result } });
+          if (!body.stream) { await sendJson(response, 200, { result, requestId }); return; }
+          if (completion.command.kind === "crashed" && completion.command.errorCode === "OUTPUT_SINK_FAILED") { response.destroy(); return; }
+          await sendEvent({ type: "completed", result, requestId });
+          await endResponse();
         } catch (error) {
+          const normalized = asPosixLoomError(error, "HTTP_EXECUTION_FAILED");
+          const payload = { error: { code: normalized.code, message: normalized.message, details: normalized.details } };
+          if (key !== undefined && !admitted && (normalized.code === "SERVER_BUSY" || normalized.code === "QUEUE_TIMEOUT")) receipts.retryAfterRejection(key);
+          else save({ status: statusFor(normalized), body: payload });
+          if (!body.stream || !response.headersSent) throw error;
           if (!response.destroyed && !response.writableEnded) {
-            const normalized = asPosixLoomError(error, "HTTP_EXECUTION_FAILED");
-            await sendEvent({ type: "error", error: { code: normalized.code, message: normalized.message, details: normalized.details }, requestId }).catch(() => undefined);
-            response.end();
+            await sendEvent({ type: "error", ...payload, requestId }).catch(() => undefined);
+            await endResponse();
           }
         } finally {
           inflight.delete(controller);
-          response.off("close", onClose);
+          responseClosed.signal.removeEventListener("abort", onClose);
         }
         return;
       }
@@ -435,13 +501,28 @@ export async function startRemoteHttpServer(runtime: RuntimeManager, options: Re
       for (const extension of options.extensions ?? []) {
         const result = await extension.handle({ method, pathname: url.pathname, searchParams: url.searchParams });
         if (result) {
-          sendJson(response, result.status ?? 200, { ...result.body, requestId });
+          await sendJson(response, result.status ?? 200, { ...result.body, requestId });
           return;
         }
       }
       throw new PosixLoomError("HTTP_NOT_FOUND", "HTTP endpoint not found", { path: url.pathname });
     };
-    void run().catch((error) => sendError(response, error, requestId));
+    const task = run().catch((error) => sendError(response, error, requestId).catch(() => { response.destroy(); request.socket.destroy(); })).finally(() => { pendingRequests -= 1; requestTasks.delete(task); });
+    requestTasks.add(task);
+  });
+  server.requestTimeout = 30000;
+  server.headersTimeout = 15000;
+  server.maxConnections = limits.maxPendingRequests + 16;
+  server.on("connection", (socket) => {
+    // Queued HTTP/1.1 responses may never receive their own close event. One socket
+    // listener cancels every affected response without adding a listener per request.
+    socket.once("close", () => {
+      for (const [response, pending] of responses) {
+        if (pending.socket !== socket) continue;
+        pending.close();
+        response.destroy();
+      }
+    });
   });
   server.on("clientError", (_error, socket) => {
     if (socket.writable) socket.end("HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n");
@@ -477,12 +558,21 @@ export async function startRemoteHttpServer(runtime: RuntimeManager, options: Re
     closed,
     close(): Promise<void> {
       if (closePromise) return closePromise;
+      closing = true;
+      for (const [response] of responses) {
+        response.shouldKeepAlive = false;
+        if (!response.headersSent) response.setHeader("connection", "close");
+      }
       for (const controller of inflight) controller.abort();
       closePromise = new Promise<void>((resolve, reject) => {
         if (!server.listening) { resolve(); return; }
-        server.close((error) => error ? reject(error) : resolve());
+        const deadline = setTimeout(() => {
+          for (const [response, pending] of responses) { pending.close(); response.destroy(); }
+          server.closeAllConnections();
+        }, runtime.config.runtime.process.cancelGraceMs + runtime.config.runtime.process.outputDrainTimeoutMs);
+        server.close((error) => { clearTimeout(deadline); error ? reject(error) : resolve(); });
         server.closeIdleConnections();
-      });
+      }).then(async () => { await Promise.allSettled(requestTasks); await service.flushTraces(); });
       return closePromise;
     },
   };

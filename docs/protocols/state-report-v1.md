@@ -29,6 +29,20 @@ __POSIXLOOM_REPORT_END\n
 
 ## 提交语义
 
+`isolated` 命令使用只包含退出码的 CompletionReport v1，不采集 cwd 或环境：
+
+```text
+__POSIXLOOM_COMPLETION_V1\n
+exit-code=<0..255 canonical decimal>\n
+__POSIXLOOM_REPORT_END\n
+```
+
+轻量回执使用 Bash 内建命令写入同一临时文件，不派生 env/base64/wc/tr。
+它只允许用于 isolated 计划；cwd-env 计划仍要求完整 StateReport。为兼容可信
+自定义后端，isolated 仍接受并严格校验完整 v1 报告，但不会提交状态。
+退出码必须与实际进程一致；报告写入失败仍退出 240，提前 exit/exec、取消、超时
+和报告缺失保持下述语义。轻量回执不是跳过完成校验。
+
 - `exit-code` 是用户命令的业务退出码，不是报告写入状态。
 - 合法 `cwd` 和 exported env patch 可在非零退出码时提交。
 - `set -e`、`exit`、`exec` 或终止导致报告缺失时返回 `not-produced`，不提交。

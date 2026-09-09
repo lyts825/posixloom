@@ -22,7 +22,12 @@
     "cancelGraceMs": 2000,
     "maxOutputBytes": 8388608,
     "outputDrainTimeoutMs": 5000,
-    "maxReportBytes": 1048576
+    "maxReportBytes": 1048576,
+    "maxConcurrent": 8,
+    "maxConcurrentPerClient": 4,
+    "maxQueued": 128,
+    "maxQueuedPerClient": 32,
+    "queueTimeoutMs": 30000
   },
   "policy": {
     "defaultProfile": "workspace-guard",
@@ -43,7 +48,20 @@
   },
   "observability": {
     "traceBufferSize": 5000,
-    "writeTraceFile": false
+    "writeTraceFile": false,
+    "collectCommandNames": false,
+    "traceMaxFileBytes": 10485760,
+    "traceRetainedFiles": 3,
+    "traceMaxPendingBytes": 1048576,
+    "traceFlushIntervalMs": 100
+  },
+  "protocol": {
+    "maxPendingRequests": 256,
+    "replayWindowSize": 10000,
+    "replayWindowTtlMs": 1800000,
+    "idempotencyMaxEntries": 1024,
+    "idempotencyTtlMs": 1800000,
+    "idempotencyMaxBytes": 33554432
   },
   "updates": {
     "enabled": true,

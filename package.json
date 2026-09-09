@@ -3,6 +3,23 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "main": "./dist/src/index.js",
+  "types": "./dist/src/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/src/index.d.ts",
+      "import": "./dist/src/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist/src/",
+    "config/defaults.json",
+    "examples/embedded.mjs"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
   "description": "Portable POSIX command runtime for Windows automation and AI harnesses",
   "scripts": {
     "build": "tsc -p tsconfig.json && node scripts/copy-gui-assets.mjs",
@@ -10,10 +27,18 @@
     "build:all": "npm run build && npm run build:host",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "npm run build:all && node --test dist/tests/**/*.test.js",
+    "test:unit": "npm run build && node scripts/run-tests.mjs unit",
+    "test:integration": "npm run build:all && node scripts/run-tests.mjs integration",
+    "test:coverage": "npm run build:all && node --experimental-test-coverage --test dist/tests/**/*.test.js",
+    "test:sdk": "npm run build && node --test dist/tests/sdk-consumer.test.js",
+    "benchmark": "npm run build:all && node scripts/benchmark.mjs",
+    "benchmark:check": "npm run build:all && node scripts/benchmark.mjs --check --output artifacts/benchmark.json",
+    "verify:defender": "powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File packaging/verify-defender.ps1",
     "posixloom": "npm run build --silent && node dist/src/cli/main.js",
     "doctor": "npm run posixloom -- runtime doctor",
     "gui": "npm run posixloom -- gui",
     "serve:http": "npm run posixloom -- serve --http",
+    "serve:stdio": "node dist/src/cli/main.js serve --stdio",
     "components:check": "node scripts/sync-components.mjs --check",
     "components:sync": "node scripts/sync-components.mjs --locked",
     "components:update": "node scripts/sync-components.mjs --refresh",

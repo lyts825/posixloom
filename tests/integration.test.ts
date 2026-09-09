@@ -4,6 +4,7 @@ import { existsSync } from "node:fs";
 import { RuntimeManager } from "../src/core/runtime.js";
 import { PosixLoomService } from "../src/core/service.js";
 import { buildNativeEnv } from "../src/core/env.js";
+import { runtimeFixture } from "./helpers/runtime-fixture.js";
 
 test("one-shot shell preserves cwd and exported env in a SessionState", { skip: !existsSync("C:\\Program Files\\Git\\usr\\bin\\bash.exe") }, async () => {
   const previous = process.env.POSIXLOOM_BASH;
@@ -16,7 +17,7 @@ test("one-shot shell preserves cwd and exported env in a SessionState", { skip: 
     assert.equal(cd.command.kind, "exited");
     assert.equal(cd.state.kind, "committed");
     const pwd = await service.execute({ raw: "pwd", sessionId });
-    assert.equal(pwd.stdout.toString().trim(), "/workspace/tests");
+    assert.equal(pwd.stdout.toString().trim(), "/workspace/tests", pwd.stderr.toString());
     const exportResult = await service.execute({ raw: "export POSIXLOOM_INTEGRATION_OK=yes", sessionId });
     assert.equal(exportResult.state.kind, "committed");
     const print = await service.execute({ raw: "printf '%s\\n' \"$POSIXLOOM_INTEGRATION_OK\"", sessionId });
@@ -30,4 +31,14 @@ test("one-shot shell preserves cwd and exported env in a SessionState", { skip: 
     if (previous === undefined) delete process.env.POSIXLOOM_BASH;
     else process.env.POSIXLOOM_BASH = previous;
   }
+});
+
+test("Shell bootstraps /tmp in a fresh temporary-drive workspace before POSIX exports", async (context) => {
+  const { runtime } = await runtimeFixture(context);
+  if (!runtime.findBash()) { context.skip("Bash is unavailable"); return; }
+  const service = new PosixLoomService(runtime);
+  const completion = await service.execute({ sessionId: service.createSession(), raw: "test -d /tmp && printf '%s|%s' \"$TMP\" \"$TMPDIR\"" });
+  assert.deepEqual(completion.command, { kind: "exited", exitCode: 0 }, completion.stderr.toString());
+  assert.equal(completion.stdout.toString(), "/tmp|/tmp");
+  assert.equal(completion.state.kind, "committed");
 });

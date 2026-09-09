@@ -242,11 +242,12 @@ async function selectRuntime(root: string, dataRoot: string, allowInvalidPointer
  * 且默认必须为整数（integer: false 可放宽为任意有限数）。
  * 非法值抛 CONFIG_INVALID，携带字段名与原值，便于定位配置问题。
  */
-function positiveNumber(value: unknown, fallback: number, name: string, options: { integer?: boolean; minimum?: number } = {}): number {
+function positiveNumber(value: unknown, fallback: number, name: string, options: { integer?: boolean; minimum?: number; maximum?: number } = {}): number {
   const number = Number(value ?? fallback);
   const minimum = options.minimum ?? 1;
-  if (!Number.isFinite(number) || number < minimum || (options.integer !== false && !Number.isInteger(number))) {
-    throw new PosixLoomError("CONFIG_INVALID", `${name} must be a finite ${options.integer === false ? "number" : "integer"} >= ${minimum}`, { name, value });
+  const maximum = options.maximum ?? Number.MAX_SAFE_INTEGER;
+  if (!Number.isFinite(number) || number < minimum || number > maximum || (options.integer !== false && !Number.isSafeInteger(number))) {
+    throw new PosixLoomError("CONFIG_INVALID", `${name} must be a finite ${options.integer === false ? "number" : "integer"} between ${minimum} and ${maximum}`, { name, value });
   }
   return number;
 }
@@ -371,10 +372,15 @@ export async function loadConfig(runRoot: string, options: { allowInvalidRuntime
     },
     // 进程默认约束：超时 30s、取消宽限 2s、输出 8 MiB、输出排空 5s、报告 1 MiB。
     process: {
-      defaultTimeoutMs: positiveNumber(merged.process?.defaultTimeoutMs, 30000, "process.defaultTimeoutMs"),
-      cancelGraceMs: positiveNumber(merged.process?.cancelGraceMs, 2000, "process.cancelGraceMs", { minimum: 0 }),
+      maxConcurrent: positiveNumber(merged.process?.maxConcurrent, 8, "process.maxConcurrent"),
+      maxConcurrentPerClient: positiveNumber(merged.process?.maxConcurrentPerClient, 4, "process.maxConcurrentPerClient"),
+      maxQueued: positiveNumber(merged.process?.maxQueued, 128, "process.maxQueued", { minimum: 0 }),
+      maxQueuedPerClient: positiveNumber(merged.process?.maxQueuedPerClient, 32, "process.maxQueuedPerClient", { minimum: 0 }),
+      queueTimeoutMs: positiveNumber(merged.process?.queueTimeoutMs, 30000, "process.queueTimeoutMs", { maximum: 2147483647 }),
+      defaultTimeoutMs: positiveNumber(merged.process?.defaultTimeoutMs, 30000, "process.defaultTimeoutMs", { maximum: 2147483647 }),
+      cancelGraceMs: positiveNumber(merged.process?.cancelGraceMs, 2000, "process.cancelGraceMs", { minimum: 0, maximum: 2147483647 }),
       maxOutputBytes: positiveNumber(merged.process?.maxOutputBytes, 8 * 1024 * 1024, "process.maxOutputBytes"),
-      outputDrainTimeoutMs: positiveNumber(merged.process?.outputDrainTimeoutMs, 5000, "process.outputDrainTimeoutMs"),
+      outputDrainTimeoutMs: positiveNumber(merged.process?.outputDrainTimeoutMs, 5000, "process.outputDrainTimeoutMs", { maximum: 2147483647 }),
       maxReportBytes: positiveNumber(merged.process?.maxReportBytes, 1024 * 1024, "process.maxReportBytes"),
     },
     // 默认 profile 为 workspace-guard（runtime 只读，读写限定在已知虚拟根内）；
@@ -387,8 +393,21 @@ export async function loadConfig(runRoot: string, options: { allowInvalidRuntime
       },
     },
     observability: {
+      traceMaxFileBytes: positiveNumber(merged.observability?.traceMaxFileBytes, 10 * 1024 * 1024, "observability.traceMaxFileBytes"),
+      traceRetainedFiles: positiveNumber(merged.observability?.traceRetainedFiles, 3, "observability.traceRetainedFiles", { minimum: 0 }),
+      traceMaxPendingBytes: positiveNumber(merged.observability?.traceMaxPendingBytes, 1024 * 1024, "observability.traceMaxPendingBytes"),
+      traceFlushIntervalMs: positiveNumber(merged.observability?.traceFlushIntervalMs, 100, "observability.traceFlushIntervalMs", { maximum: 2147483647 }),
+      collectCommandNames: booleanValue(merged.observability?.collectCommandNames, false, "observability.collectCommandNames"),
       traceBufferSize: positiveNumber(merged.observability?.traceBufferSize, 5000, "observability.traceBufferSize", { minimum: 0 }),
       writeTraceFile: booleanValue(merged.observability?.writeTraceFile, false, "observability.writeTraceFile"),
+    },
+    protocol: {
+      maxPendingRequests: positiveNumber(merged.protocol?.maxPendingRequests, 256, "protocol.maxPendingRequests"),
+      replayWindowSize: positiveNumber(merged.protocol?.replayWindowSize, 10000, "protocol.replayWindowSize"),
+      replayWindowTtlMs: positiveNumber(merged.protocol?.replayWindowTtlMs, 1800000, "protocol.replayWindowTtlMs"),
+      idempotencyMaxEntries: positiveNumber(merged.protocol?.idempotencyMaxEntries, 1024, "protocol.idempotencyMaxEntries"),
+      idempotencyTtlMs: positiveNumber(merged.protocol?.idempotencyTtlMs, 1800000, "protocol.idempotencyTtlMs"),
+      idempotencyMaxBytes: positiveNumber(merged.protocol?.idempotencyMaxBytes, 32 * 1024 * 1024, "protocol.idempotencyMaxBytes"),
     },
     // 更新默认启用、默认自动应用并强制签名校验；channel/feedUrl 可被环境变量覆盖
     // （便于测试与私有更新源）。下载上限默认 2GB，防恶意超大包撑爆磁盘。

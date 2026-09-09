@@ -23,7 +23,10 @@
  *   243=cd 失败；脚本其余部分 set +e，用户命令自身的退出码在报告成功后原样透传，
  *   Node 侧无需解析 stderr 即可定位失败发生在哪个阶段。
  */
-import { createHash, randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
+import { performance } from "node:perf_hooks";
+import { ExecutionTelemetry } from "./telemetry.js";
+import { parseExecutionRequest } from "./execution-request.js";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { PosixLoomError, asPosixLoomError } from "./errors.js";
@@ -33,6 +36,7 @@ import { NativeRegistry } from "./registry.js";
 import type { InteractiveProcessController, ProcessOutputEvent, ProcessRunResult } from "./process.js";
 import { RuntimeManager } from "./runtime.js";
 import { parseStateReport, quotePosix, toMixedPath } from "./shell.js";
+import { parseIsolatedReport } from "./state-report.js";
 import { isSafeExistingDirectory, normalizeVirtual } from "./path.js";
 import { SessionStateStore, type SessionStateEntry } from "./session.js";
 import { TraceRecorder, type TraceEvent } from "./trace.js";
@@ -73,6 +77,8 @@ export type { ParsedStateReport } from "./shell.js";
  */
 interface ExecuteBaseOptions {
   sessionId: string;
+  /** Admission identity supplied by the transport, never by an untrusted request body. */
+  clientId?: string;
   cwd?: string;
   envDelta?: Record<string, string | null>;
   statePolicy?: "isolated" | "cwd-env";
@@ -103,6 +109,8 @@ export type ExecuteOptions = TextExecuteOptions | ArgvExecuteOptions;
 
 /** execute 生命周期观察器；控制协议用它发送 started 与流式输出事件。 */
 export interface ExecuteObserver {
+  /** Called after admission, before preparation or any plugin/backend can run. */
+  onAdmitted?: () => void;
   onStarted?: (preview: ExecutionPreview) => void | Promise<void>;
   onOutput?: (event: ProcessOutputEvent) => void | Promise<void>;
 }
@@ -156,7 +164,7 @@ export class PosixLoomService {
     this.registry = runtime.registry;
     const profileName = runtime.config.runtime.policy.defaultProfile;
     this.policy = new PolicyGate(profileName, runtime.config.runtime.policy.profiles[profileName], runtime.mountTable, runtime.snapshot);
-    this.traceRecorder = new TraceRecorder(runtime.config.runtime.observability.traceBufferSize, runtime.config.runtime.observability.writeTraceFile, runtime.config.dataRoot);
+    this.traceRecorder = runtime.traces;
   }
 
   /** 创建新会话（默认虚拟 cwd 为 /workspace），返回会话 ID。 */
@@ -192,8 +200,8 @@ export class PosixLoomService {
   }
 
   /** 取当前 trace 事件快照（诊断用）。 */
-  traces(): TraceEvent[] {
-    return this.traceRecorder.snapshot();
+  traces(limit?: number): TraceEvent[] {
+    return this.traceRecorder.snapshot(limit);
   }
 
   /**
@@ -209,21 +217,77 @@ export class PosixLoomService {
    * @returns CommandCompletion；执行层错误（CWD_NOT_FOUND 等）以异常形式抛出
    */
   async execute(options: ExecuteOptions, observer: ExecuteObserver = {}): Promise<CommandCompletion> {
-    const statePolicy = options.statePolicy ?? this.runtime.config.runtime.session.defaultStatePolicy;
-    const operation = async (): Promise<CommandCompletion> => this.executeOnce(options, statePolicy, observer);
-    const completion = statePolicy === "cwd-env" ? await this.sessions.inStateLane(options.sessionId, operation) : await operation();
-    completion.trace = await this.traceRecorder.record(completion.trace);
-    return completion;
+    const timing = new ExecutionTelemetry();
+    timing.metadata.snapshotId = this.runtime.snapshot.snapshotId;
+    let completion: CommandCompletion | undefined;
+    let errorCode: string | undefined;
+    try {
+      options = timing.measureSync("validate", () => this.normalizeOptions(options));
+      timing.metadata.inputKind = options.kind ?? "text";
+      timing.stage = "admission";
+      const statePolicy = options.statePolicy ?? this.runtime.config.runtime.session.defaultStatePolicy;
+      completion = await this.admitted(options, statePolicy, timing, () => {
+        observer.onAdmitted?.();
+        return this.executeOnce(options, statePolicy, observer, timing);
+      });
+      return completion;
+    } catch (error) {
+      errorCode = asPosixLoomError(error, "EXECUTION_FAILED").code;
+      if (errorCode === "EXECUTION_CANCELLED") {
+        errorCode = undefined;
+        timing.metadata.cancelledBeforeStart = true;
+        completion = { ...this.emptyCompletion(), command: { kind: "cancelled" }, state: { kind: "not-produced", reason: "Cancelled before process start" }, planId: "not-started" };
+        return completion;
+      }
+      throw error;
+    } finally {
+      const trace = await this.traceRecorder.record(timing.finish(options?.sessionId ?? "invalid", "execute", completion, errorCode));
+      if (completion) completion.trace = trace;
+    }
   }
+
+  private normalizeOptions(options: ExecuteOptions): ExecuteOptions {
+    if (!options || typeof options !== "object" || typeof options.sessionId !== "string") throw new PosixLoomError("EXECUTE_REQUEST_INVALID", "Execution requires a sessionId");
+    const request = parseExecutionRequest({
+      ...options,
+      input: options.kind === "argv" ? { kind: "argv", argv: options.argv } : { kind: "text", raw: options.raw },
+    }, { allowEmpty: true });
+    const { input, stream: _stream, ...fields } = request;
+    return { ...options, ...fields, ...input } as ExecuteOptions;
+  }
+
+  private admitted<T>(options: ExecuteOptions, statePolicy: StatePolicy, timing: ExecutionTelemetry, operation: () => Promise<T>): Promise<T> {
+    const queuedAt = performance.now();
+    return this.sessions.withLease(options.sessionId, () =>
+      this.runtime.admission.run(options.clientId ?? "embedded", statePolicy === "cwd-env" ? options.sessionId : undefined, options.signal, async () => {
+        timing.timings.queueMs = performance.now() - queuedAt;
+        return statePolicy === "cwd-env" ? this.sessions.inStateLane(options.sessionId, operation) : operation();
+      })).finally(() => { timing.timings.queueMs ??= performance.now() - queuedAt; });
+  }
+
+  metrics(): Record<string, unknown> {
+    return { admission: this.runtime.admission.snapshot(), traces: this.traceRecorder.diagnostics() };
+  }
+
+  async flushTraces(): Promise<void> { await this.traceRecorder.flush(); }
 
   /**
    * 构建但不执行命令，返回经过脱敏的执行计划预览。
    * cwd-env 预览也进入会话 lane，保证它读取的是前序命令提交后的最新状态。
    */
   async explain(options: ExecuteOptions): Promise<ExecutionPreview> {
-    const statePolicy = options.statePolicy ?? this.runtime.config.runtime.session.defaultStatePolicy;
-    const operation = async (): Promise<ExecutionPreview> => this.preview(await this.prepareExecution(options, statePolicy));
-    return statePolicy === "cwd-env" ? this.sessions.inStateLane(options.sessionId, operation) : operation();
+    const timing = new ExecutionTelemetry();
+    timing.metadata.snapshotId = this.runtime.snapshot.snapshotId;
+    let errorCode: string | undefined;
+    try {
+      options = timing.measureSync("validate", () => this.normalizeOptions(options));
+      timing.metadata.inputKind = options.kind ?? "text";
+      timing.stage = "admission";
+      const statePolicy = options.statePolicy ?? this.runtime.config.runtime.session.defaultStatePolicy;
+      return await this.admitted(options, statePolicy, timing, async () =>
+        this.preview(await timing.measure("prepare", () => this.prepareExecution(options, statePolicy, timing))));
+    } catch (error) { errorCode = asPosixLoomError(error, "EXECUTION_FAILED").code; throw error; }
+    finally { await this.traceRecorder.record(timing.finish(options?.sessionId ?? "invalid", "explain", undefined, errorCode)); }
   }
 
   /**
@@ -248,17 +312,17 @@ export class PosixLoomService {
    * @param options 命令输入
    * @param statePolicy 已解析的状态策略（execute 层确定，含默认值回落）
    */
-  private async executeOnce(options: ExecuteOptions, statePolicy: StatePolicy, observer: ExecuteObserver): Promise<CommandCompletion> {
+  private async executeOnce(options: ExecuteOptions, statePolicy: StatePolicy, observer: ExecuteObserver, timing: ExecutionTelemetry): Promise<CommandCompletion> {
     // 空命令保持既有短路语义：完成完整性预检后不构建计划、不启动进程。
     const exactArgv = options.kind === "argv" ? options.argv : undefined;
     const raw = options.kind === "argv" ? undefined : options.raw;
     if ((exactArgv && exactArgv.length === 0) || (!exactArgv && !raw?.trim())) {
-      await this.runtime.assertRuntimeIntegrity("pre-command");
+      await timing.measure("integrityPre", () => this.runtime.assertRuntimeIntegrity("pre-command"));
       return this.emptyCompletion();
     }
     const started = Date.now();
-    const prepared = await this.prepareExecution(options, statePolicy);
-    await observer.onStarted?.(this.preview(prepared));
+    const prepared = await timing.measure("prepare", () => this.prepareExecution(options, statePolicy, timing));
+    await timing.measure("observerStart", () => observer.onStarted?.(this.preview(prepared)));
     const { plan } = prepared;
     const backend = this.runtime.plugins.extensions(EXECUTION_BACKENDS).find((candidate) => candidate.mode === plan.mode);
     if (!backend) {
@@ -266,21 +330,23 @@ export class PosixLoomService {
     }
     const hookContext = { runtime: this.runtime, input: this.pluginInput(options), sessionId: options.sessionId };
     try {
-      const result = await backend.execute({
+      const result = await timing.measure("execute", () => backend.execute({
         plan,
         runtime: this.runtime,
         hostPath: prepared.hostPath,
         signal: options.signal,
         onOutput: observer.onOutput,
         interactive: options.interactive,
+      }));
+      timing.metadata.processMode = result.processMode;
+      if (result.timings) Object.assign(timing.timings, result.timings);
+      await timing.measure("integrityPost", () => this.runtime.assertRuntimeIntegrity("post-command"));
+      await timing.measure("hooksAfterExecute", async () => {
+        for (const hook of this.runtime.plugins.extensions(EXECUTION_HOOKS)) await hook.afterExecute?.({ ...hookContext, plan, result });
       });
-      await this.runtime.assertRuntimeIntegrity("post-command");
-      for (const hook of this.runtime.plugins.extensions(EXECUTION_HOOKS)) {
-        await hook.afterExecute?.({ ...hookContext, plan, result });
-      }
-      return plan.mode === "native"
+      return timing.measure("stateCommit", () => plan.mode === "native"
         ? this.nativeCompletion(plan, result, prepared.reason, started)
-        : this.shellCompletion(plan, result, prepared.reason, started);
+        : this.shellCompletion(plan, result, prepared.reason, started));
     } catch (error) {
       for (const hook of this.runtime.plugins.extensions(EXECUTION_HOOKS)) {
         await hook.onError?.({ ...hookContext, error });
@@ -290,38 +356,52 @@ export class PosixLoomService {
   }
 
   /** 运行完整预检并构建唯一的内部执行计划，供 explain 与 execute 共用。 */
-  private async prepareExecution(options: ExecuteOptions, statePolicy: StatePolicy): Promise<PreparedExecution> {
-    await this.runtime.assertRuntimeIntegrity("pre-command");
+  private async prepareExecution(options: ExecuteOptions, statePolicy: StatePolicy, timing: ExecutionTelemetry): Promise<PreparedExecution> {
+    await timing.measure("integrityPre", () => this.runtime.assertRuntimeIntegrity("pre-command"));
     const exactArgv = options.kind === "argv" ? options.argv : undefined;
     const raw = options.kind === "argv" ? undefined : options.raw;
     if ((exactArgv && exactArgv.length === 0) || (!exactArgv && !raw?.trim())) {
       throw new PosixLoomError("COMMAND_EMPTY", "Cannot explain an empty command");
     }
     const hookContext = { runtime: this.runtime, input: this.pluginInput(options), sessionId: options.sessionId };
-    for (const hook of this.runtime.plugins.extensions(EXECUTION_HOOKS)) await hook.beforePrepare?.(hookContext);
-    const commandId = randomUUID();
+    await timing.measure("hooksBeforePrepare", async () => {
+      for (const hook of this.runtime.plugins.extensions(EXECUTION_HOOKS)) await hook.beforePrepare?.(hookContext);
+    });
+    const commandId = timing.commandId;
     const state = this.sessions.snapshot(options.sessionId);
     const virtualCwd = options.cwd ?? state.cwd;
-    const cwdHost = this.runtime.mountTable.toHost(virtualCwd);
-    this.policy.assertCwd(virtualCwd, cwdHost);
-    if (!existsSync(cwdHost)) throw new PosixLoomError("CWD_NOT_FOUND", `Working directory does not exist: ${virtualCwd}`, { cwdHost });
+    const cwdHost = await timing.measure("policy", () => {
+      const host = this.runtime.mountTable.toHost(virtualCwd);
+      this.policy.assertCwd(virtualCwd, host);
+      if (!existsSync(host)) throw new PosixLoomError("CWD_NOT_FOUND", `Working directory does not exist: ${virtualCwd}`, { cwdHost: host });
+      return host;
+    });
     // 阶段 4：按优先级咨询分类器。内置 argv 插件精确保留参数边界；内置 text
     // 插件识别 simple / builtin / shell-required / explicit-shell。
-    let classified: ClassifiedCommand | undefined;
-    for (const classifier of this.runtime.plugins.extensions(COMMAND_CLASSIFIERS)) {
-      classified = await classifier.classify({ input: hookContext.input });
-      if (classified) break;
-    }
-    if (!classified) {
-      throw new PosixLoomError("PLUGIN_CAPABILITY_MISSING", "No command classifier accepted the request", { extensionPoint: COMMAND_CLASSIFIERS.id, inputKind: hookContext.input.kind });
-    }
-    this.assertClassification(classified);
+    const classified = await timing.measure("classify", async () => {
+      let classified: ClassifiedCommand | undefined;
+      for (const classifier of this.runtime.plugins.extensions(COMMAND_CLASSIFIERS)) {
+        classified = await classifier.classify({ input: hookContext.input });
+        if (classified) break;
+      }
+      if (!classified) {
+        throw new PosixLoomError("PLUGIN_CAPABILITY_MISSING", "No command classifier accepted the request", { extensionPoint: COMMAND_CLASSIFIERS.id, inputKind: hookContext.input.kind });
+      }
+      this.assertClassification(classified);
+      return classified;
+    });
+    timing.metadata.inputKind = options.kind ?? "text";
+    timing.metadata.commandKind = classified.kind;
+    const name = classified.argv?.[0];
+    if (this.runtime.config.runtime.observability.collectCommandNames && name && /^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$/.test(name)) timing.metadata.commandName = name;
     // 命令身份：argv 模式用规范化 JSON、text 模式用原文，作为模板 ID 的哈希输入。
     const commandIdentity = exactArgv ? JSON.stringify({ argv: exactArgv }) : raw ?? "";
     // 命令体：argv 模式逐个单引号包裹后拼接（防注入），text 模式原样交给 bash。
     const commandBody = exactArgv ? exactArgv.map(quotePosix).join(" ") : raw ?? "";
     // 阶段 5：解析执行模板（simple 先查 native 注册表，未命中回落 MSYS2 bash）。
-    const template = await this.resolveTemplate(commandIdentity, classified);
+    const template = await timing.measure("resolve", () => this.resolveTemplate(commandIdentity, classified));
+    timing.metadata.backend = template.backend;
+    timing.metadata.fallbackReason = template.backend === "native" ? "native-registry" : classified.kind === "simple" ? "native-miss" : "shell-syntax";
     // 阶段 6：超时参数（非法值直接抛 TIMEOUT_INVALID）；定位 Native Host，
     // release Runtime 不允许缺失（不可回落到 Node 直接 spawn）。
     const timeoutMs = options.timeoutMs ?? this.runtime.config.runtime.process.defaultTimeoutMs;
@@ -329,28 +409,34 @@ export class PosixLoomService {
     const hostPath = this.runtime.findNativeHost();
     if (!hostPath && this.runtime.snapshot.manifest.mode === "release") throw new PosixLoomError("NATIVE_HOST_MISSING", "Release Runtime requires its packaged Native Host");
 
-    let plan: ExecutionPlan | undefined;
-    for (const planner of this.runtime.plugins.extensions(EXECUTION_PLANNERS)) {
-      plan = await planner.build({
-        commandId,
-        commandBody,
-        sessionId: options.sessionId,
-        envDelta: options.envDelta,
-        terminal: options.terminal,
-        state,
-        statePolicy,
-        template,
-        virtualCwd,
-        cwdHost,
-        timeoutMs,
-        runtime: this.runtime,
-        policy: this.policy,
-      });
-      if (plan) break;
-    }
-    if (!plan) throw new PosixLoomError("PLUGIN_CAPABILITY_MISSING", `No execution planner accepted ${template.backend}`, { extensionPoint: EXECUTION_PLANNERS.id, backend: template.backend });
-    this.assertPlanInvariants(plan, { commandId, sessionId: options.sessionId, virtualCwd, cwdHost, timeoutMs, state, statePolicy });
-    for (const hook of this.runtime.plugins.extensions(EXECUTION_HOOKS)) await hook.afterPrepare?.({ ...hookContext, plan });
+    const plan = await timing.measure("plan", async () => {
+      let plan: ExecutionPlan | undefined;
+      for (const planner of this.runtime.plugins.extensions(EXECUTION_PLANNERS)) {
+        plan = await planner.build({
+          commandId,
+          commandBody,
+          sessionId: options.sessionId,
+          envDelta: options.envDelta,
+          terminal: options.terminal,
+          state,
+          statePolicy,
+          template,
+          virtualCwd,
+          cwdHost,
+          timeoutMs,
+          runtime: this.runtime,
+          policy: this.policy,
+        });
+        if (plan) break;
+      }
+      if (!plan) throw new PosixLoomError("PLUGIN_CAPABILITY_MISSING", `No execution planner accepted ${template.backend}`, { extensionPoint: EXECUTION_PLANNERS.id, backend: template.backend });
+      return plan;
+    });
+    timing.metadata.planId = plan.planId;
+    await timing.measure("planValidate", () => this.assertPlanInvariants(plan, { commandId, sessionId: options.sessionId, virtualCwd, cwdHost, timeoutMs, state, statePolicy }));
+    await timing.measure("hooksAfterPrepare", async () => {
+      for (const hook of this.runtime.plugins.extensions(EXECUTION_HOOKS)) await hook.afterPrepare?.({ ...hookContext, plan });
+    });
 
     return {
       plan,
@@ -570,6 +656,14 @@ export class PosixLoomService {
       return this.completedShellResult(plan, result, reason, started, command, state);
     }
     try {
+      if (plan.statePolicy === "isolated") {
+        const receipt = parseIsolatedReport(result.report);
+        state = !receipt ? { kind: "not-produced", reason: "StateReport was not produced" }
+          : receipt.exitCode !== result.outcome.exitCode
+            ? { kind: "protocol-failed", reason: "Process exit code disagrees with completion receipt" }
+            : { kind: "not-applicable" };
+        return this.completedShellResult(plan, result, reason, started, command, state);
+      }
       // 解析并严格校验 StateReport；空报告（未产生）与协议失败分别处理。
       const report = parseStateReport(result.report);
       if (!report) {
@@ -583,10 +677,7 @@ export class PosixLoomService {
         } else {
           // 退出码一致：以报告记录的退出码为准（脚本在报告成功后原样透传用户退出码）。
           command = { kind: "exited", exitCode: report.exitCode };
-          if (plan.statePolicy === "isolated") {
-            // isolated：不提交任何状态。
-            state = { kind: "not-applicable" };
-          } else {
+          {
             // cwd-env：报告 cwd 必须已是归一化的绝对虚拟路径
             //（归一化改变原值或非 / 开头即非法，抛 STATE_CWD_INVALID）。
             const normalizedCwd = normalizeVirtual(report.cwd);

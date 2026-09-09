@@ -99,9 +99,11 @@
               <div class="terminal-meta">
                 <span class="route-chip" id="routeChip" hidden>—</span>
                 <span id="executionTime">就绪</span>
+                <button class="text-button" id="latestOutputButton" type="button" hidden>回到最新</button>
                 <button class="text-button" id="clearButton" type="button">清空</button>
               </div>
             </div>
+            <div class="terminal-notice" id="terminalNotice" role="status" hidden></div>
             <div class="terminal-scroll" id="terminalScroll">
               <pre class="terminal-output" id="terminalOutput" aria-live="polite"><span class="terminal-muted">PosixLoom 控制台已就绪。</span></pre>
             </div>
@@ -168,4 +170,3 @@
   <script type="module" src="/app.js"></script>
 </body>
 </html>
-

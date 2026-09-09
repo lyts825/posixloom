@@ -19,7 +19,11 @@ test("standalone GUI serves immutable assets and points at an external API", asy
   const script = await fetch(`${gui.origin}/app.js`);
   assert.equal(script.headers.get("content-type"), "text/javascript; charset=utf-8");
   assert.match(await script.text(), /application\/x-ndjson/);
+  const outputModule = await fetch(`${gui.origin}/console-output.js`);
+  assert.equal(outputModule.status, 200);
+  assert.equal(outputModule.headers.get("content-type"), "text/javascript; charset=utf-8");
+  assert.match(await outputModule.text(), /export class TerminalBuffer/);
+  assert.match(page, /id="latestOutputButton"/);
   assert.equal((await fetch(`${gui.origin}/missing`)).status, 404);
   assert.equal((await fetch(`${gui.origin}/`, { method: "POST" })).status, 405);
 });
-

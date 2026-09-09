@@ -22,7 +22,11 @@ Every message contains `protocolVersion: 1`. The server sends `hello` first:
 ```json
 {"protocolVersion":1,"type":"hello","maxFrameBytes":16777216,
  "capabilities":["session","argv","shell","cancel","runtime-doctor",
- "runtime-info","execute-plan","stream-output-v1","trace-list","pty-v1"]}
+ "runtime-info","execute-plan","stream-output-v1","trace-list","trace-summary","pty-v1",
+ "metrics-v1","bounded-replay-v1"],
+ "replayWindow":{"maximum":10000,"ttlMs":1800000},
+ "limits":{"maxPendingRequests":256,"maxConcurrent":8,"maxConcurrentPerClient":4,
+ "maxQueued":128,"maxQueuedPerClient":32,"queueTimeoutMs":30000}}
 ```
 
 Terminal responses are asynchronous, so clients correlate them by `id`. Each request
@@ -33,6 +37,12 @@ either `{ "type": "result", "id": ..., "result": ... }` or
 request that explicitly opts into streaming may receive correlated `event` frames
 before its one terminal response.
 
+Clients should always generate fresh IDs. The server rejects active duplicates and
+retains completed IDs for up to 30 minutes or the newest 10000 completed requests,
+whichever ends first (actual limits are advertised in hello). Active IDs are never
+evicted. This is not a result cache or an exactly-once guarantee after expiry/reconnect;
+retrying a side-effecting command under a new ID can repeat it.
+
 ## Requests
 
 The supported request types are:
@@ -40,7 +50,7 @@ The supported request types are:
 - `session.create`: optional `cwd`; returns `sessionId` and the initial state.
 - `session.snapshot`: requires `sessionId`; returns `version` (decimal string),
   `cwd`, and `exportedEnv`.
-- `session.close`: closes a session.
+- `session.close`: closes an inactive session; running or queued work yields `SESSION_BUSY`.
 - `execute`: requires `id`, `sessionId`, and `input`. `input` is either
   `{ "kind":"argv", "argv":[...] }` for an exact executable/argument vector,
   or `{ "kind":"text", "raw":"..." }` for one Shell script. Optional
@@ -61,6 +71,10 @@ The supported request types are:
   policy profile, and Native Registry command names without running an external command.
 - `trace.list`: returns recent in-memory trace events. Optional `limit` must be an
   integer from 1 through 5000 and defaults to 50.
+- `trace.summary`: summarizes the same bounded sample, including phase timings and
+  opt-in command-name fallback candidates. The same limit bounds apply.
+- `metrics`: returns shared admission/trace diagnostics, replay ID count, pending RPCs
+  and overload rejections. The pending count includes the metrics RPC itself.
 - `terminal.input`: requires its own correlation `id`, an in-flight terminal
   execute request in `targetId`, and canonical Base64 bytes in `dataBase64`.
   Each decoded input frame is limited to 64 KiB.
@@ -96,6 +110,18 @@ before reading more process output, propagating backpressure to the child pipes.
 output events are written before the terminal response. Cancellation, timeout, and
 connection-loss behavior is unchanged.
 
+Execution and preview requests are admitted through the shared Runtime scheduler.
+Full queues return SERVER_BUSY; queue expiry returns QUEUE_TIMEOUT. Queued cancellation
+never starts the process. Cancel can also abort an in-flight execute.plan request.
+Stdio keeps 16 reserved RPC slots for cancel/shutdown/terminal controls. The output
+deadline applies to all response frames, including hello and final results: an
+unresponsive sink ends the connection with CONTROL_OUTPUT_TIMEOUT.
+
+CLI, stdio and HTTP share execution validation: text and total argv JSON are limited
+to 1 MiB UTF-8; argv has at most 4096 elements of at most 32768 bytes each; environment
+delta JSON has a separate 1 MiB limit. NUL and invalid environment names are rejected.
+Timeouts are integers from 1 through 2147483647; terminal dimensions are 1..32767.
+
 ## Interactive terminals
 
 The `pty-v1` capability exposes a Windows ConPTY session. The terminal keeps stdin
@@ -110,9 +136,19 @@ itself a process-completion acknowledgement.
 
 ## Execute result
 
-The terminal result contains the original normalized command, state outcome, byte
+The terminal result contains the normalized command outcome, state outcome, byte
 counts, backend, plan/trace metadata, and `stdoutBase64`/`stderrBase64`. Binary
-output is therefore lossless. A committed session version is encoded as a
+encoding is lossless; retention is bounded by the process output limits and the
+16 MiB completion-frame limit. The server budgets the complete UTF-8 JSON envelope,
+metadata and both Base64 fields together. If the captured output cannot fit, it
+retains each stream's head and tail with an output-truncation marker and sets
+`result.truncated: true`. Space unused by one stream is available to the other.
+`stdoutBytes`/`stderrBytes` still report the original process byte counts; the
+command and state outcomes are preserved. Trace metadata describes process capture,
+while `result.truncated` also includes transport truncation. Streaming `output`
+events remain complete and are unaffected by the completion-frame budget.
+
+A committed session version is encoded as a
 decimal string because JavaScript `bigint` is not JSON-native. A timeout,
 cancellation, policy rejection, or native-host failure is represented by the
 typed `state`/error code; it is not converted into a successful empty result.

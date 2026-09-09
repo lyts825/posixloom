@@ -28,6 +28,7 @@
  *   同时不启用运行时完整性监听（恢复态下的运行时本就不可信）。
  */
 import { createHash } from "node:crypto";
+import { performance } from "node:perf_hooks";
 import { existsSync, lstatSync, readdirSync, readFileSync, watch, type FSWatcher } from "node:fs";
 import { basename, dirname, join, resolve, sep } from "node:path";
 import { isSafeRuntimeId, loadConfig, type LoadedConfig } from "./config.js";
@@ -38,6 +39,8 @@ import { NativeRegistry } from "./registry.js";
 import { createBuiltinRuntimePlugins } from "../plugins/builtins.js";
 import { NATIVE_COMMAND_ADAPTERS, NATIVE_COMMANDS } from "../plugins/contracts.js";
 import { PluginKernel, type RuntimePlugin } from "../plugins/kernel.js";
+import { ExecutionAdmission } from "./admission.js";
+import { TraceRecorder } from "./trace.js";
 import type { HostPath, RuntimeComponentManifest, RuntimeInfo, RuntimeManifest, RuntimeSnapshot } from "./types.js";
 
 /** release Runtime 必须全部声明并标记为 required 的基础环境组件清单。 */
@@ -75,7 +78,7 @@ function hashText(text: string): string {
  * dev 模式的 findBash 候选链依赖本函数实现"未打包 MSYS2 但装有 Git"的
  * 开发机兜底。
  *
- * @param gitPaths where.exe/which 找到的 git 可执行文件路径列表
+ * @param gitPaths 由直接文件系统探测得到的 git 可执行文件路径列表
  * @returns 去重后的 bash 候选路径（按推导顺序排列；是否真实存在由调用方探测）
  */
 export function deriveGitBashCandidates(gitPaths: string[]): string[] {
@@ -453,6 +456,8 @@ export function validateRuntimeManifest(value: unknown, runtimeRoot: string): Do
  * 都已通过启动校验，或显式进入恢复模式。
  */
 export class RuntimeManager {
+  readonly admission: ExecutionAdmission;
+  readonly traces: TraceRecorder;
   /** 已加载的 PosixLoom 配置（含策略、挂载表与更新设置）。 */
   readonly config: LoadedConfig;
   /** 由插件贡献合成的命令注册表，创建时已通过 validate() 校验。 */
@@ -475,8 +480,10 @@ export class RuntimeManager {
   private integrityWatcher?: FSWatcher;
 
   /** 私有构造：仅在 create() 完成加载与校验后调用。 */
-  private constructor(config: LoadedConfig, registry: NativeRegistry, snapshot: RuntimeSnapshot, recoveryChecks: DoctorCheck[], recoveryRequired: boolean, plugins: PluginKernel) {
+  private constructor(config: LoadedConfig, registry: NativeRegistry, snapshot: RuntimeSnapshot, recoveryChecks: DoctorCheck[], recoveryRequired: boolean, plugins: PluginKernel, readonly initializationTimings: Readonly<Record<string, number>>) {
     this.config = config;
+    this.admission = new ExecutionAdmission(config.runtime.process);
+    this.traces = new TraceRecorder(config.runtime.observability.traceBufferSize, config.runtime.observability.writeTraceFile, config.dataRoot, config.runtime.observability);
     this.registry = registry;
     this.mountTable = new MountTable(config.runtime.mounts);
     this.snapshot = snapshot;
@@ -526,104 +533,121 @@ export class RuntimeManager {
     /** Advanced embedding option for constructing a completely custom capability graph. */
     includeBuiltinPlugins?: boolean;
   } = {}): Promise<RuntimeManager> {
+    const started = performance.now();
     const config = await loadConfig(runRoot, { allowInvalidRuntimePointer: options.allowInvalidRuntime });
+    const timings: Record<string, number> = { configMs: performance.now() - started };
+    const pluginStarted = performance.now();
     const plugins = new PluginKernel([
       ...(options.includeBuiltinPlugins === false ? [] : createBuiltinRuntimePlugins()),
       ...(options.plugins ?? []),
     ]);
-    await plugins.start();
-    const registry = new NativeRegistry(
-      [...plugins.extensions(NATIVE_COMMANDS)],
-      [...plugins.extensions(NATIVE_COMMAND_ADAPTERS)],
-    );
-    registry.validate();
-    const runtimeId = config.runtimeId;
-    const runtimeRoot = config.runtimeRoot;
-    if (!isSafeRuntimeId(runtimeId)) throw new PosixLoomError("RUNTIME_ID_INVALID", `Invalid runtime id: ${runtimeId}`, { runtimeId });
-    // 读取 manifest.json：解析失败在严格模式下直接抛出；恢复模式记录诊断并继续。
-    const manifestPath = join(runtimeRoot, "manifest.json");
-    const recoveryChecks: DoctorCheck[] = [];
-    let parsedManifest: RuntimeManifest | undefined;
-    let manifestReadIssue = false;
     try {
-      const parsed = readJsonSafe<unknown>(manifestPath);
-      if (parsed !== undefined) {
-        if (!isRecord(parsed)) throw new PosixLoomError("MANIFEST_INVALID", `Runtime manifest must be a JSON object: ${manifestPath}`, { manifestPath });
-        parsedManifest = parsed as unknown as RuntimeManifest;
+      await plugins.start();
+      timings.pluginsMs = performance.now() - pluginStarted;
+      const registryStarted = performance.now();
+      const registry = new NativeRegistry(
+        [...plugins.extensions(NATIVE_COMMANDS)],
+        [...plugins.extensions(NATIVE_COMMAND_ADAPTERS)],
+      );
+      registry.validate();
+      timings.registryMs = performance.now() - registryStarted;
+      const manifestStarted = performance.now();
+      const runtimeId = config.runtimeId;
+      const runtimeRoot = config.runtimeRoot;
+      if (!isSafeRuntimeId(runtimeId)) throw new PosixLoomError("RUNTIME_ID_INVALID", `Invalid runtime id: ${runtimeId}`, { runtimeId });
+      // 读取 manifest.json：解析失败在严格模式下直接抛出；恢复模式记录诊断并继续。
+      const manifestPath = join(runtimeRoot, "manifest.json");
+      const recoveryChecks: DoctorCheck[] = [];
+      let parsedManifest: RuntimeManifest | undefined;
+      let manifestReadIssue = false;
+      try {
+        const parsed = readJsonSafe<unknown>(manifestPath);
+        if (parsed !== undefined) {
+          if (!isRecord(parsed)) throw new PosixLoomError("MANIFEST_INVALID", `Runtime manifest must be a JSON object: ${manifestPath}`, { manifestPath });
+          parsedManifest = parsed as unknown as RuntimeManifest;
+        }
+      } catch (error) {
+        if (!options.allowInvalidRuntime) throw error;
+        manifestReadIssue = true;
+        recoveryChecks.push({ id: "runtime.manifest-read", level: "FAIL", message: "Runtime manifest could not be read; recovery fallback is active", details: { manifestPath, cause: String(error) } });
       }
-    } catch (error) {
-      if (!options.allowInvalidRuntime) throw error;
-      manifestReadIssue = true;
-      recoveryChecks.push({ id: "runtime.manifest-read", level: "FAIL", message: "Runtime manifest could not be read; recovery fallback is active", details: { manifestPath, cause: String(error) } });
-    }
-    // 开发源允许没有 manifest；其他来源缺 manifest 属致命错误（或恢复诊断项）。
-    if (!parsedManifest && config.runtimeSource !== "development") {
-      if (!options.allowInvalidRuntime) throw new PosixLoomError("RUNTIME_MANIFEST_MISSING", `Selected Runtime has no manifest: ${manifestPath}`, { runtimeId, manifestPath, source: config.runtimeSource });
-      if (!manifestReadIssue) recoveryChecks.push({ id: "runtime.manifest-read", level: "FAIL", message: "Selected Runtime has no manifest; recovery fallback is active", details: { runtimeId, manifestPath, source: config.runtimeSource } });
-    }
-    // fallback manifest：仅恢复模式或开发源缺 manifest 时使用，让诊断流程能
-    // 继续跑完；release 源会因后续深度校验失败被标记为 recoveryRequired。
-    const manifest: RuntimeManifest = parsedManifest ?? {
-      manifestVersion: 1,
-      runtimeId,
-      runtimeSemver: config.runtimeSource === "development" ? "0.1.0-dev" : "0.0.0-invalid",
-      mode: config.runtimeSource === "development" ? "development" : "release",
-      required: [],
-      notes: "Fallback manifest used for runtime recovery diagnostics",
-    };
-    // manifest 模式必须与来源一致：开发源必须 development，打包源必须 release，
-    // 防止用宽松的 development manifest 冒充经过哈希审计的 release 运行时。
-    const expectedMode = config.runtimeSource === "development" ? "development" : "release";
-    if (manifest.mode !== expectedMode && !options.allowInvalidRuntime) {
-      throw new PosixLoomError("RUNTIME_MODE_MISMATCH", "Selected Runtime manifest mode does not match its source", {
+      // 开发源允许没有 manifest；其他来源缺 manifest 属致命错误（或恢复诊断项）。
+      if (!parsedManifest && config.runtimeSource !== "development") {
+        if (!options.allowInvalidRuntime) throw new PosixLoomError("RUNTIME_MANIFEST_MISSING", `Selected Runtime has no manifest: ${manifestPath}`, { runtimeId, manifestPath, source: config.runtimeSource });
+        if (!manifestReadIssue) recoveryChecks.push({ id: "runtime.manifest-read", level: "FAIL", message: "Selected Runtime has no manifest; recovery fallback is active", details: { runtimeId, manifestPath, source: config.runtimeSource } });
+      }
+      // fallback manifest：仅恢复模式或开发源缺 manifest 时使用，让诊断流程能
+      // 继续跑完；release 源会因后续深度校验失败被标记为 recoveryRequired。
+      const manifest: RuntimeManifest = parsedManifest ?? {
+        manifestVersion: 1,
         runtimeId,
+        runtimeSemver: config.runtimeSource === "development" ? "0.1.0-dev" : "0.0.0-invalid",
+        mode: config.runtimeSource === "development" ? "development" : "release",
+        required: [],
+        notes: "Fallback manifest used for runtime recovery diagnostics",
+      };
+      // manifest 模式必须与来源一致：开发源必须 development，打包源必须 release，
+      // 防止用宽松的 development manifest 冒充经过哈希审计的 release 运行时。
+      const expectedMode = config.runtimeSource === "development" ? "development" : "release";
+      if (manifest.mode !== expectedMode && !options.allowInvalidRuntime) {
+        throw new PosixLoomError("RUNTIME_MODE_MISMATCH", "Selected Runtime manifest mode does not match its source", {
+          runtimeId,
+          source: config.runtimeSource,
+          expected: expectedMode,
+          actual: manifest.mode,
+        });
+      }
+      // 指针身份一致性：runtime/current 指向的 runtimeId 必须与 manifest 内声明的
+      // 一致，防止目录内容被整体替换为另一个 Runtime 而不被察觉。
+      if (manifest.runtimeId !== runtimeId && !options.allowInvalidRuntime) {
+        throw new PosixLoomError("RUNTIME_ID_MISMATCH", "runtime/current does not match manifest runtimeId", { pointer: runtimeId, manifest: manifest.runtimeId });
+      }
+      if (manifest.runtimeId !== runtimeId && options.allowInvalidRuntime) {
+        recoveryChecks.push({ id: "runtime.identity", level: "FAIL", message: "Runtime pointer does not match manifest runtimeId", details: { pointer: runtimeId, manifest: manifest.runtimeId } });
+      }
+      const startupChecks = validateRuntimeManifest(manifest, runtimeRoot);
+      const failures = startupChecks.filter((check) => check.level === "FAIL");
+      if (failures.length && !options.allowInvalidRuntime) {
+        throw new PosixLoomError("RUNTIME_VALIDATION_FAILED", "Selected Runtime failed startup validation", { runtimeId, failures });
+      }
+      // 五路内容哈希合成 snapshotId：runtimeId + manifest 哈希 + 注册表哈希 +
+      // 插件图哈希 + 挂载表哈希 + 策略哈希。任一路变化都会改变快照身份，供会话与状态上报
+      // 判断运行环境是否漂移；快照一经构造即不可变。
+      const mountsHash = hashText(JSON.stringify(config.runtime.mounts));
+      const policyHash = hashText(JSON.stringify(config.runtime.policy));
+      const registryHash = registry.hash();
+      const pluginsHash = hashText(JSON.stringify(plugins.inspect().map(({ id, version, requires, provides }) => ({ id, version, requires, provides }))));
+      const runtimeManifestHash = hashText(JSON.stringify(manifest));
+      const snapshotId = hashText(JSON.stringify({ runtimeId, runtimeManifestHash, registryHash, pluginsHash, mountsHash, policyHash }));
+      const snapshot: RuntimeSnapshot = {
+        snapshotId,
+        runtimeId,
+        runtimeRoot: resolve(runtimeRoot),
+        runtimeManifestHash,
+        registryHash,
+        pluginsHash,
+        mountsHash,
+        policyHash,
+        manifest,
         source: config.runtimeSource,
-        expected: expectedMode,
-        actual: manifest.mode,
-      });
+      };
+      // 任一启动异常（指针问题、manifest 读取失败、深度校验失败、身份或模式
+      // 不一致）都会把实例标记为恢复模式：诊断信息仍可输出，但运行时不再被信任。
+      const recoveryRequired = config.runtimePointerIssues.length > 0
+        || recoveryChecks.length > 0
+        || failures.length > 0
+        || manifest.runtimeId !== runtimeId
+        || manifest.mode !== expectedMode;
+      timings.manifestMs = performance.now() - manifestStarted;
+      const runtime = new RuntimeManager(config, registry, snapshot, recoveryChecks, recoveryRequired, plugins, timings);
+      timings.totalMs = performance.now() - started;
+      Object.freeze(timings);
+      return runtime;
+    } catch (error) {
+      try { await plugins.stop(); }
+      catch (cleanupError) { if (error instanceof PosixLoomError) error.details.pluginCleanupError = String(cleanupError); }
+      throw error;
     }
-    // 指针身份一致性：runtime/current 指向的 runtimeId 必须与 manifest 内声明的
-    // 一致，防止目录内容被整体替换为另一个 Runtime 而不被察觉。
-    if (manifest.runtimeId !== runtimeId && !options.allowInvalidRuntime) {
-      throw new PosixLoomError("RUNTIME_ID_MISMATCH", "runtime/current does not match manifest runtimeId", { pointer: runtimeId, manifest: manifest.runtimeId });
-    }
-    if (manifest.runtimeId !== runtimeId && options.allowInvalidRuntime) {
-      recoveryChecks.push({ id: "runtime.identity", level: "FAIL", message: "Runtime pointer does not match manifest runtimeId", details: { pointer: runtimeId, manifest: manifest.runtimeId } });
-    }
-    const startupChecks = validateRuntimeManifest(manifest, runtimeRoot);
-    const failures = startupChecks.filter((check) => check.level === "FAIL");
-    if (failures.length && !options.allowInvalidRuntime) {
-      throw new PosixLoomError("RUNTIME_VALIDATION_FAILED", "Selected Runtime failed startup validation", { runtimeId, failures });
-    }
-    // 五路内容哈希合成 snapshotId：runtimeId + manifest 哈希 + 注册表哈希 +
-    // 插件图哈希 + 挂载表哈希 + 策略哈希。任一路变化都会改变快照身份，供会话与状态上报
-    // 判断运行环境是否漂移；快照一经构造即不可变。
-    const mountsHash = hashText(JSON.stringify(config.runtime.mounts));
-    const policyHash = hashText(JSON.stringify(config.runtime.policy));
-    const registryHash = registry.hash();
-    const pluginsHash = hashText(JSON.stringify(plugins.inspect().map(({ id, version, requires, provides }) => ({ id, version, requires, provides }))));
-    const runtimeManifestHash = hashText(JSON.stringify(manifest));
-    const snapshotId = hashText(JSON.stringify({ runtimeId, runtimeManifestHash, registryHash, pluginsHash, mountsHash, policyHash }));
-    const snapshot: RuntimeSnapshot = {
-      snapshotId,
-      runtimeId,
-      runtimeRoot: resolve(runtimeRoot),
-      runtimeManifestHash,
-      registryHash,
-      pluginsHash,
-      mountsHash,
-      policyHash,
-      manifest,
-      source: config.runtimeSource,
-    };
-    // 任一启动异常（指针问题、manifest 读取失败、深度校验失败、身份或模式
-    // 不一致）都会把实例标记为恢复模式：诊断信息仍可输出，但运行时不再被信任。
-    const recoveryRequired = config.runtimePointerIssues.length > 0
-      || recoveryChecks.length > 0
-      || failures.length > 0
-      || manifest.runtimeId !== runtimeId
-      || manifest.mode !== expectedMode;
-    return new RuntimeManager(config, registry, snapshot, recoveryChecks, recoveryRequired, plugins);
   }
 
   /**
@@ -710,6 +734,7 @@ export class RuntimeManager {
       nativeCommands: this.registry.list().map((descriptor) => descriptor.name).sort(),
       plugins: this.plugins.inspect(),
       recoveryRequired: this.recoveryRequired,
+      initializationTimings: { ...this.initializationTimings },
     };
   }
 
@@ -756,6 +781,13 @@ export class RuntimeManager {
     this.integrityWatcher?.close();
     this.integrityWatcher = undefined;
     this.integrityMonitorAvailable = false;
+    void this.traces.flush();
+  }
+
+  async close(): Promise<void> {
+    this.dispose();
+    await this.traces.close();
+    await this.plugins.stop();
   }
 
   /**

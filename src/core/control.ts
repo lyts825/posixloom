@@ -27,6 +27,10 @@
  * 会话与命令执行语义见 ./service.ts。
  */
 import type { Readable, Writable } from "node:stream";
+import { randomUUID } from "node:crypto";
+import { ReplayWindow } from "./replay-window.js";
+import { summarizeTraces } from "./trace-summary.js";
+import { parseExecutionRequest } from "./execution-request.js";
 import { PosixLoomError, asPosixLoomError } from "./errors.js";
 import { InteractiveProcessController, NATIVE_MAX_FRAME_BYTES, NativeFrameDecoder, encodeNativeFrame, validateTerminalSize } from "./process.js";
 import { RuntimeManager } from "./runtime.js";
@@ -90,12 +94,12 @@ function jsonSessionState(state: { version: bigint; cwd: string; exportedEnv: Re
  * 不能直接放进 JSON，统一转 Base64（stdoutBase64 / stderrBase64），同时保留
  * 原始字节数与截断标记，Harness 侧可无损还原字节流并感知截断。
  */
-function jsonCompletion(completion: CommandCompletion): Record<string, unknown> {
-  return {
+function jsonCompletion(completion: CommandCompletion, id: string): Record<string, unknown> {
+  const result = {
     command: completion.command,
     state: jsonStateOutcome(completion.state),
-    stdoutBase64: completion.stdout.toString("base64"),
-    stderrBase64: completion.stderr.toString("base64"),
+    stdoutBase64: "",
+    stderrBase64: "",
     stdoutBytes: completion.stdoutBytes,
     stderrBytes: completion.stderrBytes,
     truncated: completion.truncated,
@@ -103,6 +107,28 @@ function jsonCompletion(completion: CommandCompletion): Record<string, unknown> 
     planId: completion.planId,
     trace: completion.trace,
   };
+  // Include the full UTF-8 envelope, escaped request ID and metadata before assigning
+  // whole Base64 quartets to the two streams. Unused space belongs to the other stream.
+  const metadataBytes = Buffer.byteLength(JSON.stringify({ protocolVersion: CONTROL_PROTOCOL_VERSION, type: "result", id, result }));
+  const quartets = Math.max(0, Math.floor((NATIVE_MAX_FRAME_BYTES - metadataBytes) / 4));
+  let stdoutQuartets = Math.min(Math.ceil(completion.stdout.length / 3), Math.floor(quartets / 2));
+  const stderrQuartets = Math.min(Math.ceil(completion.stderr.length / 3), quartets - stdoutQuartets);
+  stdoutQuartets = Math.min(Math.ceil(completion.stdout.length / 3), quartets - stderrQuartets);
+  const encodeOutput = (output: Buffer, maximum: number): string => {
+    if (output.length <= maximum) return output.toString("base64");
+    result.truncated = true;
+    const marker = Buffer.from("\n[PosixLoom OUTPUT TRUNCATED]\n");
+    if (maximum < marker.length) return output.subarray(0, maximum).toString("base64");
+    const retained = maximum - marker.length;
+    return Buffer.concat([
+      output.subarray(0, Math.ceil(retained / 2)),
+      marker,
+      output.subarray(output.length - Math.floor(retained / 2)),
+    ]).toString("base64");
+  };
+  result.stdoutBase64 = encodeOutput(completion.stdout, stdoutQuartets * 3);
+  result.stderrBase64 = encodeOutput(completion.stderr, stderrQuartets * 3);
+  return result;
 }
 
 /** id 类字段（请求 id / 会话 id / targetId）的统一守卫：非空字符串且不超过 128 字符。 */
@@ -127,41 +153,9 @@ type ValidExecuteRequest = ControlRequest & {
  * @throws {PosixLoomError} CONTROL_REQUEST_INVALID - sessionId/input 缺失或任一可选字段类型不合法。
  */
 function validateExecuteRequest(request: ControlRequest): asserts request is ValidExecuteRequest {
-  // sessionId 与 input 是必填项：无会话的执行会绕过状态模型，必须先拒绝。
-  if (!validId(request.sessionId) || !request.input || typeof request.input !== "object" || Array.isArray(request.input)) {
-    invalidRequest("execute requires sessionId and input");
-  }
-  if (request.cwd !== undefined && typeof request.cwd !== "string") invalidRequest("cwd must be a string");
-  if (request.timeoutMs !== undefined && (!Number.isSafeInteger(request.timeoutMs) || request.timeoutMs <= 0)) {
-    invalidRequest("timeoutMs must be a positive integer");
-  }
-  if (request.stream !== undefined && typeof request.stream !== "boolean") invalidRequest("stream must be a boolean");
-  if (request.terminal !== undefined) {
-    if (!request.terminal || typeof request.terminal !== "object" || Array.isArray(request.terminal)) invalidRequest("terminal must be an object");
-    try {
-      validateTerminalSize({ columns: request.terminal.columns as number, rows: request.terminal.rows as number });
-    } catch (error) {
-      invalidRequest("terminal columns and rows must be integers between 1 and 32767", { cause: String(error) });
-    }
-  }
-  if (request.statePolicy !== undefined && request.statePolicy !== "isolated" && request.statePolicy !== "cwd-env") {
-    invalidRequest("statePolicy must be isolated or cwd-env");
-  }
-  if (request.envDelta !== undefined) {
-    if (!request.envDelta || typeof request.envDelta !== "object" || Array.isArray(request.envDelta)) invalidRequest("envDelta must be an object");
-    for (const [key, value] of Object.entries(request.envDelta)) {
-      if (typeof value !== "string" && value !== null) invalidRequest("envDelta values must be strings or null", { key });
-    }
-  }
-  // 判别联合逐分支校验：argv 必须是非空的全字符串数组（逐参数精确透传）；
-  // text 的 raw 必须是字符串；未知 kind 一律拒绝，防止被静默当作脚本处理。
-  if (request.input.kind === "argv") {
-    if (!Array.isArray(request.input.argv) || request.input.argv.length === 0 || request.input.argv.some((argument) => typeof argument !== "string")) {
-      invalidRequest("argv input must contain at least one string");
-    }
-  } else if (request.input.kind === "text") {
-    if (typeof request.input.raw !== "string") invalidRequest("text input requires a string raw script");
-  } else invalidRequest("unsupported execute input kind");
+  if (!validId(request.sessionId)) invalidRequest("execute requires sessionId");
+  const parsed = parseExecutionRequest(request, { code: "CONTROL_REQUEST_INVALID" });
+  Object.assign(request, parsed);
 }
 
 /** 控制协议边界上的规范 Base64 解码，拒绝 URL-safe/省略填充等歧义形式。 */
@@ -203,9 +197,12 @@ export async function serveControlPlane(runtime: RuntimeManager, input: Readable
   // 当前连接上的交互终端：execute 请求 id -> 运行期输入控制器。
   const terminals = new Map<string, InteractiveProcessController>();
   // 本连接已用过的请求 id，用于同连接去重（重试语义由 Harness 换新 id 保证）。
-  const requestIds = new Set<string>();
+  const limits = runtime.config.runtime.protocol;
+  const requestIds = new ReplayWindow(limits.replayWindowSize, limits.replayWindowTtlMs);
+  const clientId = `stdio:${randomUUID()}`;
   // 全部在途请求任务（fire-and-forget），退出前用 allSettled 等待落定。
   const tasks = new Set<Promise<void>>();
+  let rejectedRequests = 0;
   // 首个输出侧致命错误；一经记录即视为连接已死，后续写入全部拒绝。
   let outputFailure: Error | undefined;
   // 中止全部在途命令（Harness 已不可达，继续执行只会浪费资源并留下孤儿进程）。
@@ -235,12 +232,22 @@ export async function serveControlPlane(runtime: RuntimeManager, input: Readable
       if (outputFailure || output.destroyed) throw outputFailure ?? new PosixLoomError("CONTROL_OUTPUT_CLOSED", "Harness control output is unavailable");
       const frame = encodeNativeFrame({ protocolVersion: CONTROL_PROTOCOL_VERSION, ...value });
       await new Promise<void>((resolve, reject) => {
-        output.write(frame, (error) => {
+        let settled = false;
+        const timer = setTimeout(() => {
+          const error = new PosixLoomError("CONTROL_OUTPUT_TIMEOUT", "Harness output did not drain before the configured deadline");
+          done(error);
+          output.destroy();
+        }, runtime.config.runtime.process.outputDrainTimeoutMs);
+        const done = (error?: Error | null): void => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
           if (error) {
             failOutput(error);
             reject(error);
           } else resolve();
-        });
+        };
+        try { output.write(frame, done); } catch (error) { done(error instanceof Error ? error : new Error(String(error))); }
       });
     });
     // 队列指针无条件前移（吞掉错误）：单个帧写失败不应阻塞后续帧的尝试。
@@ -260,13 +267,6 @@ export async function serveControlPlane(runtime: RuntimeManager, input: Readable
       await send({ type: "error", id, code: "CONTROL_REQUEST_INVALID", message: "Request id is required and must be at most 128 characters" });
       return;
     }
-    // 同连接 id 去重：重试必须换新 id，复用旧 id 视为协议错误（fail closed）。
-    if (requestIds.has(id)) {
-      await send({ type: "error", id, code: "CONTROL_REQUEST_DUPLICATE_ID", message: "Request id was already used on this connection" });
-      return;
-    }
-    // 先登记再继续校验：即使后续字段非法导致失败，这个 id 也已消耗，重发必须换新 id。
-    requestIds.add(id);
     // 协议版本不匹配直接拒绝，避免新旧协议语义混淆。
     if (request.protocolVersion !== CONTROL_PROTOCOL_VERSION) {
       await send({ type: "error", id, code: "CONTROL_PROTOCOL_MISMATCH", message: "Unsupported control protocol version" });
@@ -304,24 +304,33 @@ export async function serveControlPlane(runtime: RuntimeManager, input: Readable
         return;
       }
       // 运行时摘要：不执行外部命令，返回快照、挂载、后端路径与注册表命令。
+      if (request.type === "metrics") {
+        await send({ type: "result", id, result: { ...service.metrics(), replayIds: requestIds.size, pendingRequests: tasks.size, rejectedRequests } });
+        return;
+      }
       if (request.type === "runtime.info") {
         await send({ type: "result", id, result: runtime.info() });
         return;
       }
       // 当前服务进程的内存 trace；持久化 trace 由 CLI 从 JSONL 尾部读取。
-      if (request.type === "trace.list") {
+      if (request.type === "trace.list" || request.type === "trace.summary") {
         const limit = request.limit ?? 50;
         if (!Number.isSafeInteger(limit) || limit <= 0 || limit > 5000) invalidRequest("limit must be an integer between 1 and 5000");
-        await send({ type: "result", id, result: { events: service.traces().slice(-limit) } });
+        const events = service.traces(limit);
+        await send({ type: "result", id, result: request.type === "trace.summary" ? { summary: summarizeTraces(events) } : { events } });
         return;
       }
       // 计划预览与 execute 共用服务层准备管道，但不会创建子进程或提交会话状态。
       if (request.type === "execute.plan") {
         validateExecuteRequest(request);
+        const controller = new AbortController();
+        inflight.set(id, controller);
         const options: ExecuteOptions = request.input.kind === "argv"
-          ? { kind: "argv", argv: request.input.argv, sessionId: request.sessionId, cwd: request.cwd, envDelta: request.envDelta, statePolicy: request.statePolicy, timeoutMs: request.timeoutMs, terminal: request.terminal as { columns: number; rows: number } | undefined }
-          : { kind: "text", raw: request.input.raw, sessionId: request.sessionId, cwd: request.cwd, envDelta: request.envDelta, statePolicy: request.statePolicy, timeoutMs: request.timeoutMs, terminal: request.terminal as { columns: number; rows: number } | undefined };
-        await send({ type: "result", id, result: await service.explain(options) });
+          ? { kind: "argv", argv: request.input.argv, sessionId: request.sessionId, clientId, cwd: request.cwd, envDelta: request.envDelta, statePolicy: request.statePolicy, timeoutMs: request.timeoutMs, terminal: request.terminal as { columns: number; rows: number } | undefined }
+          : { kind: "text", raw: request.input.raw, sessionId: request.sessionId, clientId, cwd: request.cwd, envDelta: request.envDelta, statePolicy: request.statePolicy, timeoutMs: request.timeoutMs, terminal: request.terminal as { columns: number; rows: number } | undefined };
+        options.signal = controller.signal;
+        try { await send({ type: "result", id, result: await service.explain(options) }); }
+        finally { inflight.delete(id); }
         return;
       }
       // 交互终端的运行期输入：targetId 指向尚在运行的 execute 请求。
@@ -367,8 +376,8 @@ export async function serveControlPlane(runtime: RuntimeManager, input: Readable
         if (interactive) terminals.set(id, interactive);
         // argv：逐参数精确透传；text：脚本文本，唯一启用 Shell 语法。其余选项原样透传。
         const options: ExecuteOptions = request.input.kind === "argv"
-          ? { kind: "argv", argv: request.input.argv, sessionId: request.sessionId, cwd: request.cwd, envDelta: request.envDelta, statePolicy: request.statePolicy, timeoutMs: request.timeoutMs, signal: controller.signal, terminal: request.terminal as { columns: number; rows: number } | undefined, interactive }
-          : { kind: "text", raw: request.input.raw, sessionId: request.sessionId, cwd: request.cwd, envDelta: request.envDelta, statePolicy: request.statePolicy, timeoutMs: request.timeoutMs, signal: controller.signal, terminal: request.terminal as { columns: number; rows: number } | undefined, interactive };
+          ? { kind: "argv", argv: request.input.argv, sessionId: request.sessionId, clientId, cwd: request.cwd, envDelta: request.envDelta, statePolicy: request.statePolicy, timeoutMs: request.timeoutMs, signal: controller.signal, terminal: request.terminal as { columns: number; rows: number } | undefined, interactive }
+          : { kind: "text", raw: request.input.raw, sessionId: request.sessionId, clientId, cwd: request.cwd, envDelta: request.envDelta, statePolicy: request.statePolicy, timeoutMs: request.timeoutMs, signal: controller.signal, terminal: request.terminal as { columns: number; rows: number } | undefined, interactive };
         try {
           const completion = await service.execute(options, request.stream
             ? {
@@ -390,7 +399,7 @@ export async function serveControlPlane(runtime: RuntimeManager, input: Readable
             }
             : {});
           // 输出统一走 jsonCompletion：stdout/stderr 转 Base64、bigint 版本转字符串。
-          await send({ type: "result", id, result: jsonCompletion(completion) });
+          await send({ type: "result", id, result: jsonCompletion(completion, id) });
         } finally {
           // 命令结束（完成或失败）后注销取消句柄，避免 cancel 命中已完成的请求。
           inflight.delete(id);
@@ -427,13 +436,24 @@ export async function serveControlPlane(runtime: RuntimeManager, input: Readable
   };
 
   // 读循环自身的致命错误（解码器抛错等），与输出侧错误分开记录。
+  const dispatch = async (request: ControlRequest): Promise<void> => {
+    if (!validId(request.id)) { await handle(request); return; }
+    if (!requestIds.begin(request.id)) {
+      await send({ type: "error", id: request.id, code: "CONTROL_REQUEST_DUPLICATE_ID", message: "Request id is active or retained in the replay window" });
+      return;
+    }
+    try { await handle(request); } finally { requestIds.finish(request.id); }
+  };
+
   let serviceError: unknown;
   try {
     // 握手帧：宣告帧上限与能力集，Harness 在发送第一个请求前即可完成协商。
     await send({
       type: "hello",
       maxFrameBytes: NATIVE_MAX_FRAME_BYTES,
-      capabilities: ["session", "argv", "shell", "cancel", "runtime-doctor", "runtime-info", "execute-plan", "stream-output-v1", "trace-list", "pty-v1"],
+      replayWindow: { maximum: limits.replayWindowSize, ttlMs: limits.replayWindowTtlMs },
+      limits: { maxPendingRequests: limits.maxPendingRequests, ...runtime.config.runtime.process },
+      capabilities: ["session", "argv", "shell", "cancel", "runtime-doctor", "runtime-info", "execute-plan", "stream-output-v1", "trace-list", "trace-summary", "pty-v1", "metrics-v1", "bounded-replay-v1"],
     });
     controlLoop: for await (const chunk of input) {
       // 已进入收尾（shutdown / 输出失效）则不再读取新数据。
@@ -447,7 +467,13 @@ export async function serveControlPlane(runtime: RuntimeManager, input: Readable
           continue;
         }
         // fire-and-forget：请求处理与读循环解耦，慢命令不会阻塞后续请求的接收。
-        const task = handle(frame as ControlRequest);
+        const priority = ["cancel", "shutdown", "terminal.input", "terminal.resize", "terminal.eof"].includes(String((frame as ControlRequest).type));
+        if (tasks.size >= limits.maxPendingRequests + (priority ? 16 : 0)) {
+          rejectedRequests += 1;
+          await send({ type: "error", id: (frame as ControlRequest).id, code: "SERVER_BUSY", message: "Control request capacity exhausted" });
+          continue;
+        }
+        const task = dispatch(frame as ControlRequest);
         tasks.add(task);
         void task.then(() => tasks.delete(task), () => tasks.delete(task));
         if (closing) break controlLoop;
@@ -464,6 +490,7 @@ export async function serveControlPlane(runtime: RuntimeManager, input: Readable
     await Promise.allSettled(tasks);
     // 等待最后一个已排队的写入完成，尽量把已生成的响应送达对端。
     await writeLane;
+    await service.flushTraces();
     // 移除输出监听，避免进程退出阶段的 close 事件再触发 failOutput。
     output.off("error", failOutput);
     output.off("close", outputClosed);

@@ -33,6 +33,11 @@ The packaged defaults keep process-local state and child-process data bounded:
     "idleTimeoutMs": 1800000
   },
   "process": {
+    "maxConcurrent": 8,
+    "maxConcurrentPerClient": 4,
+    "maxQueued": 128,
+    "maxQueuedPerClient": 32,
+    "queueTimeoutMs": 30000,
     "maxOutputBytes": 8388608,
     "outputDrainTimeoutMs": 5000,
     "maxReportBytes": 1048576
@@ -45,6 +50,40 @@ session is reclaimed; if every slot is executing or queued, creation fails with
 `SESSION_LIMIT_REACHED`. `maxOutputBytes` applies independently to stdout and stderr,
 `outputDrainTimeoutMs` prevents a stalled streaming client from holding completion
 open forever, and `maxReportBytes` is a separate hard limit for StateReport data.
+
+All Services attached to one Runtime share execution admission; execute and explain
+both consume capacity. Stateful same-session waits do not occupy execution slots.
+`queueTimeoutMs` bounds waiting independently of execution `timeoutMs`. Full queues
+return `SERVER_BUSY`; expired waits return `QUEUE_TIMEOUT` (HTTP 429 with Retry-After).
+Zero queue capacity disables waiting. Process timers must fit 1..2147483647 milliseconds;
+`cancelGraceMs` may also be zero. Running and queued operations, including isolated
+executions, hold a session lease: explicit close returns `SESSION_BUSY` (HTTP 409).
+
+HTTP identities use actual socket addresses, not forwarded headers or request body
+fields. Clients behind a proxy share that cap. Each stdio connection has its own ID;
+embedded calls share `embedded` unless a trusted host supplies `clientId`. Separate
+Runtime instances/processes have independent budgets. HTTP `/api/v1/metrics` and stdio
+`metrics` report active, queued, completed/rejected work and trace diagnostics.
+
+Protocol limits are separate from execution slots:
+
+```json
+{
+  "protocol": {
+    "maxPendingRequests": 256,
+    "replayWindowSize": 10000,
+    "replayWindowTtlMs": 1800000,
+    "idempotencyMaxEntries": 1024,
+    "idempotencyTtlMs": 1800000,
+    "idempotencyMaxBytes": 33554432
+  }
+}
+```
+
+Stdio reserves 16 additional request slots for cancellation, shutdown and terminal
+control. Replay retention applies to completed IDs; active IDs are never evicted.
+HTTP idempotency applies only when an Idempotency-Key is supplied. See the
+[HTTP](../protocols/http-v1.md) and [stdio](../protocols/control-v1.md) contracts.
 
 ## Execution plan preview
 
@@ -73,6 +112,7 @@ posixloom runtime info
 posixloom runtime info --json
 posixloom trace list --limit 50
 posixloom trace list --limit 50 --json
+posixloom trace summary --limit 1000 --json
 ```
 
 `runtime info` reports the immutable snapshot and plugin-graph hashes, Runtime source
@@ -83,6 +123,34 @@ Path commands, and a data-only inventory of active runtime plugins.
 recording is disabled by default; enable `observability.writeTraceFile` in the user
 configuration when historical diagnostics are required. Trace records contain command
 metadata and outcomes, not command text or environment values.
+
+Trace defaults:
+
+```json
+{
+  "observability": {
+    "traceBufferSize": 5000,
+    "writeTraceFile": false,
+    "collectCommandNames": false,
+    "traceMaxFileBytes": 10485760,
+    "traceRetainedFiles": 3,
+    "traceMaxPendingBytes": 1048576,
+    "traceFlushIntervalMs": 100
+  }
+}
+```
+
+The memory buffer is a fixed-capacity ring. Persistence batches asynchronously;
+`traceRetainedFiles` counts rotated files in addition to the current JSONL file,
+and `trace list` reads across them. Full queues, oversize records and IO failures
+affect diagnostics only, never the command outcome. Inspect trace metrics for drops
+and the last IO error. CLI/transports flush on graceful shutdown; embedders should
+`await runtime.close()`. Abrupt termination can lose the last batch. Zero buffer size
+disables memory retention; zero rotated files keeps only the current file.
+
+Command names are opt-in, restricted to safe bare names. Arguments, script bodies,
+environment values and paths are not recorded. `trace summary` reports sample counts,
+phase percentiles and fallback candidates. See [performance](performance.md).
 
 ## Interactive terminal mode
 

@@ -9,7 +9,8 @@
   3. 调用 packaging/build-runtime.ps1 -Mode release 组装发布包，
      全部组件目录从 resolved-components.json 显式注入；
   4. 调用 packaging/verify-runtime.ps1 验证包完整性并执行兼容性语料；
-  5. 调用 scripts/create-update-feed.mjs 用 Ed25519 私钥签名，产出更新 Feed。
+  5. 调用 packaging/verify-defender.ps1 扫描包目录与两个归档，失败则禁止签名；
+  6. 调用 scripts/create-update-feed.mjs 用 Ed25519 私钥签名，产出更新 Feed。
 
   设计意图：
   - 签名发布使客户端只能安装经过验证的完整 Runtime：环境组件（node/msys2/
@@ -40,7 +41,7 @@
 .PARAMETER PrivateKey
   Ed25519 私钥文件路径（必填）。
 .PARAMETER SkipCorpus
-  跳过兼容性语料，仅做静态包验证。
+  跳过兼容性语料，仅做静态包验证；Defender 门禁仍会执行。
 #>
 [CmdletBinding()]
 param(
@@ -147,6 +148,10 @@ if ($SkipCorpus) {
 # ArchiveUrl 缺省为归档文件名（相对地址），由分发端决定最终落地 URL。
 $runtimeArchive = Join-Path (Split-Path -Parent $Output) "$runtimeId.runtime.zip"
 if (!(Test-Path -LiteralPath $runtimeArchive -PathType Leaf)) { throw "Runtime update archive missing: $runtimeArchive" }
+# Antivirus verification is mandatory before signing. Never change protection or add exclusions.
+Invoke-Checked {
+  & (Join-Path $root 'packaging\verify-defender.ps1') -PackageRoot $Output -ArchivePaths @("$Output.zip", $runtimeArchive) -ReportPath "$Output.defender.json"
+} 'Release Defender scan failed'
 if ([string]::IsNullOrWhiteSpace($ArchiveUrl)) { $ArchiveUrl = [IO.Path]::GetFileName($runtimeArchive) }
 Invoke-Checked {
   & node (Join-Path $root 'scripts\create-update-feed.mjs') `

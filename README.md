@@ -78,10 +78,30 @@ npm run posixloom -- trace list --limit 50
 启动 Harness 控制面：
 
 ```powershell
-npm run posixloom -- serve --stdio
+npm run build:all
+node dist/src/cli/main.js serve --stdio
 ```
 
-协议使用长度前缀 JSON 帧，详见 [control protocol v1](docs/protocols/control-v1.md)。
+构建完成后也可用 `npm run --silent serve:stdio`。Harness 启动子进程时应直接运行 Node 入口，或便携包中的 `posixloom.exe serve --stdio`，确保 stdout 从第一字节开始都是协议帧。协议使用长度前缀 JSON 帧，详见 [control protocol v1](docs/protocols/control-v1.md)。
+
+## 嵌入 Node.js 宿主
+
+构建会生成 ESM 入口和 TypeScript 声明；包保持私有，可通过本地 tarball 接入：
+
+```powershell
+npm run build
+npm pack
+# 在宿主项目中安装上一步生成的 tarball
+npm install C:\path\to\posixloom-runtime-0.1.0.tgz
+```
+
+宿主可使用 `import { RuntimeManager, PosixLoomService } from "posixloom-runtime"`。SDK 调度已有 Runtime，第三方工具和 Native Host 由便携包或开发仓库提供。完整生命周期示例见 [embedded.mjs](examples/embedded.mjs)，运行时传入该 Runtime 的根目录：
+
+```powershell
+node node_modules/posixloom-runtime/examples/embedded.mjs C:\path\to\posixloom
+```
+
+执行结束后应 `await runtime.close()` 释放观察器、插件和日志资源。`npm run test:sdk` 会在仓库外创建离线消费项目，检查实际 tarball、类型声明和命令执行。
 
 启动本地 GUI（默认分别监听 GUI `127.0.0.1:7330` 与 API `127.0.0.1:7331`）：
 
@@ -138,6 +158,9 @@ npm run posixloom -- plugin run workspace-inspector git-status
 - [HTTP API v1](docs/protocols/http-v1.md)、[控制协议 v1](docs/protocols/control-v1.md) 与 [StateReport v1](docs/protocols/state-report-v1.md)。
 
 ## 当前边界
+
+Windows Shell 需要已构建的 Native Host。同一 MSYS 安装的 Shell 会跨进程
+互斥执行以保护共享挂载，原生命令继续并发；详见[性能与资源边界](docs/guides/performance.md)。
 
 项目目前处于 `0.1.0` 开发阶段，目标平台为 Windows 10/11 x64。Session 仅在当前服务进程内保存，进程退出后不会恢复；配置中的历史字段 `session.persistAcrossRestart: true` 会被明确拒绝。HTTP 服务自身不终止 TLS，跨机器或公网使用时应置于 HTTPS 反向代理之后。市场插件是不会自动加载代码的声明式命令包；进程内 `RuntimePlugin` 只能由宿主显式注入，必须视为与宿主等权的可信代码。默认策略提供的是防误操作 Guardrail，不是针对恶意本地代码的 OS 级安全沙箱。发布前应执行完整门禁：
 

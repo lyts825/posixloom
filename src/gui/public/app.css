@@ -254,7 +254,8 @@ kbd { padding: 1px 5px; border: 1px solid var(--line); border-bottom-color: var(
 .route-chip { padding: 3px 7px; border: 1px solid rgba(154, 168, 255, 0.22); border-radius: 99px; background: rgba(154, 168, 255, 0.08); color: var(--blue); }
 .text-button { padding: 3px 5px; border: 0; background: none; color: var(--faint); cursor: pointer; font: inherit; }
 .text-button:hover { color: var(--text); }
-.terminal-scroll { min-height: 0; flex: 1; overflow: auto; scrollbar-color: #303844 transparent; }
+.terminal-scroll { min-height: 0; flex: 1; overflow: auto; overflow-anchor: none; scrollbar-color: #303844 transparent; }
+.terminal-notice { flex: none; padding: 7px 18px; border-bottom: 1px solid var(--line); color: var(--amber); font-size: 11px; }
 .terminal-output { min-height: 100%; margin: 0; padding: 20px; color: #c9d1dc; font: 12px/1.65 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere; tab-size: 4; }
 .terminal-output .stderr { color: #ff9a9f; }
 .terminal-output .system { color: var(--blue); }

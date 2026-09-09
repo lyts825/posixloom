@@ -136,7 +136,18 @@ export class SessionStateStore {
    */
   close(sessionId: string): void {
     this.pruneExpired();
+    if ((this.sessions.get(sessionId)?.activeOperations ?? 0) > 0) {
+      throw new PosixLoomError("SESSION_BUSY", "Cannot close a session with running or queued operations", { sessionId });
+    }
     if (!this.sessions.delete(sessionId)) throw new PosixLoomError("SESSION_NOT_FOUND", `Unknown session: ${sessionId}`);
+  }
+
+  /** Protect both isolated work and queued requests from eviction or explicit close. */
+  async withLease<T>(sessionId: string, operation: () => Promise<T>): Promise<T> {
+    const record = this.requireRecord(sessionId);
+    record.activeOperations += 1;
+    try { return await operation(); }
+    finally { record.activeOperations -= 1; record.lastAccessedAt = this.now(); }
   }
 
   /**

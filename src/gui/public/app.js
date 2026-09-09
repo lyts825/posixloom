@@ -1,3 +1,5 @@
+import { bytesFromBase64, consumeNdjson, createTerminalView } from "./console-output.js";
+
 const byId = (id) => document.getElementById(id);
 
 const elements = {
@@ -32,9 +34,15 @@ const elements = {
   statusDot: byId("statusDot"),
   terminalOutput: byId("terminalOutput"),
   terminalScroll: byId("terminalScroll"),
+  terminalNotice: byId("terminalNotice"),
+  latestOutputButton: byId("latestOutputButton"),
   toast: byId("toast"),
   tokenInput: byId("tokenInput"),
 };
+
+const terminal = createTerminalView({ output: elements.terminalOutput, scroll: elements.terminalScroll, notice: elements.terminalNotice, latest: elements.latestOutputButton });
+terminal.clear();
+terminal.append("PosixLoom 控制台已就绪。", "terminal-muted");
 
 const state = {
   apiBaseUrl: "",
@@ -67,7 +75,7 @@ function createElement(tag, className, text) {
 }
 
 function errorText(error) {
-  if (error instanceof ApiError) return `${error.code}: ${error.message}`;
+  if (error instanceof Error && typeof error.code === "string") return `${error.code}: ${error.message}`;
   if (error instanceof Error) return error.message;
   return String(error);
 }
@@ -161,22 +169,13 @@ function commandRequest(stream = false) {
 }
 
 function clearTerminal() {
-  elements.terminalOutput.replaceChildren();
+  terminal.clear();
   elements.routeChip.hidden = true;
   elements.executionTime.textContent = "就绪";
 }
 
 function appendTerminal(text, className = "") {
-  const span = createElement("span", className, text);
-  elements.terminalOutput.append(span);
-  elements.terminalScroll.scrollTop = elements.terminalScroll.scrollHeight;
-}
-
-function bytesFromBase64(value) {
-  const binary = atob(value);
-  const bytes = new Uint8Array(binary.length);
-  for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
-  return bytes;
+  terminal.append(text, className);
 }
 
 function setExecuting(executing) {
@@ -247,36 +246,23 @@ async function runCommand() {
     }
     if (!response.body) throw new ApiError("STREAM_UNAVAILABLE", "浏览器没有提供响应流。");
     setConnection("online", "已连接");
-    const reader = response.body.getReader();
-    const lineDecoder = new TextDecoder();
-    let pending = "";
     let finalEvent;
-    const consume = (line) => {
-      if (!line.trim()) return;
-      const event = JSON.parse(line);
+    const consume = (event) => {
+      if (!event || typeof event !== "object" || finalEvent) throw new ApiError("STREAM_INVALID", "执行流包含无效或重复的事件。");
       if (event.type === "started") {
         elements.routeChip.textContent = `${event.preview.commandKind} → ${event.preview.backend}`;
         elements.routeChip.hidden = false;
         appendTerminal(`$ ${elements.commandInput.value}\n`, "system");
       } else if (event.type === "output") {
+        if (event.stream !== "stdout" && event.stream !== "stderr") throw new ApiError("STREAM_INVALID", "执行流包含未知的输出通道。");
         const decoder = event.stream === "stderr" ? stderrDecoder : stdoutDecoder;
         const text = decoder.decode(bytesFromBase64(event.dataBase64), { stream: true });
         appendTerminal(text, event.stream === "stderr" ? "stderr" : "");
       } else if (event.type === "completed") finalEvent = event;
       else if (event.type === "error") throw new ApiError(event.error.code, event.error.message, 0, event.error.details);
+      else throw new ApiError("STREAM_INVALID", "执行流包含未知的事件。");
     };
-    for (;;) {
-      const { value, done } = await reader.read();
-      pending += lineDecoder.decode(value || new Uint8Array(), { stream: !done });
-      let newline;
-      while ((newline = pending.indexOf("\n")) >= 0) {
-        const line = pending.slice(0, newline);
-        pending = pending.slice(newline + 1);
-        consume(line);
-      }
-      if (done) break;
-    }
-    if (pending.trim()) consume(pending);
+    await consumeNdjson(response.body, consume);
     appendTerminal(stdoutDecoder.decode(), "");
     appendTerminal(stderrDecoder.decode(), "stderr");
     if (!finalEvent) throw new ApiError("STREAM_TRUNCATED", "执行流在完成事件之前结束。");
@@ -286,6 +272,8 @@ async function runCommand() {
     elements.executionTime.textContent = `${Math.round(performance.now() - started)} ms`;
     await refreshSession();
   } catch (error) {
+    // Decoder/protocol failures must close the HTTP stream and cancel its process tree too.
+    controller.abort();
     if (error?.name === "AbortError") {
       appendTerminal("\n[已请求停止执行]\n", "stderr");
       elements.executionTime.textContent = "已停止";
@@ -295,6 +283,7 @@ async function runCommand() {
       toast(errorText(error), "error");
     }
   } finally {
+    terminal.flush();
     state.controller = null;
     setExecuting(false);
   }
@@ -553,4 +542,3 @@ void main().catch((error) => {
   setConnection("offline", "初始化失败");
   toast(errorText(error), "error");
 });
-

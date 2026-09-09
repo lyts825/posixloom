@@ -1,0 +1,72 @@
+name: release-defender-client-gate
+
+on:
+  workflow_dispatch:
+    inputs:
+      package_root:
+        description: "Absolute path of the identical, pre-staged release package on both clean client runners"
+        required: true
+        type: string
+      package_manifest_sha256:
+        description: "SHA-256 of the exact candidate SHA256SUMS file; identical on both runners"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    # Never run untrusted pull-request code on these self-hosted machines.
+    # Provision disposable clean Windows clients with active, current Defender.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - family: "10"
+            label: posixloom-clean-win10-x64
+          - family: "11"
+            label: posixloom-clean-win11-x64
+    runs-on: [self-hosted, Windows, X64, "${{ matrix.label }}"]
+    timeout-minutes: 40
+    env:
+      POSIXLOOM_RELEASE_PACKAGE: ${{ inputs.package_root }}
+      POSIXLOOM_EXPECTED_WINDOWS: ${{ matrix.family }}
+      POSIXLOOM_EXPECTED_MANIFEST: ${{ inputs.package_manifest_sha256 }}
+    steps:
+      - name: Check out verification scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Verify immutable package and compatibility corpus
+        shell: powershell
+        run: |
+          if ($env:POSIXLOOM_EXPECTED_MANIFEST -notmatch '^[a-fA-F0-9]{64}$') { throw 'Expected package manifest SHA-256 is invalid' }
+          $manifest = Join-Path $env:POSIXLOOM_RELEASE_PACKAGE 'SHA256SUMS'
+          if ((Get-FileHash -LiteralPath $manifest -Algorithm SHA256).Hash -ne $env:POSIXLOOM_EXPECTED_MANIFEST) { throw 'The staged package is not the selected release candidate' }
+          ./packaging/verify-runtime.ps1 -PackageRoot $env:POSIXLOOM_RELEASE_PACKAGE -RunCorpus
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Measure the exact package through its public launcher
+        shell: powershell
+        run: |
+          $runtimeId = (Get-Content -LiteralPath (Join-Path $env:POSIXLOOM_RELEASE_PACKAGE 'runtime\current') -Raw).Trim()
+          if ($runtimeId -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$') { throw 'Invalid candidate Runtime ID' }
+          $candidateNode = Join-Path $env:POSIXLOOM_RELEASE_PACKAGE "runtime\versions\$runtimeId\node\node.exe"
+          $report = Join-Path $env:RUNNER_TEMP "posixloom-benchmark-win$env:POSIXLOOM_EXPECTED_WINDOWS.json"
+          & $candidateNode scripts/benchmark.mjs --run-root $env:POSIXLOOM_RELEASE_PACKAGE --samples 7 --warmup 2 --check --output $report
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Defender scan without remediation or protection changes
+        shell: powershell
+        run: |
+          $report = Join-Path $env:RUNNER_TEMP "posixloom-defender-win$env:POSIXLOOM_EXPECTED_WINDOWS.json"
+          ./packaging/verify-defender.ps1 -PackageRoot $env:POSIXLOOM_RELEASE_PACKAGE -RequireClientWindows -ExpectedWindows $env:POSIXLOOM_EXPECTED_WINDOWS -ReportPath $report
+      - name: Preserve scan evidence in job log and summary
+        if: always()
+        shell: powershell
+        run: |
+          $report = Join-Path $env:RUNNER_TEMP "posixloom-defender-win$env:POSIXLOOM_EXPECTED_WINDOWS.json"
+          if (Test-Path -LiteralPath $report) {
+            Get-Content -LiteralPath $report
+            Get-Content -LiteralPath $report | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY
+            Get-ChildItem -LiteralPath $env:RUNNER_TEMP -Filter "posixloom-defender-win$env:POSIXLOOM_EXPECTED_WINDOWS.json.scan-*.log" | ForEach-Object { Get-Content -LiteralPath $_.FullName }
+          }
+          $benchmark = Join-Path $env:RUNNER_TEMP "posixloom-benchmark-win$env:POSIXLOOM_EXPECTED_WINDOWS.json"
+          if (Test-Path -LiteralPath $benchmark) { Get-Content -LiteralPath $benchmark | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY }

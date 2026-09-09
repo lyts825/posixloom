@@ -120,6 +120,11 @@ export interface RuntimeConfig {
   };
   /** 进程块：超时、取消宽限与数据限额，构成命令执行的资源安全边界。 */
   process: {
+    maxConcurrent: number;
+    maxConcurrentPerClient: number;
+    maxQueued: number;
+    maxQueuedPerClient: number;
+    queueTimeoutMs: number;
     /** 单命令默认超时（毫秒），可被 VirtualCommand.timeoutMs 覆盖。 */
     defaultTimeoutMs: number;
     /** 发出取消信号后的宽限期（毫秒），到期升级为强制终止。 */
@@ -139,7 +144,8 @@ export interface RuntimeConfig {
     profiles: Record<"trusted" | "workspace-guard", PolicyProfile>;
   };
   /** 可观测性块：trace 环形缓冲容量与是否落盘 trace 文件。 */
-  observability: { traceBufferSize: number; writeTraceFile: boolean };
+  observability: { traceBufferSize: number; writeTraceFile: boolean; traceMaxFileBytes: number; traceRetainedFiles: number; traceMaxPendingBytes: number; traceFlushIntervalMs: number; collectCommandNames: boolean };
+  protocol: { maxPendingRequests: number; replayWindowSize: number; replayWindowTtlMs: number; idempotencyMaxEntries: number; idempotencyTtlMs: number; idempotencyMaxBytes: number };
   /** 更新块：更新通道、签名校验与下载限额（由 updater.ts 消费）。 */
   updates: {
     /** 是否启用运行时更新检查。 */
@@ -269,6 +275,7 @@ export interface RuntimeSnapshot {
 
 /** 面向 CLI / Harness 的只读运行时摘要。 */
 export interface RuntimeInfo {
+  initializationTimings: Record<string, number>;
   runtimeId: string;
   runtimeSemver: string;
   updateSequence?: number;

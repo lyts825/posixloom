@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import test from "node:test";
+import { assertControlChild } from "./helpers/control-child.js";
 
 function sha256(contents: Buffer | string): string {
   return createHash("sha256").update(contents).digest("hex");
@@ -17,7 +18,7 @@ function singleFileTree(relative: string, contents: Buffer): { rootTreeSha256: s
 
 const releaseHost = join(process.cwd(), "native", "posixloom-host", "target", "release", "posixloom.exe");
 
-test("release packaging is self-consistent and launcher verifies application hashes", { skip: process.platform !== "win32" || !existsSync(releaseHost) }, () => {
+test("release packaging is self-consistent and launcher verifies application hashes", { skip: process.platform !== "win32" || !existsSync(releaseHost) }, async () => {
   const fixture = mkdtempSync(join(tmpdir(), "posixloom-packaging-"));
   try {
     const nodeRoot = join(fixture, "node source");
@@ -85,6 +86,25 @@ test("release packaging is self-consistent and launcher verifies application has
     ], { encoding: "utf8", maxBuffer: 16 * 1024 * 1024 });
     assert.equal(verified.status, 0, `${verified.stdout}\n${verified.stderr}`);
     assert.equal(existsSync(join(output, "dist", "tests")), false);
+    const launcher = join(output, "posixloom.exe");
+    const env = { ...process.env, POSIXLOOM_RUN_ROOT: output, POSIXLOOM_DATA_ROOT: join(fixture, "consumer data"), POSIXLOOM_UPDATE_FEED_URL: "" };
+    for (const args of [["version"], ["launch", "version"]]) {
+      const version = spawnSync(launcher, args, { cwd: fixture, env, encoding: "utf8", windowsHide: true, timeout: 15_000 });
+      assert.equal(version.status, 0, version.stderr);
+      assert.match(version.stdout, /PosixLoom Runtime/);
+    }
+    await assertControlChild(launcher, ["serve", "--stdio"], { cwd: fixture, env });
+    for (const helper of ["state-report.sh", "extract-runtime.ps1"]) {
+      const path = join(output, "dist", "src", "core", "assets", helper);
+      const original = readFileSync(path);
+      assert.deepEqual(original, readFileSync(join(process.cwd(), "src", "core", "assets", helper)));
+      assert.equal(original.includes(Buffer.from("\r")), false);
+      writeFileSync(path, Buffer.concat([original, Buffer.from("\n# tampered asset\n")]));
+      const refused = spawnSync(join(output, "posixloom.exe"), ["version"], { encoding: "utf8" });
+      assert.notEqual(refused.status, 0);
+      assert.match(refused.stderr, /SHA-256 mismatch/);
+      writeFileSync(path, original);
+    }
     const manifest = JSON.parse(readFileSync(join(output, "runtime", "versions", "runtime-9.9.9-fixture", "manifest.json"), "utf8"));
     assert.equal(manifest.required.includes("shims"), true);
     assert.equal(manifest.updateSequence, 42);
@@ -95,7 +115,7 @@ test("release packaging is self-consistent and launcher verifies application has
     const runtimeModule = join(output, "dist", "src", "core", "runtime.js");
     const runtimeModuleBytes = readFileSync(runtimeModule);
     writeFileSync(runtimeModule, Buffer.concat([runtimeModuleBytes, Buffer.from("\n// tampered module\n")]));
-    const moduleLaunch = spawnSync(join(output, "posixloom.exe"), ["launch", "version"], { encoding: "utf8" });
+    const moduleLaunch = spawnSync(join(output, "posixloom.exe"), ["version"], { encoding: "utf8" });
     assert.notEqual(moduleLaunch.status, 0);
     assert.match(moduleLaunch.stderr, /SHA-256 mismatch/);
     writeFileSync(runtimeModule, runtimeModuleBytes);

@@ -25,6 +25,8 @@ PosixLoom 采用“微内核 + 插件能力图”。微内核只保留无法安�
 ```ts
 import {
   COMMAND_CLASSIFIERS,
+  PosixLoomService,
+  RuntimeManager,
   type RuntimePlugin,
 } from "posixloom-runtime";
 
@@ -53,7 +55,16 @@ export const aliases: RuntimePlugin = {
 ```ts
 const runtime = await RuntimeManager.create(appRoot, { plugins: [aliases] });
 const service = new PosixLoomService(runtime);
+try {
+  const sessionId = service.createSession();
+  const completion = await service.execute({ sessionId, raw: "project:check" });
+  process.stdout.write(completion.stdout);
+} finally {
+  await runtime.close();
+}
 ```
+
+`appRoot` 指向已有 PosixLoom Runtime 根目录，示例命令还要求宿主工作区包含 `scripts/check.mjs`。包导入方式与本地 tarball 安装步骤见[开发指南](development.md#嵌入-sdk)。
 
 内置插件没有特殊通道；`createBuiltinRuntimePlugins()` 返回的也是同一种 `RuntimePlugin`。嵌入方可以设置 `includeBuiltinPlugins: false` 构造完全自定义的能力图，但必须自行提供服务运行所需扩展点。
 

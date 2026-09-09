@@ -1,7 +1,7 @@
 /**
  * check-format.mjs -- 源码格式检查（无参数，直接运行）。
  *
- * 用途：对仓库中的 .ts / .mjs / .rs 源文件执行两条与 Git diff 噪声和
+ * 用途：对仓库中的 .ts / .mjs / .rs / .sh 源文件执行两条与 Git diff 噪声和
  * POSIX 工具链兼容性相关的格式约束：
  *   1. 禁止 CRLF：Windows 行尾会在跨平台协作与 shell 脚本处理中引入
  *      隐蔽差异（脚本 / CI 中常用字符串比较与行处理对 \r 极其敏感）；
@@ -20,7 +20,7 @@ import { resolve } from "node:path";
  * 递归收集仓库中需要检查的源文件路径。
  * 行为：跳过生成物与依赖目录（.git / artifacts / coverage / data /
  * dist / node_modules / target）；目录递归下钻；仅保留扩展名为
- * .ts / .mjs / .rs 的文件。
+ * .ts / .mjs / .rs / .sh 的文件。
  * @param {string} directory 起始目录（以 "." 从仓库根开始）
  * @returns {Promise<string[]>} 源文件的绝对路径列表
  */
@@ -31,7 +31,7 @@ async function collect(directory) {
     if ([".git", "artifacts", "coverage", "data", "dist", "node_modules", "target"].includes(entry.name)) continue;
     const path = resolve(directory, entry.name);
     if (entry.isDirectory()) files.push(...await collect(path));
-    else if (/\.(ts|mjs|rs)$/.test(entry.name)) files.push(path);
+    else if (/\.(ts|mjs|rs|sh)$/.test(entry.name)) files.push(path);
   }
   return files;
 }

@@ -116,7 +116,7 @@ try {
   New-Item -ItemType Directory -Path $workspace -Force | Out-Null
   # 运行包内 posixloom 的 runtime doctor：release 包要求全部检查通过且退出码为 0；
   # development 包仅允许 bash 检查失败（外部回退不可用），此时降级为告警。
-  $output = & $posixloom launch runtime doctor --json 2>&1
+  $output = & $posixloom runtime doctor --json 2>&1
   $doctorExitCode = $LASTEXITCODE
   try { $doctorReport = ($output -join "`n") | ConvertFrom-Json } catch { $output; throw "Runtime doctor did not return valid JSON" }
   $unexpectedFailures = @($doctorReport.checks | Where-Object { $_.level -eq 'FAIL' -and !($runtimeMode -eq 'development' -and $_.id -eq 'bash') })
@@ -132,7 +132,7 @@ try {
   if ($RunCorpus) {
     # 语料 1：Node argv 精确透传（含空格、& 与中文字符，不允许被引号/转义破坏）。
     $exactArgument = 'a b&中'
-    $argvOutput = & $posixloom launch exec -- node -p 'process.argv.at(1)' $exactArgument 2>&1
+    $argvOutput = & $posixloom exec -- node -p 'process.argv.at(1)' $exactArgument 2>&1
     if ($LASTEXITCODE -ne 0 -or (($argvOutput -join "`n").Trim() -ne $exactArgument)) { $argvOutput; throw 'argv compatibility corpus failed' }
 
     # 语料 2：bash 在含空格中文目录中切换 cwd 并导出环境变量，
@@ -143,7 +143,7 @@ try {
     $previousOutputEncoding = $OutputEncoding
     try {
       $OutputEncoding = [Text.UTF8Encoding]::new($false)
-      $shellOutput = $shellScript | & $posixloom launch shell --stdin 2>&1
+      $shellOutput = $shellScript | & $posixloom shell --stdin 2>&1
     } finally {
       $OutputEncoding = $previousOutputEncoding
     }
@@ -152,11 +152,11 @@ try {
     # 语料 3：ripgrep 在含空格中文路径下做固定字符串搜索，验证路径翻译与 UTF-8 匹配。
     $searchFile = Join-Path $workspace '资料 文件.txt'
     [IO.File]::WriteAllText($searchFile, "needle-你好`n", [Text.UTF8Encoding]::new($false))
-    $rgOutput = & $posixloom launch exec -- rg --fixed-strings 'needle-你好' '/workspace/资料 文件.txt' 2>&1
+    $rgOutput = & $posixloom exec -- rg --fixed-strings 'needle-你好' '/workspace/资料 文件.txt' 2>&1
     if ($LASTEXITCODE -ne 0 -or !(($rgOutput -join "`n").Contains('needle-你好'))) { $rgOutput; throw 'ripgrep path compatibility corpus failed' }
 
     # 语料 4：git 在含空格中文路径下 init 建仓，并确认 .git 目录真实生成。
-    $gitOutput = & $posixloom launch exec -- git init '/workspace/仓 库' 2>&1
+    $gitOutput = & $posixloom exec -- git init '/workspace/仓 库' 2>&1
     if ($LASTEXITCODE -ne 0 -or !(Test-Path -LiteralPath (Join-Path $workspace '仓 库\.git') -PathType Container)) { $gitOutput; throw 'git path compatibility corpus failed' }
   }
 }

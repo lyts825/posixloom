@@ -8,6 +8,7 @@ import { PosixLoomError } from "../core/errors.js";
 import { runProcess } from "../core/process.js";
 import { DEFAULT_NATIVE_ADAPTERS, DEFAULT_REGISTRY } from "../core/registry.js";
 import { buildShellScript, toMixedPath } from "../core/shell.js";
+import { shellNamespaceIdentity } from "../core/shell-namespace.js";
 import type { ExecutionPlan, MountBootstrap, NativeExecutionPlan, ShellExecutionPlan } from "../core/types.js";
 import {
   COMMAND_CLASSIFIERS,
@@ -174,12 +175,19 @@ const shellBackend: ExecutionBackend = {
   mode: "shell",
   async execute({ plan, runtime, hostPath, signal, interactive, onOutput }) {
     if (plan.mode !== "shell") throw new PosixLoomError("BACKEND_PLAN_MISMATCH", "MSYS2 backend received a non-shell plan");
+    if (process.platform === "win32" && !hostPath) throw new PosixLoomError("NATIVE_HOST_MISSING", "Windows Shell execution requires the Native Host for shared MSYS mounts and process-tree isolation; run npm run build:host or use a complete Runtime");
+    const shellNamespace = process.platform === "win32" ? shellNamespaceIdentity(plan.bashExecutable) : undefined;
     try {
       return await runProcess({
         program: plan.bashExecutable,
+        shellNamespace,
         args: plan.terminal ? ["--noprofile", "--norc", "-c", buildShellScript(plan)] : ["--noprofile", "--norc", "-s"],
         cwd: runtime.mountTable.toHost(plan.cwdVirtual),
-        env: plan.envPosix,
+        // MSYS initializes its fixed /tmp mount BEFORE the wrapper runs. A POSIX
+        // '/tmp' here would resolve against the current drive (e.g. C:\\tmp).
+        // Supply the real host directory for bootstrap; the wrapper then restores
+        // the declared POSIX environment so user commands still see TMP=/tmp.
+        env: { ...plan.envPosix, TMP: runtime.mountTable.toHost("/tmp"), TEMP: runtime.mountTable.toHost("/tmp"), TMPDIR: runtime.mountTable.toHost("/tmp") },
         timeoutMs: plan.timeoutMs,
         cancelGraceMs: runtime.config.runtime.process.cancelGraceMs,
         input: plan.terminal ? undefined : buildShellScript(plan),
