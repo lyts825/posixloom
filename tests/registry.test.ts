@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { join } from "node:path";
 import test from "node:test";
 import { PolicyGate } from "../src/core/policy.js";
+import { NativeRegistry } from "../src/core/registry.js";
 import { RuntimeManager } from "../src/core/runtime.js";
 
 test("git init translates its explicit virtual destination as a create path", async () => {
@@ -55,14 +56,20 @@ test("git leaves magic pathspecs untouched after the separator", async () => {
 test("ripgrep distinguishes patterns and option values from path positions", async () => {
   const runtime = await RuntimeManager.create(process.cwd());
   const gate = new PolicyGate("trusted", runtime.config.runtime.policy.profiles.trusted, runtime.mountTable, runtime.snapshot);
-  const resolved = runtime.registry.resolve("rg", ["rg", "/a/", "--glob", "/generated/", "/workspace"], runtime.snapshot, runtime.mountTable, gate);
+  // This tests argument adaptation without launching ripgrep. Use an available
+  // executable explicitly so resolution does not depend on the machine's PATH.
+  const registry = new NativeRegistry(runtime.registry.list().map((descriptor) => (
+    descriptor.name === "rg" ? { ...descriptor, executable: process.execPath } : descriptor
+  )));
+  const resolved = registry.resolve("rg", ["rg", "/a/", "--glob", "/generated/", "/workspace"], runtime.snapshot, runtime.mountTable, gate);
   assert.ok(resolved);
+  assert.equal(resolved.executable, process.execPath);
   assert.equal(resolved.adapter.argv[1], "/a/");
   assert.equal(resolved.adapter.argv[3], "/generated/");
   assert.equal(resolved.adapter.argv[4], runtime.config.workspace);
   assert.deepEqual(resolved.adapter.decisions.map((decision) => decision.argumentIndex), [4]);
 
-  const files = runtime.registry.resolve("rg", ["rg", "--files", "/workspace"], runtime.snapshot, runtime.mountTable, gate);
+  const files = registry.resolve("rg", ["rg", "--files", "/workspace"], runtime.snapshot, runtime.mountTable, gate);
   assert.ok(files);
   assert.equal(files.adapter.argv[2], runtime.config.workspace);
 });

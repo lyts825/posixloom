@@ -1,6 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
+import { mkdir, symlink, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import { inspect } from "node:util";
 import { RuntimeManager } from "../src/core/runtime.js";
 import { PosixLoomService } from "../src/core/service.js";
 import { buildNativeEnv } from "../src/core/env.js";
@@ -40,5 +43,39 @@ test("Shell bootstraps /tmp in a fresh temporary-drive workspace before POSIX ex
   const completion = await service.execute({ sessionId: service.createSession(), raw: "test -d /tmp && printf '%s|%s' \"$TMP\" \"$TMPDIR\"" });
   assert.deepEqual(completion.command, { kind: "exited", exitCode: 0 }, completion.stderr.toString());
   assert.equal(completion.stdout.toString(), "/tmp|/tmp");
-  assert.equal(completion.state.kind, "committed");
+  assert.equal(completion.state.kind, "committed", inspect(completion.state));
+});
+
+test("Windows Shell keeps physical cwd and temporary mounts virtual through a directory alias", { skip: process.platform !== "win32" }, async (context) => {
+  const outer = await runtimeFixture(context);
+  if (!outer.runtime.findBash()) { context.skip("Bash is unavailable"); return; }
+  const physical = join(outer.root, "physical temporary directory"), alias = join(outer.root, "temporary alias");
+  await mkdir(physical);
+  // Junctions exercise the same physical/lexical mismatch as NTFS 8.3 TEMP
+  // paths, even on volumes where short-name generation has been disabled.
+  await symlink(physical, alias, "junction");
+  const previousTmp = process.env.TMP, previousTemp = process.env.TEMP;
+  let fixture: Awaited<ReturnType<typeof runtimeFixture>>;
+  try {
+    process.env.TMP = alias;
+    process.env.TEMP = alias;
+    fixture = await runtimeFixture(context);
+  } finally {
+    if (previousTmp === undefined) delete process.env.TMP; else process.env.TMP = previousTmp;
+    if (previousTemp === undefined) delete process.env.TEMP; else process.env.TEMP = previousTemp;
+  }
+  try {
+    assert.ok(fixture.root.startsWith(alias));
+    await mkdir(join(fixture.root, "tests"));
+    await writeFile(join(fixture.runtime.config.dataRoot, "tmp", "marker.txt"), "temporary mount\n");
+    const service = new PosixLoomService(fixture.runtime), sessionId = service.createSession();
+    const completion = await service.execute({ sessionId, raw: "cd /workspace/tests && /usr/bin/cat /tmp/marker.txt && builtin pwd -P && printf '%s|%s' \"$TMP\" \"$TMPDIR\"" });
+    assert.deepEqual(completion.command, { kind: "exited", exitCode: 0 }, completion.stderr.toString());
+    assert.equal(completion.stdout.toString(), "temporary mount\n/workspace/tests\n/tmp|/tmp");
+    assert.equal(completion.state.kind, "committed", inspect(completion.state));
+    assert.equal(service.sessionSnapshot(sessionId).cwd, "/workspace/tests");
+  } finally {
+    // The outer fixture's cleanup hook removes this nested directory first.
+    await fixture.runtime.close();
+  }
 });

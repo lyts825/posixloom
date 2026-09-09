@@ -29,7 +29,7 @@
  */
 import { createHash } from "node:crypto";
 import { performance } from "node:perf_hooks";
-import { existsSync, lstatSync, readdirSync, readFileSync, watch, type FSWatcher } from "node:fs";
+import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync, watch, type FSWatcher } from "node:fs";
 import { basename, dirname, join, resolve, sep } from "node:path";
 import { isSafeRuntimeId, loadConfig, type LoadedConfig } from "./config.js";
 import { PosixLoomError } from "./errors.js";
@@ -478,6 +478,8 @@ export class RuntimeManager {
   private integrityMonitorAvailable = false;
   /** runtimeRoot 的递归目录监听器（仅 release 且非恢复模式创建）。 */
   private integrityWatcher?: FSWatcher;
+  private integrityWatcherClosed: Promise<void> = Promise.resolve();
+  private closePromise?: Promise<void>;
 
   /** 私有构造：仅在 create() 完成加载与校验后调用。 */
   private constructor(config: LoadedConfig, registry: NativeRegistry, snapshot: RuntimeSnapshot, recoveryChecks: DoctorCheck[], recoveryRequired: boolean, plugins: PluginKernel, readonly initializationTimings: Readonly<Record<string, number>>) {
@@ -495,9 +497,19 @@ export class RuntimeManager {
     // watcher unref 保证不阻止进程退出。恢复模式下不启用--运行时本就不可信。
     if (snapshot.manifest.mode === "release" && !recoveryRequired) {
       try {
-        this.integrityWatcher = watch(snapshot.runtimeRoot, { recursive: process.platform === "win32" }, () => { this.integrityDirty = true; });
-        this.integrityWatcher.on("error", () => { this.integrityMonitorAvailable = false; this.integrityDirty = true; });
-        this.integrityWatcher.unref();
+        // libuv compares event paths in their long Windows form with this root.
+        // Passing an 8.3 alias (common in %TEMP%) can abort below the JS error
+        // handler; resolve the existing directory before attaching the watcher.
+        const watchRoot = realpathSync.native(snapshot.runtimeRoot);
+        const watcher = watch(watchRoot, { recursive: process.platform === "win32" }, () => { this.integrityDirty = true; });
+        this.integrityWatcher = watcher;
+        this.integrityWatcherClosed = new Promise<void>((done) => watcher.once("close", () => {
+          this.integrityMonitorAvailable = false;
+          this.integrityDirty = true;
+          done();
+        }));
+        watcher.on("error", () => { this.integrityMonitorAvailable = false; this.integrityDirty = true; watcher.close(); });
+        watcher.unref();
         this.integrityMonitorAvailable = true;
       } catch {
         this.integrityDirty = true;
@@ -784,10 +796,15 @@ export class RuntimeManager {
     void this.traces.flush();
   }
 
-  async close(): Promise<void> {
-    this.dispose();
-    await this.traces.close();
-    await this.plugins.stop();
+  close(): Promise<void> {
+    return this.closePromise ??= (async () => {
+      this.dispose();
+      // Teardown callers may remove RuntimeRoot immediately after awaiting us.
+      // Drain the native watch handle before allowing that filesystem cleanup.
+      await this.integrityWatcherClosed;
+      await this.traces.close();
+      await this.plugins.stop();
+    })();
   }
 
   /**

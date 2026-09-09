@@ -4,6 +4,7 @@ import { parseIsolatedReport, parseStateReport } from "../src/core/state-report.
 import { PosixLoomService } from "../src/core/service.js";
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { inspect } from "node:util";
 import { shellNamespaceIdentity } from "../src/core/shell-namespace.js";
 import { runtimeFixture } from "./helpers/runtime-fixture.js";
 
@@ -46,7 +47,7 @@ test("isolated shell preserves output and exit code without collecting cwd or en
   assert.equal(result.stderr.toString(), "stderr");
   assert.deepEqual(service.sessionSnapshot(sessionId), before);
   const stateful = await service.execute({ sessionId, statePolicy: "cwd-env", raw: "function [ { return 0; }; true" });
-  assert.equal(stateful.state.kind, "committed");
+  assert.equal(stateful.state.kind, "committed", inspect(stateful.state));
 });
 
 test("isolated early exit, exec, errexit and receipt write failure retain failure semantics", async (context) => {

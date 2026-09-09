@@ -80,11 +80,20 @@ test("release packaging is self-consistent and launcher verifies application has
     assert.notEqual(overlapping.status, 0);
     assert.match(`${overlapping.stdout}\n${overlapping.stderr}`, /overlaps a package output target/i);
     assert.equal(existsSync(join(nodeRoot, "node.exe")), true);
-    const verified = spawnSync(powershell, [
-      "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", join(process.cwd(), "packaging", "verify-runtime.ps1"),
-      "-PackageRoot", output,
-    ], { encoding: "utf8", maxBuffer: 16 * 1024 * 1024 });
-    assert.equal(verified.status, 0, `${verified.stdout}\n${verified.stderr}`);
+    const shortFixture = spawnSync(powershell, [
+      "-NoProfile", "-NonInteractive", "-Command",
+      `(New-Object -ComObject Scripting.FileSystemObject).GetFolder('${fixture.replaceAll("'", "''")}').ShortPath`,
+    ], { encoding: "utf8" });
+    assert.equal(shortFixture.status, 0, shortFixture.stderr);
+    // Hosted Windows runners can expose TEMP through an 8.3 profile alias.
+    // Keep the Unicode leaf to cover mixed short and long path segments.
+    for (const packageRoot of new Set([output, join(shortFixture.stdout.trim(), "发布 包")])) {
+      const verified = spawnSync(powershell, [
+        "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", join(process.cwd(), "packaging", "verify-runtime.ps1"),
+        "-PackageRoot", packageRoot,
+      ], { encoding: "utf8", maxBuffer: 16 * 1024 * 1024 });
+      assert.equal(verified.status, 0, `${verified.stdout}\n${verified.stderr}`);
+    }
     assert.equal(existsSync(join(output, "dist", "tests")), false);
     const launcher = join(output, "posixloom.exe");
     const env = { ...process.env, POSIXLOOM_RUN_ROOT: output, POSIXLOOM_DATA_ROOT: join(fixture, "consumer data"), POSIXLOOM_UPDATE_FEED_URL: "" };

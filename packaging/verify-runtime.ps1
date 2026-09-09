@@ -45,10 +45,12 @@ function Get-Sha256Hex([string]$Path) {
 # ---- 定位启动器并读取 Runtime 身份 ----
 # 依次校验：包根不是 reparse point、runtime\current 指针格式合法、
 # 对应版本的 manifest 存在且身份字段（清单版本/ID/模式）自洽。
-$posixloom = Join-Path (Resolve-Path $PackageRoot).Path 'posixloom.exe'
+$packageItem = Get-Item -LiteralPath $PackageRoot -Force
+# Get-ChildItem expands 8.3 ancestors (for example RUNNER~1 in TEMP).
+# Use the same long path for prefix checks and relative-path offsets.
+$package = $packageItem.FullName
+$posixloom = Join-Path $package 'posixloom.exe'
 if (!(Test-Path -LiteralPath $posixloom)) { throw "posixloom.exe not found: $posixloom" }
-$package = (Resolve-Path $PackageRoot).Path
-$packageItem = Get-Item -LiteralPath $package -Force
 if (($packageItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw "Package root cannot be a reparse point: $package" }
 $packagePrefix = $package.TrimEnd('\') + '\'
 $pointerPath = Join-Path $package 'runtime\current'

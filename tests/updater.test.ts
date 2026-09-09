@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash, generateKeyPairSync, sign } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync, type FSWatcher } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -15,6 +15,19 @@ function sha256(contents: Buffer | string): string {
 
 function treeSha256(entries: Array<[string, Buffer]>): string {
   return sha256(entries.sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0).map(([name, contents]) => `${name}\0${sha256(contents)}\n`).join(""));
+}
+
+/** Exercise the same alias shape returned by %TEMP% on Windows CI runners. */
+function shortPath(path: string): string {
+  const powershell = join(process.env.SystemRoot ?? "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+  return execFileSync(powershell, ["-NoProfile", "-NonInteractive", "-Command", [
+    "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)",
+    "Add-Type -TypeDefinition 'using System; using System.Text; using System.Runtime.InteropServices; public static class ShortPath { [DllImport(\"kernel32.dll\", CharSet=CharSet.Unicode, SetLastError=true)] public static extern uint GetShortPathName(string path, StringBuilder output, uint length); }'",
+    "$buffer = [System.Text.StringBuilder]::new(32768)",
+    "$size = [ShortPath]::GetShortPathName($env:POSIXLOOM_TEST_LONG_PATH, $buffer, $buffer.Capacity)",
+    "if ($size -eq 0 -or $size -ge $buffer.Capacity) { throw 'GetShortPathName failed' }",
+    "$buffer.ToString()",
+  ].join("; ")], { encoding: "utf8", windowsHide: true, env: { ...process.env, POSIXLOOM_TEST_LONG_PATH: path } }).trim();
 }
 
 test("update feed signatures cover canonical signed metadata", () => {
@@ -76,8 +89,9 @@ test("relative update archives resolve beside a Windows local feed", { skip: pro
   assert.equal(resolveUpdateResource("https://updates.example.test/stable/feed.json", "runtime.zip"), "https://updates.example.test/stable/runtime.zip");
 });
 
-test("release Runtime update checks cannot disable signature verification", async () => {
+test("release Runtime update checks cannot disable signature verification", async (context) => {
   const runtime = await RuntimeManager.create(process.cwd());
+  context.after(() => runtime.close());
   runtime.snapshot.manifest.mode = "release";
   runtime.config.runtime.updates.feedUrl = "unused.json";
   runtime.config.runtime.updates.requireSignature = false;
@@ -97,9 +111,11 @@ test("Runtime selection restores the prior pointer when update state commit fail
   const fixture = mkdtempSync(join(tmpdir(), "posixloom-update-transaction-"));
   const dataRoot = join(fixture, "data");
   const previousDataRoot = process.env.POSIXLOOM_DATA_ROOT;
+  const runtimes: RuntimeManager[] = [];
   try {
     process.env.POSIXLOOM_DATA_ROOT = dataRoot;
     const runtime = await RuntimeManager.create(process.cwd());
+    runtimes.push(runtime);
     const pointer = join(dataRoot, "runtime", "current");
     mkdirSync(join(dataRoot, "runtime"), { recursive: true });
     writeFileSync(pointer, "runtime-old");
@@ -112,6 +128,7 @@ test("Runtime selection restores the prior pointer when update state commit fail
     );
     assert.equal(readFileSync(pointer, "utf8"), "runtime-old");
   } finally {
+    await Promise.all(runtimes.map((runtime) => runtime.close()));
     if (previousDataRoot === undefined) delete process.env.POSIXLOOM_DATA_ROOT;
     else process.env.POSIXLOOM_DATA_ROOT = previousDataRoot;
     rmSync(fixture, { recursive: true, force: true });
@@ -121,9 +138,11 @@ test("Runtime selection restores the prior pointer when update state commit fail
 test("stale update lock recovery cannot delete a replacement lock", async () => {
   const fixture = mkdtempSync(join(tmpdir(), "posixloom-update-lock-"));
   const previousDataRoot = process.env.POSIXLOOM_DATA_ROOT;
+  const runtimes: RuntimeManager[] = [];
   try {
     process.env.POSIXLOOM_DATA_ROOT = fixture;
     const runtime = await RuntimeManager.create(process.cwd());
+    runtimes.push(runtime);
     const updater = new RuntimeUpdater(runtime) as any;
     const lockPath = join(fixture, "updates", "update.lock");
     const first = await updater.acquireLock(lockPath);
@@ -135,14 +154,15 @@ test("stale update lock recovery cannot delete a replacement lock", async () => 
     await replacement.release();
     assert.equal(existsSync(lockPath), false);
   } finally {
+    await Promise.all(runtimes.map((runtime) => runtime.close()));
     if (previousDataRoot === undefined) delete process.env.POSIXLOOM_DATA_ROOT;
     else process.env.POSIXLOOM_DATA_ROOT = previousDataRoot;
     rmSync(fixture, { recursive: true, force: true });
   }
 });
 
-test("runtime updater validates, installs and atomically selects a complete Runtime", { skip: process.platform !== "win32" }, async () => {
-  const fixture = mkdtempSync(join(tmpdir(), "posixloom-update-"));
+test("runtime updater validates, installs and watches a complete Runtime through a Windows short path", { skip: process.platform !== "win32" }, async () => {
+  const fixture = shortPath(mkdtempSync(join(tmpdir(), "posixloom-update-")));
   const runRoot = join(fixture, "run");
   const dataRoot = join(fixture, "data");
   const workspace = join(fixture, "工作 空间");
@@ -151,6 +171,7 @@ test("runtime updater validates, installs and atomically selects a complete Runt
   const maliciousArchive = join(fixture, "runtime-malicious.zip");
   const previousDataRoot = process.env.POSIXLOOM_DATA_ROOT;
   const previousHost = process.env.POSIXLOOM_NATIVE_HOST;
+  const runtimes: RuntimeManager[] = [];
   try {
     mkdirSync(join(runRoot, "config"), { recursive: true });
     mkdirSync(join(runRoot, "runtime", "versions", "runtime-dev"), { recursive: true });
@@ -251,6 +272,7 @@ test("runtime updater validates, installs and atomically selects a complete Runt
     process.env.POSIXLOOM_DATA_ROOT = dataRoot;
     process.env.POSIXLOOM_NATIVE_HOST = join(process.cwd(), "native", "posixloom-host", "target", "debug", "posixloom.exe");
     const runtime = await RuntimeManager.create(runRoot);
+    runtimes.push(runtime);
     runtime.snapshot.manifest.runtimeSemver = "999.0.0";
     (runtime as any).recoveryRequired = true;
     const maliciousBytes = readFileSync(maliciousArchive);
@@ -287,6 +309,7 @@ test("runtime updater validates, installs and atomically selects a complete Runt
     assert.equal(result.status, "installed");
     assert.equal(readFileSync(join(dataRoot, "runtime", "current"), "utf8"), manifest.runtimeId);
     const selected = await RuntimeManager.create(runRoot);
+    runtimes.push(selected);
     assert.equal(selected.snapshot.runtimeId, manifest.runtimeId);
     assert.equal(selected.snapshot.source, "data");
     const integrityTarget = join(dataRoot, "runtime", "versions", manifest.runtimeId, "native", "rg", "rg.exe");
@@ -299,9 +322,15 @@ test("runtime updater validates, installs and atomically selects a complete Runt
     assert.equal(rollback.runtimeId, "runtime-dev");
     assert.equal(existsSync(join(dataRoot, "runtime", "current")), false);
     const restored = await RuntimeManager.create(runRoot);
+    runtimes.push(restored);
     assert.equal(restored.snapshot.runtimeId, "runtime-dev");
     assert.equal(restored.snapshot.source, "development");
-    selected.dispose();
+    const watcher = (selected as unknown as { integrityWatcher?: FSWatcher }).integrityWatcher;
+    assert.ok(watcher, "release integrity monitoring remains enabled for a short-path Runtime");
+    let watcherClosed = false;
+    watcher.once("close", () => { watcherClosed = true; });
+    await selected.close();
+    assert.equal(watcherClosed, true, "Runtime close drains its filesystem watcher before directory cleanup");
     writeFileSync(join(dataRoot, "updates", "state.json"), JSON.stringify({ history: [{ runtimeId: "runtime-missing", source: "bundled" }] }));
     await assert.rejects(
       () => new RuntimeUpdater(restored).rollback(),
@@ -310,6 +339,7 @@ test("runtime updater validates, installs and atomically selects a complete Runt
     writeFileSync(join(dataRoot, "updates", "state.json"), JSON.stringify({ history: [{ runtimeId: "../../outside", source: "data" }] }));
     await assert.rejects(() => new RuntimeUpdater(restored).rollback(), /Unable to read update state/);
   } finally {
+    await Promise.all(runtimes.map((runtime) => runtime.close()));
     if (previousDataRoot === undefined) delete process.env.POSIXLOOM_DATA_ROOT;
     else process.env.POSIXLOOM_DATA_ROOT = previousDataRoot;
     if (previousHost === undefined) delete process.env.POSIXLOOM_NATIVE_HOST;

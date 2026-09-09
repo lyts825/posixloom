@@ -7,7 +7,7 @@ import { buildNativeEnv, buildPosixEnv } from "../core/env.js";
 import { PosixLoomError } from "../core/errors.js";
 import { runProcess } from "../core/process.js";
 import { DEFAULT_NATIVE_ADAPTERS, DEFAULT_REGISTRY } from "../core/registry.js";
-import { buildShellScript, toMixedPath } from "../core/shell.js";
+import { buildShellScript, canonicalShellHostPath, toMixedPath } from "../core/shell.js";
 import { shellNamespaceIdentity } from "../core/shell-namespace.js";
 import type { ExecutionPlan, MountBootstrap, NativeExecutionPlan, ShellExecutionPlan } from "../core/types.js";
 import {
@@ -178,6 +178,7 @@ const shellBackend: ExecutionBackend = {
     if (process.platform === "win32" && !hostPath) throw new PosixLoomError("NATIVE_HOST_MISSING", "Windows Shell execution requires the Native Host for shared MSYS mounts and process-tree isolation; run npm run build:host or use a complete Runtime");
     const shellNamespace = process.platform === "win32" ? shellNamespaceIdentity(plan.bashExecutable) : undefined;
     try {
+      const temporaryDirectory = canonicalShellHostPath(runtime.mountTable.toHost("/tmp"));
       return await runProcess({
         program: plan.bashExecutable,
         shellNamespace,
@@ -187,7 +188,7 @@ const shellBackend: ExecutionBackend = {
         // '/tmp' here would resolve against the current drive (e.g. C:\\tmp).
         // Supply the real host directory for bootstrap; the wrapper then restores
         // the declared POSIX environment so user commands still see TMP=/tmp.
-        env: { ...plan.envPosix, TMP: runtime.mountTable.toHost("/tmp"), TEMP: runtime.mountTable.toHost("/tmp"), TMPDIR: runtime.mountTable.toHost("/tmp") },
+        env: { ...plan.envPosix, TMP: temporaryDirectory, TEMP: temporaryDirectory, TMPDIR: temporaryDirectory },
         timeoutMs: plan.timeoutMs,
         cancelGraceMs: runtime.config.runtime.process.cancelGraceMs,
         input: plan.terminal ? undefined : buildShellScript(plan),
