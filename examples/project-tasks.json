@@ -1,0 +1,28 @@
+{
+  "schemaVersion": 1,
+  "tasks": [
+    {
+      "id": "report",
+      "title": "Generate a project report",
+      "parameters": {
+        "mode": { "type": "enum", "values": ["quick", "full"], "default": "quick" },
+        "title": { "type": "string", "default": "Workspace report" }
+      },
+      "steps": [
+        {
+          "id": "inspect",
+          "input": { "kind": "argv", "argv": ["git", "status", "--short"] },
+          "timeoutMs": 30000
+        },
+        {
+          "id": "write-report",
+          "input": {
+            "kind": "argv",
+            "argv": ["node", "-e", "const fs=require('node:fs');fs.mkdirSync('artifacts',{recursive:true});fs.writeFileSync('artifacts/project-report.json',JSON.stringify({title:process.argv[1],mode:process.argv[2],generatedAt:new Date().toISOString()},null,2));console.log('Report ready')", "${title}", "${mode}"]
+          }
+        }
+      ],
+      "artifacts": ["/workspace/artifacts/project-report.json"]
+    }
+  ]
+}

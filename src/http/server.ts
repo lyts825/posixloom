@@ -11,6 +11,7 @@ import { PosixLoomError, asPosixLoomError } from "../core/errors.js";
 import { parseExecutionRequest, executionRequestSchema, type ExecutionRequest } from "../core/execution-request.js";
 import { IdempotencyStore, requestFingerprint, type Receipt } from "./idempotency.js";
 import { openApiDocument } from "./openapi.js";
+import { WorkbenchHttp, isWorkbenchRoute, WORKBENCH_CAPABILITIES } from "./workbench.js";
 import { summarizeTraces } from "../core/trace-summary.js";
 import type { ProcessOutputEvent } from "../core/process.js";
 import { RuntimeManager } from "../core/runtime.js";
@@ -96,10 +97,14 @@ function statusFor(error: PosixLoomError): number {
   if (error.code === "HTTP_FORBIDDEN") return 403;
   if (error.code === "HTTP_NOT_FOUND" || error.code === "SESSION_NOT_FOUND" || error.code.endsWith("_NOT_FOUND") || error.code.endsWith("_NOT_INSTALLED")) return 404;
   if (error.code === "HTTP_METHOD_NOT_ALLOWED") return 405;
-  if (error.code === "HTTP_BODY_TOO_LARGE") return 413;
-  if (error.code === "STATE_CONFLICT" || error.code === "SESSION_BUSY" || error.code.startsWith("IDEMPOTENCY_")) return 409;
+  if (error.code === "HTTP_BODY_TOO_LARGE" || error.code === "STATE_FILE_TOO_LARGE" || error.code === "TERMINAL_INPUT_TOO_LARGE") return 413;
+  if (error.code === "STATE_CONFLICT" || error.code === "SESSION_BUSY" || error.code === "JOB_STORE_LOCKED" || error.code === "JOB_BUSY" || error.code.startsWith("IDEMPOTENCY_") || error.code === "TERMINAL_CLOSED") return 409;
+  if (["JOB_NOT_RUNNING", "TERMINAL_MODE_REQUIRED", "TERMINAL_INPUT_CLOSED", "JOB_ARTIFACT_CHANGED", "STATE_STORAGE_UNSAFE"].includes(error.code)) return 409;
+  if (error.code.startsWith("POLICY_") || error.code === "ARTIFACT_PATH_DENIED") return 403;
   if (error.code === "SERVER_BUSY" || error.code === "QUEUE_TIMEOUT") return 429;
-  if (error.code === "SESSION_LIMIT_REACHED") return 429;
+  if (["SESSION_LIMIT_REACHED", "JOB_LIMIT_REACHED", "CHECKPOINT_LIMIT_REACHED", "JOB_STORAGE_FULL", "TERMINAL_INPUT_BUFFER_FULL"].includes(error.code)) return 429;
+  if (error.code === "JOB_PATH_DENIED") return 403;
+  if (error.code === "STATE_PATCH_REJECTED") return 400;
   if (error.code.startsWith("HTTP_") || error.code.endsWith("_INVALID") || error.code === "TIMEOUT_INVALID") return 400;
   return 500;
 }
@@ -284,6 +289,7 @@ export async function startRemoteHttpServer(runtime: RuntimeManager, options: Re
     corsOrigins.add(normalized);
   }
   const service = new PosixLoomService(runtime);
+  const workbench = new WorkbenchHttp(service);
   const inflight = new Set<AbortController>();
   const limits = runtime.config.runtime.protocol;
   const receipts = new IdempotencyStore(limits.idempotencyMaxEntries, limits.idempotencyTtlMs, limits.idempotencyMaxBytes);
@@ -363,7 +369,33 @@ export async function startRemoteHttpServer(runtime: RuntimeManager, options: Re
 
       if ((url.pathname === "/api/v1" || url.pathname === "/api/v1/capabilities") && method === "GET") {
         const extensionCapabilities = (options.extensions ?? []).flatMap((extension) => extension.capabilities);
-        await sendJson(response, 200, { apiVersion: HTTP_API_VERSION, transport: "http-json", streaming: "application/x-ndjson", capabilities: ["sessions", "execute", "execute-plan", "stream-output", "runtime", "traces", "trace-summary", "metrics", "idempotency-v1", "schema", ...new Set(extensionCapabilities)], limits: { ...limits, ...runtime.config.runtime.process }, requestId });
+        await sendJson(response, 200, { apiVersion: HTTP_API_VERSION, transport: "http-json", streaming: "application/x-ndjson", capabilities: ["sessions", "execute", "execute-plan", "stream-output", "runtime", "traces", "trace-summary", "metrics", "idempotency-v1", "schema", ...WORKBENCH_CAPABILITIES, ...new Set(extensionCapabilities)], limits: { ...limits, ...runtime.config.runtime.process, jobs: runtime.config.runtime.jobs }, requestId });
+        return;
+      }
+      if (isWorkbenchRoute(url.pathname)) {
+        const body = method === "POST" ? await readJson(request, maximumBody, true) : {};
+        const headerKey = method === "POST" && url.pathname === "/api/v1/jobs" ? request.headers["idempotency-key"] : undefined;
+        if (headerKey !== undefined && typeof headerKey !== "string") throw new PosixLoomError("HTTP_IDEMPOTENCY_INVALID", "Idempotency-Key must be a single header");
+        const key = headerKey;
+        if (key !== undefined) {
+          const prior = receipts.begin(key, requestFingerprint({ ...body, resource: "jobs" }));
+          if (prior.replayed) {
+            response.setHeader("idempotency-replayed", "true");
+            await sendJson(response, prior.receipt!.status, { ...prior.receipt!.body, requestId });
+            return;
+          }
+        }
+        let result;
+        try { result = await workbench.handle(method, url, body, clientId); }
+        catch (error) {
+          if (key !== undefined) {
+            const normalized = asPosixLoomError(error, "HTTP_WORKBENCH_FAILED");
+            receipts.complete(key, { status: statusFor(normalized), body: { error: { code: normalized.code, message: normalized.message, details: normalized.details } } });
+          }
+          throw error;
+        }
+        if (key !== undefined) receipts.complete(key, result);
+        await sendJson(response, result.status, { ...result.body, requestId });
         return;
       }
       if (url.pathname === "/api/v1/metrics" && method === "GET") {
@@ -564,6 +596,8 @@ export async function startRemoteHttpServer(runtime: RuntimeManager, options: Re
         if (!response.headersSent) response.setHeader("connection", "close");
       }
       for (const controller of inflight) controller.abort();
+      const workbenchClosed = workbench.close();
+      void workbenchClosed.catch(() => undefined);
       closePromise = new Promise<void>((resolve, reject) => {
         if (!server.listening) { resolve(); return; }
         const deadline = setTimeout(() => {
@@ -572,7 +606,7 @@ export async function startRemoteHttpServer(runtime: RuntimeManager, options: Re
         }, runtime.config.runtime.process.cancelGraceMs + runtime.config.runtime.process.outputDrainTimeoutMs);
         server.close((error) => { clearTimeout(deadline); error ? reject(error) : resolve(); });
         server.closeIdleConnections();
-      }).then(async () => { await Promise.allSettled(requestTasks); await service.flushTraces(); });
+      }).then(async () => { await workbenchClosed; await Promise.allSettled(requestTasks); await service.flushTraces(); });
       return closePromise;
     },
   };

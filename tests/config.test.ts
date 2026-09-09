@@ -30,8 +30,11 @@ test("config paths remain discoverable and reject the unimplemented persistence 
   assert.equal(loaded.runtime.process.maxReportBytes, 1024 * 1024);
   assert.equal(loaded.runtime.process.maxConcurrent, 8);
   assert.equal(loaded.runtime.protocol.replayWindowSize, 10000);
+  assert.equal(loaded.runtime.jobs.maxLogBytes, 64 * 1024 * 1024);
+  assert.equal(loaded.runtime.jobs.retentionMs, 604800000);
   assert.equal(loaded.runtime.observability.traceMaxPendingBytes, 1024 * 1024);
   for (const invalid of [
+    { jobs: null }, { jobs: { maxJobs: 0 } }, { jobs: { maxTotalBytes: -1 } }, { jobs: { retentionMs: 2147483648 } },
     { process: { maxConcurrent: 0 } }, { process: { maxQueued: -1 } }, { process: { queueTimeoutMs: 2147483648 } },
     { protocol: { maxPendingRequests: 0 } }, { protocol: { idempotencyTtlMs: 0 } }, { protocol: { replayWindowSize: 0 } },
     { observability: { traceMaxFileBytes: 0 } }, { observability: { traceRetainedFiles: -1 } }, { observability: { collectCommandNames: "false" } },

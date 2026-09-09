@@ -118,6 +118,15 @@ export interface RuntimeConfig {
     /** 会话无活动多久后可被回收（毫秒）。 */
     idleTimeoutMs: number;
   };
+  /** Durable job history, output spool and artifact retention limits. */
+  jobs: {
+    maxJobs: number;
+    maxActiveJobs: number;
+    maxLogBytes: number;
+    maxArtifactBytes: number;
+    maxTotalBytes: number;
+    retentionMs: number;
+  };
   /** 进程块：超时、取消宽限与数据限额，构成命令执行的资源安全边界。 */
   process: {
     maxConcurrent: number;

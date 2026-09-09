@@ -46,6 +46,12 @@ export async function startGuiServer(options: GuiServerOptions): Promise<GuiServ
     ["/app.css", "app.css", "text/css; charset=utf-8"],
     ["/app.js", "app.js", "text/javascript; charset=utf-8"],
     ["/console-output.js", "console-output.js", "text/javascript; charset=utf-8"],
+    ["/workbench.js", "workbench.js", "text/javascript; charset=utf-8"],
+    ["/vendor/xterm/xterm.js", "vendor/xterm/xterm.js", "text/javascript; charset=utf-8"],
+    ["/vendor/xterm/xterm.css", "vendor/xterm/xterm.css", "text/css; charset=utf-8"],
+    ["/vendor/xterm/addon-fit.js", "vendor/xterm/addon-fit.js", "text/javascript; charset=utf-8"],
+    ["/vendor/xterm/xterm-LICENSE", "vendor/xterm/xterm-LICENSE", "text/plain; charset=utf-8"],
+    ["/vendor/xterm/addon-fit-LICENSE", "vendor/xterm/addon-fit-LICENSE", "text/plain; charset=utf-8"],
     ["/favicon.svg", "favicon.svg", "image/svg+xml"],
   ];
   const assets = new Map<string, GuiAsset>();
@@ -54,7 +60,9 @@ export async function startGuiServer(options: GuiServerOptions): Promise<GuiServ
   }));
   const configuration = Buffer.from(`${JSON.stringify({ apiVersion: 1, apiBaseUrl: apiUrl.origin, product: "PosixLoom" })}\n`);
   const connectSource = apiUrl.origin === "null" ? "" : ` ${apiUrl.origin}`;
-  const contentSecurityPolicy = `default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'${connectSource}; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'`;
+  // xterm's renderer creates measured character/theme styles at runtime. Scripts
+  // remain restricted to local assets; the exception is limited to CSS.
+  const contentSecurityPolicy = `default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'${connectSource}; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'`;
 
   const server: Server = createServer((request, response) => {
     response.setHeader("x-content-type-options", "nosniff");

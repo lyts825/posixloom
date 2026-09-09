@@ -168,7 +168,7 @@ export class PosixLoomService {
   }
 
   /** 创建新会话（默认虚拟 cwd 为 /workspace），返回会话 ID。 */
-  createSession(cwd = "/workspace"): string {
+  createSession(cwd = "/workspace", exportedEnv?: Record<string, string>): string {
     let normalizedCwd: string;
     try {
       normalizedCwd = normalizeVirtual(cwd);
@@ -186,7 +186,7 @@ export class PosixLoomService {
     } catch (error) {
       throw new PosixLoomError("SESSION_CWD_INVALID", "Session cwd does not resolve to an allowed existing directory", { cwd: normalizedCwd, cause: String(error) });
     }
-    return this.sessions.create(normalizedCwd);
+    return this.sessions.create(normalizedCwd, exportedEnv);
   }
 
   /** List live process-local sessions without extending their idle lifetime. */

@@ -1,4 +1,5 @@
 import { executionRequestSchema } from "../core/execution-request.js";
+import { workbenchSchemas, workbenchPaths } from "./workbench-openapi.js";
 
 const string = { type: "string" };
 const boolean = { type: "boolean" };
@@ -66,9 +67,10 @@ export const openApiDocument = {
   security: [{ bearerAuth: [] }],
   components: {
     securitySchemes: { bearerAuth: { type: "http", scheme: "bearer" } },
-    schemas: { ExecutionRequest: { ...executionRequestSchema, properties: { ...executionRequestSchema.properties, terminal: false } }, ...responseSchemas },
+    schemas: { ExecutionRequest: { ...executionRequestSchema, properties: { ...executionRequestSchema.properties, terminal: false } }, ...responseSchemas, ...workbenchSchemas },
   },
   paths: {
+    ...workbenchPaths,
     "/api/v1/health": { get: { security: [], responses: { "200": genericResponse } } },
     ...Object.fromEntries(["capabilities", "runtime", "runtime/doctor", "traces", "traces/summary", "metrics", "schema", "openapi.json"].map((name) => [`/api/v1/${name}`, { get: { responses: { ...errors, "200": genericResponse } } }])),
     "/api/v1/sessions": {

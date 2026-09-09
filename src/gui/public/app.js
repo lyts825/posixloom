@@ -1,4 +1,5 @@
-import { bytesFromBase64, consumeNdjson, createTerminalView } from "./console-output.js";
+import { bytesFromBase64, createTerminalView } from "./console-output.js";
+import { activeJob, jobStatus, storageKey, readSessionState, rememberSession, taskParameters, textToBase64, JobEventCursor } from "./workbench.js";
 
 const byId = (id) => document.getElementById(id);
 
@@ -39,6 +40,7 @@ const elements = {
   toast: byId("toast"),
   tokenInput: byId("tokenInput"),
 };
+for (const id of ["sessionSelect", "checkpointName", "checkpointEnvKeys", "checkpointList", "saveCheckpointButton", "forkSessionButton", "interactiveMode", "artifactPaths", "timeoutInput", "interactiveTerminal", "terminalInputForm", "terminalInput", "terminalEofButton", "terminalInterruptButton", "outputModeButton", "jobDetails", "jobTitle", "jobStatus", "jobCaption", "jobSteps", "jobArtifacts", "jobList", "allHistory", "refreshHistoryButton", "taskSelect", "taskDescription", "taskParameters", "taskStepsPreview", "taskRunForm", "runTaskButton", "refreshTasksButton", "taskManifest", "taskManifestError", "taskExampleButton", "saveTasksButton", "tasksLocation", "diagnosticsButton", "jobDiagnosticsButton"]) elements[id] = byId(id);
 
 const terminal = createTerminalView({ output: elements.terminalOutput, scroll: elements.terminalScroll, notice: elements.terminalNotice, latest: elements.latestOutputButton });
 terminal.clear();
@@ -48,13 +50,22 @@ const state = {
   apiBaseUrl: "",
   capabilities: [],
   connected: false,
-  controller: null,
   executing: false,
+  submitting: false,
   mode: "text",
   pluginFilter: "all",
   plugins: [],
   sessionId: null,
-  token: sessionStorage.getItem("posixloom-token") || "",
+  token: "",
+  sessions: [],
+  jobs: [],
+  tasks: [],
+  selectedJob: null,
+  followVersion: 0,
+  sessionVersion: 0,
+  pollTimer: null,
+  interactive: null,
+  terminalVisible: false,
 };
 
 class ApiError extends Error {
@@ -138,6 +149,8 @@ function navigate(view) {
   elements.mobileNavButton.setAttribute("aria-expanded", "false");
   location.hash = view;
   if (view === "plugins" && state.capabilities.includes("plugins")) void loadPlugins();
+  if (view === "tasks") void loadTasks();
+  if (view === "console") requestAnimationFrame(() => fitTerminal());
 }
 
 function setMode(mode) {
@@ -170,6 +183,7 @@ function commandRequest(stream = false) {
 
 function clearTerminal() {
   terminal.clear();
+  state.interactive?.terminal.clear();
   elements.routeChip.hidden = true;
   elements.executionTime.textContent = "就绪";
 }
@@ -180,113 +194,356 @@ function appendTerminal(text, className = "") {
 
 function setExecuting(executing) {
   state.executing = executing;
-  elements.runButton.disabled = executing;
-  elements.explainButton.disabled = executing;
+  elements.runButton.disabled = executing || state.submitting;
+  elements.explainButton.disabled = executing || state.submitting;
   elements.cancelButton.hidden = !executing;
-  elements.newSessionButton.disabled = executing;
+  elements.terminalInput.disabled = !executing;
+  elements.terminalEofButton.disabled = !executing;
+  elements.terminalInterruptButton.disabled = !executing;
 }
 
 async function ensureSession(replace = false) {
   if (state.sessionId && !replace) return state.sessionId;
-  const previous = state.sessionId;
-  if (previous && replace) void api(`/api/v1/sessions/${encodeURIComponent(previous)}`, { method: "DELETE" }).catch(() => undefined);
+  const version = ++state.sessionVersion;
   const payload = await api("/api/v1/sessions", {
     method: "POST",
     body: JSON.stringify({ cwd: elements.cwdInput.value || "/workspace" }),
   });
-  state.sessionId = payload.sessionId;
-  elements.sessionLabel.textContent = payload.sessionId;
-  elements.sessionLabel.title = payload.sessionId;
-  elements.cwdInput.value = payload.state.cwd;
+  if (version !== state.sessionVersion) { adoptSession(payload, false); return payload.sessionId; }
+  adoptSession(payload);
+  if (replace) resetSelectedJob();
+  await loadJobs();
   return payload.sessionId;
 }
 
 async function refreshSession() {
   if (!state.sessionId) return;
+  const id = state.sessionId;
   try {
-    const payload = await api(`/api/v1/sessions/${encodeURIComponent(state.sessionId)}`);
-    elements.cwdInput.value = payload.state.cwd;
+    const payload = await api(`/api/v1/sessions/${encodeURIComponent(id)}`);
+    if (id === state.sessionId) adoptSession({ ...payload, sessionId: id });
   } catch (error) {
-    if (error instanceof ApiError && error.status === 404) await ensureSession(true);
+    if (id === state.sessionId && error instanceof ApiError && error.status === 404) await ensureSession(true);
   }
 }
 
-async function runCommand() {
-  if (state.executing) return;
-  let body;
+function persistSessions() {
+  try { sessionStorage.setItem(storageKey(state.apiBaseUrl), JSON.stringify({ sessions: state.sessions, selected: state.sessionId })); } catch { /* Private storage may be unavailable. */ }
+}
+
+function adoptSession(payload, select = true) {
+  const remembered = rememberSession({ sessions: state.sessions }, payload);
+  state.sessions = remembered.sessions;
+  if (select || !state.sessionId) state.sessionId = remembered.selected;
+  elements.sessionLabel.textContent = state.sessionId;
+  elements.sessionLabel.title = state.sessionId;
+  if (select) elements.cwdInput.value = payload.state?.cwd || payload.cwd || "/workspace";
+  elements.sessionSelect.replaceChildren();
+  for (const item of state.sessions) {
+    const option = createElement("option", "", `${item.cwd} · ${item.sessionId.slice(0, 12)}`);
+    option.value = item.sessionId;
+    option.title = item.sessionId;
+    elements.sessionSelect.append(option);
+  }
+  elements.sessionSelect.value = state.sessionId;
+  persistSessions();
+}
+
+function resetSelectedJob() {
+  state.followVersion += 1;
+  clearTimeout(state.pollTimer);
+  state.selectedJob = null;
+  state.interactive?.terminal.dispose();
+  state.interactive?.observer?.disconnect();
+  state.interactive?.clearResize();
+  state.interactive = null;
+  elements.interactiveTerminal.replaceChildren();
+  elements.interactiveTerminal.hidden = true;
+  elements.terminalScroll.hidden = false;
+  elements.terminalInputForm.hidden = true;
+  elements.outputModeButton.hidden = true;
+  elements.jobDetails.hidden = true;
+  setExecuting(false);
+  clearTerminal();
+}
+
+async function selectSession(id) {
+  const version = ++state.sessionVersion;
   try {
-    body = commandRequest(true);
-    await ensureSession();
+    const payload = await api(`/api/v1/sessions/${encodeURIComponent(id)}`);
+    if (version !== state.sessionVersion) return;
+    resetSelectedJob();
+    adoptSession({ ...payload, sessionId: id });
+    await loadJobs();
+    const latest = state.jobs.find((job) => job.sessionId === id);
+    if (latest) await selectJob(latest.jobId);
   } catch (error) {
-    toast(errorText(error), "error");
+    if (version !== state.sessionVersion) return;
+    elements.sessionSelect.value = state.sessionId || "";
+    if (error.status === 404) toast("此会话已失效，可从快照恢复或创建新会话。", "error");
+    else toast(errorText(error), "error");
+  }
+}
+
+function terminalRequest(jobId, action, body = {}) {
+  return api(`/api/v1/jobs/${encodeURIComponent(jobId)}/${action}`, { method: "POST", body: JSON.stringify(body) });
+}
+
+function fitTerminal() {
+  const interactive = state.interactive;
+  if (!interactive || !state.terminalVisible || !elements.interactiveTerminal.clientWidth) return;
+  interactive.fit.fit();
+}
+
+function showTerminal(visible) {
+  state.terminalVisible = visible;
+  elements.interactiveTerminal.hidden = !visible;
+  elements.terminalScroll.hidden = visible;
+  elements.outputModeButton.textContent = visible ? "查看日志" : "查看终端";
+  requestAnimationFrame(() => { fitTerminal(); if (visible) state.interactive?.terminal.focus(); });
+}
+
+function openInteractive(job) {
+  if (!globalThis.Terminal || !globalThis.FitAddon) {
+    toast("终端组件未加载，请刷新页面。日志仍可查看。", "error");
     return;
   }
-  clearTerminal();
-  setExecuting(true);
-  const started = performance.now();
-  const controller = new AbortController();
-  state.controller = controller;
-  const stdoutDecoder = new TextDecoder();
-  const stderrDecoder = new TextDecoder();
+  const screen = new globalThis.Terminal({ convertEol: false, cursorBlink: true, fontSize: 13, fontFamily: '"Cascadia Code", Consolas, monospace', scrollback: 2000, theme: { background: "#0c0f14", foreground: "#edf1f6", cursor: "#56e39f" }, allowProposedApi: false });
+  const fit = new globalThis.FitAddon.FitAddon();
+  screen.loadAddon(fit);
+  elements.interactiveTerminal.hidden = false;
+  screen.open(elements.interactiveTerminal);
+  let inputQueue = Promise.resolve();
+  screen.onData((text) => {
+    if (!activeJob(state.selectedJob) || state.selectedJob.jobId !== job.jobId) return;
+    inputQueue = inputQueue.then(() => terminalRequest(job.jobId, "input", { dataBase64: textToBase64(text) })).catch((error) => toast(errorText(error), "error"));
+  });
+  let resizeTimer;
+  screen.onResize(({ cols, rows }) => {
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(() => {
+      if (activeJob(state.selectedJob) && state.selectedJob.jobId === job.jobId) void terminalRequest(job.jobId, "resize", { columns: cols, rows }).catch((error) => toast(errorText(error), "error"));
+    }, 150);
+  });
+  const observer = new ResizeObserver(() => fitTerminal());
+  observer.observe(elements.interactiveTerminal);
+  state.interactive = { terminal: screen, fit, observer, clearResize: () => clearTimeout(resizeTimer) };
+  elements.terminalInputForm.hidden = false;
+  elements.outputModeButton.hidden = false;
+  showTerminal(true);
+}
+
+async function runCommand() {
+  if (state.executing || state.submitting) return;
+  state.submitting = true;
+  setExecuting(state.executing);
   try {
-    const headers = new Headers({ accept: "application/x-ndjson", "content-type": "application/json" });
-    if (state.token) headers.set("authorization", `Bearer ${state.token}`);
-    const response = await fetch(`${state.apiBaseUrl}/api/v1/sessions/${encodeURIComponent(state.sessionId)}/execute`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify(body),
-      signal: controller.signal,
-    });
-    if (!response.ok) {
-      let payload = {};
-      try { payload = await response.json(); } catch { /* response is not JSON */ }
-      const remote = payload.error || {};
-      if (response.status === 401) requestToken("令牌无效或已失效，请重新输入。");
-      throw new ApiError(remote.code || `HTTP_${response.status}`, remote.message || response.statusText, response.status, remote.details || {});
-    }
-    if (!response.body) throw new ApiError("STREAM_UNAVAILABLE", "浏览器没有提供响应流。");
-    setConnection("online", "已连接");
-    let finalEvent;
-    const consume = (event) => {
-      if (!event || typeof event !== "object" || finalEvent) throw new ApiError("STREAM_INVALID", "执行流包含无效或重复的事件。");
-      if (event.type === "started") {
-        elements.routeChip.textContent = `${event.preview.commandKind} → ${event.preview.backend}`;
-        elements.routeChip.hidden = false;
-        appendTerminal(`$ ${elements.commandInput.value}\n`, "system");
-      } else if (event.type === "output") {
-        if (event.stream !== "stdout" && event.stream !== "stderr") throw new ApiError("STREAM_INVALID", "执行流包含未知的输出通道。");
-        const decoder = event.stream === "stderr" ? stderrDecoder : stdoutDecoder;
-        const text = decoder.decode(bytesFromBase64(event.dataBase64), { stream: true });
-        appendTerminal(text, event.stream === "stderr" ? "stderr" : "");
-      } else if (event.type === "completed") finalEvent = event;
-      else if (event.type === "error") throw new ApiError(event.error.code, event.error.message, 0, event.error.details);
-      else throw new ApiError("STREAM_INVALID", "执行流包含未知的事件。");
-    };
-    await consumeNdjson(response.body, consume);
-    appendTerminal(stdoutDecoder.decode(), "");
-    appendTerminal(stderrDecoder.decode(), "stderr");
-    if (!finalEvent) throw new ApiError("STREAM_TRUNCATED", "执行流在完成事件之前结束。");
-    const result = finalEvent.result;
-    const outcome = result.command.kind === "exited" ? `exit ${result.command.exitCode}` : result.command.kind;
-    appendTerminal(`\n[${outcome} · ${result.backend}${result.truncated ? " · output truncated" : ""}]\n`, result.command.kind === "exited" && result.command.exitCode === 0 ? "success" : "stderr");
-    elements.executionTime.textContent = `${Math.round(performance.now() - started)} ms`;
-    await refreshSession();
+    const { stream: _stream, ...body } = commandRequest();
+    const timeout = elements.timeoutInput.value.trim();
+    if (timeout && (!Number.isSafeInteger(Number(timeout)) || Number(timeout) < 1)) throw new Error("超时需要填写正整数毫秒。");
+    const artifacts = elements.artifactPaths.value.split(/\r?\n/).map((path) => path.trim()).filter(Boolean);
+    const sessionId = await ensureSession();
+    const version = state.sessionVersion;
+    elements.runButton.disabled = true;
+    const payload = await api("/api/v1/jobs", { method: "POST", headers: { "idempotency-key": crypto.randomUUID() }, body: JSON.stringify({ ...body, sessionId, ...(timeout ? { timeoutMs: Number(timeout) } : {}), ...(artifacts.length ? { artifacts } : {}), ...(elements.interactiveMode.checked ? { terminal: { columns: 100, rows: 24 } } : {}) }) });
+    if (version === state.sessionVersion) await selectJob(payload.job?.jobId || payload.jobId);
+    else { setExecuting(activeJob(state.selectedJob)); toast("任务已在原会话启动，可在全部会话历史中查看。"); }
+    await loadJobs();
   } catch (error) {
-    // Decoder/protocol failures must close the HTTP stream and cancel its process tree too.
-    controller.abort();
-    if (error?.name === "AbortError") {
-      appendTerminal("\n[已请求停止执行]\n", "stderr");
-      elements.executionTime.textContent = "已停止";
-    } else {
-      appendTerminal(`\n[${errorText(error)}]\n`, "stderr");
-      elements.executionTime.textContent = "失败";
-      toast(errorText(error), "error");
-    }
+    toast(errorText(error), "error");
   } finally {
-    terminal.flush();
-    state.controller = null;
-    setExecuting(false);
+    state.submitting = false;
+    setExecuting(activeJob(state.selectedJob));
   }
+}
+
+function stepRequest(step) { return step.request || step; }
+function jobInput(job) { return stepRequest(job.steps?.[0] || {}).input; }
+function inputLabel(input) { return input?.kind === "text" ? input.raw : input?.argv?.join(" ") || ""; }
+
+function renderJob(job) {
+  const unchanged = state.selectedJob?.jobId === job.jobId && job.updatedAt !== undefined && state.selectedJob.updatedAt === job.updatedAt && state.selectedJob.status === job.status;
+  state.selectedJob = job;
+  setExecuting(activeJob(job));
+  if (unchanged) return;
+  elements.jobDetails.hidden = false;
+  elements.jobTitle.textContent = job.label || job.taskId || "命令执行";
+  elements.jobTitle.title = elements.jobTitle.textContent;
+  elements.jobStatus.textContent = jobStatus(job.status);
+  elements.jobStatus.dataset.status = job.status;
+  elements.jobCaption.textContent = `${job.jobId} · 会话 ${job.sessionId} · ${new Date(job.createdAt).toLocaleString()}${job.truncated ? " · 日志达到归档容量上限，后续输出未保存" : ""}${job.error ? ` · ${job.error.message || job.error}` : ""}`;
+  elements.executionTime.textContent = jobStatus(job.status);
+  elements.jobSteps.replaceChildren();
+  for (const [index, step] of (job.steps || []).entries()) {
+    const row = createElement("div", "step-row");
+    const command = inputLabel(stepRequest(step).input);
+    const title = createElement("span", "step-copy", `${index + 1}. ${step.label || step.name || step.id || step.stepId || command || "命令"}`);
+    title.title = command;
+    const outcome = step.outcome?.command || step.outcome;
+    row.append(title, createElement("span", "subtle", `${jobStatus(step.status)}${outcome?.exitCode !== undefined ? ` · exit ${outcome.exitCode}` : ""}`));
+    if (stepRequest(step).input) {
+      const load = createElement("button", "text-button", "载入命令");
+      load.type = "button";
+      load.addEventListener("click", () => loadHistoryCommand(step));
+      row.append(load);
+    }
+    elements.jobSteps.append(row);
+  }
+  elements.jobArtifacts.replaceChildren();
+  for (const artifact of job.artifacts || []) {
+    const download = createElement("button", "artifact-button", `${artifact.name} · ${formatBytes(artifact.size)}`);
+    download.type = "button";
+    download.title = `下载 ${artifact.name}${artifact.sha256 ? `\nSHA256: ${artifact.sha256}` : ""}`;
+    download.addEventListener("click", () => {
+      download.disabled = true;
+      void downloadArtifact(job.jobId, artifact).catch((error) => toast(errorText(error), "error")).finally(() => { download.disabled = false; });
+    });
+    elements.jobArtifacts.append(download);
+  }
+  const artifactErrors = Array.isArray(job.artifactErrors) ? job.artifactErrors : [];
+  for (const failure of artifactErrors.slice(0, 64)) {
+    const notice = createElement("div", "artifact-error");
+    const path = String(failure.virtualPath || "未知文件").slice(0, 512);
+    const code = String(failure.error?.code || "ARTIFACT_FAILED").slice(0, 128);
+    const message = String(failure.error?.message || "无法归档文件").slice(0, 1024);
+    notice.append(createElement("strong", "", `未归档：${path}`), createElement("span", "", `${code}: ${message}`));
+    elements.jobArtifacts.append(notice);
+  }
+  if (artifactErrors.length > 64) elements.jobArtifacts.append(createElement("p", "subtle", `另有 ${artifactErrors.length - 64} 项归档错误未显示。`));
+}
+
+async function selectJob(id) {
+  resetSelectedJob();
+  const version = state.followVersion;
+  const payload = await api(`/api/v1/jobs/${encodeURIComponent(id)}`);
+  if (version !== state.followVersion) return;
+  const job = payload.job;
+  renderJob(job);
+  const hasTerminal = Boolean(job.terminal || job.steps?.some((step) => stepRequest(step).terminal));
+  if (hasTerminal) openInteractive(job);
+  const cursor = new JobEventCursor();
+  let failures = 0;
+  async function consumePage(events) {
+    const screen = state.interactive?.terminal;
+    let pendingBytes = 0;
+    let painted = Promise.resolve();
+    for (const event of events) {
+      if (version !== state.followVersion) return;
+      cursor.consume([event], appendTerminal, (bytes) => {
+        if (!screen) return;
+        pendingBytes += bytes.length;
+        painted = new Promise((resolve) => screen.write(bytes, resolve));
+      });
+      // Keep xterm's asynchronous parser queue bounded during long archived replays.
+      if (pendingBytes >= 256 * 1024) { await painted; pendingBytes = 0; }
+    }
+    await painted;
+  }
+  async function poll() {
+    if (version !== state.followVersion) return;
+    try {
+      const page = await api(`/api/v1/jobs/${encodeURIComponent(id)}/events?after=${cursor.sequence}&limit=256`);
+      if (version !== state.followVersion) return;
+      await consumePage(page.events);
+      if (version !== state.followVersion) return;
+      terminal.flush();
+      if (page.hasMore) { state.pollTimer = setTimeout(() => void poll(), 0); return; }
+      const current = (await api(`/api/v1/jobs/${encodeURIComponent(id)}`)).job;
+      if (version !== state.followVersion) return;
+      renderJob(current);
+      failures = 0;
+      if (activeJob(current)) state.pollTimer = setTimeout(() => void poll(), state.interactive ? 90 : 750);
+      else {
+        // Completion and its last output can occur between the event page and job query.
+        const tail = await api(`/api/v1/jobs/${encodeURIComponent(id)}/events?after=${cursor.sequence}&limit=256`);
+        if (version !== state.followVersion) return;
+        await consumePage(tail.events);
+        if (version !== state.followVersion) return;
+        if (tail.hasMore) { state.pollTimer = setTimeout(() => void poll(), 0); return; }
+        cursor.finish(appendTerminal);
+        terminal.flush();
+        await loadJobs();
+        if (current.sessionId === state.sessionId) await refreshSession();
+      }
+    } catch (error) {
+      if (version !== state.followVersion) return;
+      failures += 1;
+      elements.executionTime.textContent = error.status === 401 ? "等待授权" : "连接中断 · 正在续接";
+      if (failures === 1) toast(errorText(error), "error");
+      if (error.status !== 404) state.pollTimer = setTimeout(() => void poll(), Math.min(1000 * 2 ** Math.min(failures, 4), 15000));
+      else setExecuting(false);
+    }
+  }
+  void poll();
+}
+
+function loadHistoryCommand(step) {
+  const request = stepRequest(step);
+  const input = request.input;
+  if (!input) return;
+  setMode(input.kind);
+  elements.commandInput.value = input.kind === "text" ? input.raw : JSON.stringify(input.argv, null, 2);
+  if (request.cwd) elements.cwdInput.value = request.cwd;
+  elements.interactiveMode.checked = Boolean(request.terminal);
+  elements.timeoutInput.value = request.timeoutMs || "";
+  elements.artifactPaths.value = "";
+  navigate("console");
+  elements.commandInput.focus();
+  toast("已载入历史命令，可编辑后执行。");
+}
+
+async function loadJobs() {
+  const sessionId = state.sessionId;
+  const all = elements.allHistory.checked;
+  const payload = await api(`/api/v1/jobs${all || !sessionId ? "" : `?sessionId=${encodeURIComponent(sessionId)}`}`);
+  if (sessionId !== state.sessionId || all !== elements.allHistory.checked) return;
+  state.jobs = [...(payload.jobs || [])].sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+  elements.jobList.replaceChildren();
+  if (!state.jobs.length) elements.jobList.append(createElement("p", "list-empty", "此会话还没有任务。"));
+  for (const job of state.jobs) {
+    const row = createElement("div", `job-row${state.selectedJob?.jobId === job.jobId ? " selected" : ""}`);
+    const copy = createElement("button", "job-open");
+    copy.type = "button";
+    copy.append(createElement("strong", "", job.label || inputLabel(jobInput(job)) || job.taskId || job.jobId), createElement("small", "", `${new Date(job.createdAt).toLocaleString()} · ${job.sessionId.slice(0, 12)}`));
+    copy.title = "打开执行详情并续读输出";
+    copy.addEventListener("click", () => void selectJob(job.jobId).catch((error) => toast(errorText(error), "error")));
+    const status = createElement("span", "job-status", jobStatus(job.status));
+    status.dataset.status = job.status;
+    row.append(copy, status);
+    if (jobInput(job)) {
+      const load = createElement("button", "text-button", "载入");
+      load.type = "button";
+      load.addEventListener("click", () => loadHistoryCommand(job.steps[0]));
+      row.append(load);
+    }
+    elements.jobList.append(row);
+  }
+}
+
+function formatBytes(size = 0) { return size < 1024 ? `${size} B` : size < 1024 * 1024 ? `${(size / 1024).toFixed(1)} KB` : `${(size / 1024 / 1024).toFixed(1)} MB`; }
+function downloadBlob(blob, name) {
+  const link = createElement("a");
+  const url = URL.createObjectURL(blob);
+  link.href = url;
+  link.download = name;
+  document.body.append(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 60000);
+}
+async function downloadArtifact(jobId, artifact) {
+  const chunks = [];
+  let offset = 0;
+  for (;;) {
+    const part = await api(`/api/v1/jobs/${encodeURIComponent(jobId)}/artifacts/${encodeURIComponent(artifact.artifactId)}?offset=${offset}&limit=262144`);
+    const bytes = bytesFromBase64(part.dataBase64);
+    chunks.push(bytes);
+    offset += bytes.length;
+    if (part.eof) break;
+    if (!bytes.length) throw new Error("产物下载没有前进，请重试。");
+  }
+  downloadBlob(new Blob(chunks, { type: "application/octet-stream" }), artifact.name);
+  toast(`已下载 ${artifact.name}`);
 }
 
 async function explainCommand() {
@@ -295,6 +552,7 @@ async function explainCommand() {
     await ensureSession();
     const payload = await api(`/api/v1/sessions/${encodeURIComponent(state.sessionId)}/explain`, { method: "POST", body: JSON.stringify(body) });
     const plan = payload.preview;
+    if (state.interactive) showTerminal(false);
     clearTerminal();
     elements.routeChip.textContent = `${plan.commandKind} → ${plan.backend}`;
     elements.routeChip.hidden = false;
@@ -312,6 +570,183 @@ async function explainCommand() {
   } catch (error) {
     toast(errorText(error), "error");
   }
+}
+
+async function loadCheckpoints() {
+  const payload = await api("/api/v1/checkpoints");
+  elements.checkpointList.replaceChildren();
+  if (!payload.checkpoints?.length) elements.checkpointList.append(createElement("p", "list-empty", "尚未保存会话快照。"));
+  for (const checkpoint of payload.checkpoints || []) {
+    const row = createElement("div", "checkpoint-row");
+    const copy = createElement("div", "checkpoint-copy");
+    copy.append(createElement("strong", "", checkpoint.name || checkpoint.checkpointId.slice(0, 12)), createElement("small", "subtle", `${checkpoint.cwd} · ${new Date(checkpoint.createdAt).toLocaleString()} · ${(checkpoint.envKeys || []).length} 个环境变量`));
+    const restore = createElement("button", "button secondary", "恢复为新会话");
+    restore.type = "button";
+    restore.addEventListener("click", async () => {
+      restore.disabled = true;
+      const version = ++state.sessionVersion;
+      try {
+        const session = await api(`/api/v1/checkpoints/${encodeURIComponent(checkpoint.checkpointId)}/restore`, { method: "POST", body: "{}" });
+        if (version !== state.sessionVersion) { adoptSession(session, false); toast("快照已恢复，可从会话列表切换。"); return; }
+        resetSelectedJob();
+        adoptSession(session);
+        await loadJobs();
+        toast("快照已恢复为新会话。");
+      } catch (error) { toast(errorText(error), "error"); }
+      finally { restore.disabled = false; }
+    });
+    const remove = createElement("button", "text-button", "删除");
+    remove.type = "button";
+    remove.addEventListener("click", async () => {
+      remove.disabled = true;
+      try {
+        await api(`/api/v1/checkpoints/${encodeURIComponent(checkpoint.checkpointId)}`, { method: "DELETE" });
+        await loadCheckpoints();
+        toast("快照已删除。");
+      } catch (error) { toast(errorText(error), "error"); remove.disabled = false; }
+    });
+    row.append(copy, restore, remove);
+    elements.checkpointList.append(row);
+  }
+}
+
+async function saveCheckpoint() {
+  elements.saveCheckpointButton.disabled = true;
+  try {
+    await ensureSession();
+    const envKeys = [...new Set(elements.checkpointEnvKeys.value.split(/[,\s]+/).filter(Boolean))];
+    const name = elements.checkpointName.value.trim();
+    await api(`/api/v1/sessions/${encodeURIComponent(state.sessionId)}/checkpoint`, { method: "POST", body: JSON.stringify({ ...(name ? { name } : {}), envKeys }) });
+    await loadCheckpoints();
+    toast("会话快照已保存，可在服务重启后恢复。");
+  } catch (error) { toast(errorText(error), "error"); }
+  finally { elements.saveCheckpointButton.disabled = false; }
+}
+
+async function forkSession() {
+  elements.forkSessionButton.disabled = true;
+  try {
+    const sessionId = await ensureSession();
+    const version = ++state.sessionVersion;
+    const session = await api(`/api/v1/sessions/${encodeURIComponent(sessionId)}/fork`, { method: "POST", body: "{}" });
+    if (version !== state.sessionVersion) { adoptSession(session, false); toast("已创建分叉，可从会话列表切换。"); return; }
+    resetSelectedJob();
+    adoptSession(session);
+    await loadJobs();
+    toast("已从当前目录和环境创建独立会话。");
+  } catch (error) { toast(errorText(error), "error"); }
+  finally { elements.forkSessionButton.disabled = false; }
+}
+
+let manifestDirty = false;
+const exampleManifest = {
+  schemaVersion: 1,
+  tasks: [{
+    id: "inspect",
+    title: "检查项目文件",
+    parameters: { target: { type: "string", default: "src", required: true } },
+    steps: [{ id: "files", input: { kind: "argv", argv: ["rg", "--files", "${target}"] }, cwd: "/workspace", statePolicy: "isolated", timeoutMs: 60000 }],
+    artifacts: [],
+  }],
+};
+
+async function loadTasks(replaceEditor = false) {
+  try {
+    const payload = await api("/api/v1/tasks");
+    state.tasks = payload.tasks || payload.manifest?.tasks || [];
+    const selected = elements.taskSelect.value;
+    elements.taskSelect.replaceChildren();
+    const placeholder = createElement("option", "", state.tasks.length ? "选择项目任务" : "还没有任务，可载入右侧示例");
+    placeholder.value = "";
+    elements.taskSelect.append(placeholder);
+    for (const task of state.tasks) {
+      const option = createElement("option", "", task.title || task.id);
+      option.value = task.id;
+      elements.taskSelect.append(option);
+    }
+    if (state.tasks.some((task) => task.id === selected)) elements.taskSelect.value = selected;
+    else if (state.tasks.length === 1) elements.taskSelect.value = state.tasks[0].id;
+    renderTaskParameters();
+    if (replaceEditor || !manifestDirty) {
+      elements.taskManifest.value = JSON.stringify(payload.manifest || { schemaVersion: 1, tasks: state.tasks }, null, 2);
+      manifestDirty = false;
+    }
+    elements.tasksLocation.textContent = payload.path || payload.manifestPath || "";
+  } catch (error) { toast(errorText(error), "error"); }
+}
+
+function renderTaskParameters() {
+  const task = state.tasks.find((candidate) => candidate.id === elements.taskSelect.value);
+  elements.taskParameters.replaceChildren();
+  elements.taskStepsPreview.replaceChildren();
+  elements.runTaskButton.disabled = !task;
+  elements.taskDescription.textContent = task?.description || "选择任务后填写参数，步骤将依次执行，失败时停止。";
+  if (!task) return;
+  for (const [name, definition] of Object.entries(task.parameters || {})) {
+    const label = createElement("label", "form-field", `${name}${definition.required ? " *" : ""}`);
+    const field = createElement(definition.type === "enum" ? "select" : "input");
+    field.dataset.parameter = name;
+    field.name = name;
+    field.required = Boolean(definition.required);
+    if (definition.type === "enum") {
+      if (!definition.required && definition.default === undefined) field.append(createElement("option", "", ""));
+      for (const value of definition.values || []) { const option = createElement("option", "", value); option.value = value; field.append(option); }
+    }
+    field.value = definition.default ?? "";
+    label.append(field);
+    if (definition.description) label.append(createElement("small", "subtle", definition.description));
+    elements.taskParameters.append(label);
+  }
+  for (const [index, step] of (task.steps || []).entries()) {
+    const row = createElement("div", "step-row");
+    row.append(createElement("strong", "", `${index + 1}. ${step.title || step.id}`), createElement("code", "subtle", inputLabel(step.input)));
+    elements.taskStepsPreview.append(row);
+  }
+}
+
+async function runTask(event) {
+  event.preventDefault();
+  if (state.submitting) return;
+  const task = state.tasks.find((candidate) => candidate.id === elements.taskSelect.value);
+  if (!task) return;
+  state.submitting = true;
+  setExecuting(state.executing);
+  elements.runTaskButton.disabled = true;
+  try {
+    const values = Object.create(null);
+    elements.taskParameters.querySelectorAll("[data-parameter]").forEach((field) => { values[field.dataset.parameter] = field.value; });
+    const parameters = taskParameters(task, values);
+    const sessionId = await ensureSession();
+    const version = state.sessionVersion;
+    const payload = await api("/api/v1/jobs", { method: "POST", headers: { "idempotency-key": crypto.randomUUID() }, body: JSON.stringify({ sessionId, taskId: task.id, parameters }) });
+    if (version === state.sessionVersion) { navigate("console"); await selectJob(payload.job?.jobId || payload.jobId); }
+    else toast("任务已在原会话启动，可在全部会话历史中查看。");
+    await loadJobs();
+  } catch (error) { toast(errorText(error), "error"); }
+  finally { state.submitting = false; setExecuting(activeJob(state.selectedJob)); elements.runTaskButton.disabled = false; }
+}
+
+async function saveTasks() {
+  elements.saveTasksButton.disabled = true;
+  elements.taskManifestError.textContent = "";
+  try {
+    let manifest;
+    try { manifest = JSON.parse(elements.taskManifest.value); }
+    catch { throw new Error("任务清单不是有效 JSON，请检查引号、逗号与括号。"); }
+    if (manifest?.schemaVersion !== 1 || !Array.isArray(manifest.tasks)) throw new Error("任务清单需要 schemaVersion: 1 和 tasks 数组。");
+    await api("/api/v1/tasks", { method: "POST", body: JSON.stringify(manifest) });
+    await loadTasks(true);
+    toast("项目任务清单已保存。");
+  } catch (error) { elements.taskManifestError.textContent = errorText(error); }
+  finally { elements.saveTasksButton.disabled = false; }
+}
+
+async function exportDiagnostics(jobId) {
+  try {
+    const report = await api(`/api/v1/diagnostics${jobId ? `?jobId=${encodeURIComponent(jobId)}` : ""}`);
+    downloadBlob(new Blob([JSON.stringify(report, null, 2), "\n"], { type: "application/json" }), `posixloom-diagnostics${jobId ? `-${jobId}` : ""}.json`);
+    toast("已导出脱敏排障报告。");
+  } catch (error) { toast(errorText(error), "error"); }
 }
 
 function metricCard(icon, label, value, detail) {
@@ -464,14 +899,41 @@ async function loadPlugins(force = false) {
   }
 }
 
+async function synchronizeSessions() {
+  const version = ++state.sessionVersion;
+  const payload = await api("/api/v1/sessions");
+  if (version !== state.sessionVersion) return false;
+  const sessions = (payload.sessions || []).filter((session) => typeof session.sessionId === "string" && typeof session.state?.cwd === "string");
+  const selected = sessions.find((session) => session.sessionId === state.sessionId) || sessions[0];
+  state.sessions = sessions.slice(-100).map((session) => ({ sessionId: session.sessionId, cwd: session.state.cwd }));
+  if (selected?.sessionId !== state.sessionId) resetSelectedJob();
+  if (selected) adoptSession(selected);
+  else {
+    state.sessionId = null;
+    elements.sessionSelect.replaceChildren();
+    elements.sessionLabel.textContent = "正在创建";
+    persistSessions();
+    const created = await ensureSession();
+    if (state.sessionId !== created) return false;
+  }
+  return true;
+}
+
 async function connect() {
+  const sessionVersion = state.sessionVersion;
   setConnection("", "正在连接");
   try {
     const capabilities = await api("/api/v1/capabilities");
     state.capabilities = capabilities.capabilities || [];
     if (elements.authDialog.open) elements.authDialog.close();
     elements.authError.textContent = "";
-    await Promise.all([ensureSession(), loadRuntime()]);
+    if (sessionVersion !== state.sessionVersion) return;
+    if (!await synchronizeSessions()) return;
+    const version = state.sessionVersion;
+    await Promise.all([loadRuntime(), loadJobs(), loadCheckpoints(), loadTasks()]);
+    if (version !== state.sessionVersion) return;
+    const latest = state.jobs.find((job) => job.sessionId === state.sessionId);
+    if (latest) await selectJob(latest.jobId);
     if (state.capabilities.includes("plugins")) await loadPlugins(true);
   } catch (error) {
     if (!(error instanceof ApiError && error.status === 401)) {
@@ -491,9 +953,39 @@ function bindEvents() {
   }));
   elements.runButton.addEventListener("click", () => void runCommand());
   elements.explainButton.addEventListener("click", () => void explainCommand());
-  elements.cancelButton.addEventListener("click", () => state.controller?.abort());
+  elements.cancelButton.addEventListener("click", () => {
+    if (!state.selectedJob) return;
+    elements.cancelButton.disabled = true;
+    void terminalRequest(state.selectedJob.jobId, "cancel").then(() => toast("已请求停止任务。")).catch((error) => toast(errorText(error), "error")).finally(() => { elements.cancelButton.disabled = false; });
+  });
   elements.clearButton.addEventListener("click", clearTerminal);
   elements.newSessionButton.addEventListener("click", () => void ensureSession(true).then(() => toast("已创建新会话")).catch((error) => toast(errorText(error), "error")));
+  elements.sessionSelect.addEventListener("change", () => void selectSession(elements.sessionSelect.value));
+  elements.saveCheckpointButton.addEventListener("click", () => void saveCheckpoint());
+  elements.forkSessionButton.addEventListener("click", () => void forkSession());
+  elements.refreshHistoryButton.addEventListener("click", () => void loadJobs().catch((error) => toast(errorText(error), "error")));
+  elements.allHistory.addEventListener("change", () => void loadJobs().catch((error) => toast(errorText(error), "error")));
+  elements.refreshTasksButton.addEventListener("click", () => void loadTasks());
+  elements.taskSelect.addEventListener("change", renderTaskParameters);
+  elements.taskRunForm.addEventListener("submit", (event) => void runTask(event));
+  elements.taskManifest.addEventListener("input", () => { manifestDirty = true; });
+  elements.taskExampleButton.addEventListener("click", () => { elements.taskManifest.value = JSON.stringify(exampleManifest, null, 2); manifestDirty = true; elements.taskManifestError.textContent = ""; });
+  elements.saveTasksButton.addEventListener("click", () => void saveTasks());
+  elements.diagnosticsButton.addEventListener("click", () => void exportDiagnostics());
+  elements.jobDiagnosticsButton.addEventListener("click", () => void exportDiagnostics(state.selectedJob?.jobId));
+  elements.outputModeButton.addEventListener("click", () => showTerminal(!state.terminalVisible));
+  elements.terminalInputForm.addEventListener("submit", (event) => {
+    event.preventDefault();
+    if (!activeJob(state.selectedJob)) return;
+    const text = elements.terminalInput.value;
+    void terminalRequest(state.selectedJob.jobId, "input", { dataBase64: textToBase64(`${text}\r`) }).then(() => { elements.terminalInput.value = ""; }).catch((error) => toast(errorText(error), "error"));
+  });
+  elements.terminalEofButton.addEventListener("click", () => {
+    if (activeJob(state.selectedJob)) void terminalRequest(state.selectedJob.jobId, "eof").catch((error) => toast(errorText(error), "error"));
+  });
+  elements.terminalInterruptButton.addEventListener("click", () => {
+    if (activeJob(state.selectedJob)) void terminalRequest(state.selectedJob.jobId, "input", { dataBase64: "Aw==" }).catch((error) => toast(errorText(error), "error"));
+  });
   elements.refreshRuntimeButton.addEventListener("click", () => void loadRuntime());
   elements.commandInput.addEventListener("keydown", (event) => {
     if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) { event.preventDefault(); void runCommand(); }
@@ -511,8 +1003,10 @@ function bindEvents() {
       return;
     }
     state.token = token;
-    if (token) sessionStorage.setItem("posixloom-token", token);
-    else sessionStorage.removeItem("posixloom-token");
+    try {
+      if (token) sessionStorage.setItem(storageKey(state.apiBaseUrl, "token"), token);
+      else sessionStorage.removeItem(storageKey(state.apiBaseUrl, "token"));
+    } catch { /* Keep credentials in memory when browser storage is disabled. */ }
     elements.authDialog.close();
     void connect();
   });
@@ -523,7 +1017,7 @@ function bindEvents() {
   });
   window.addEventListener("hashchange", () => {
     const view = location.hash.slice(1);
-    if (["console", "runtime", "plugins"].includes(view)) navigate(view);
+    if (["console", "tasks", "runtime", "plugins"].includes(view)) navigate(view);
   });
 }
 
@@ -531,10 +1025,14 @@ async function main() {
   bindEvents();
   const configuration = await fetch("/config.json", { cache: "no-store" }).then((response) => response.json());
   state.apiBaseUrl = configuration.apiBaseUrl.replace(/\/$/, "");
+  const saved = readSessionState(sessionStorage, state.apiBaseUrl);
+  state.sessions = saved.sessions;
+  state.sessionId = saved.selected;
+  try { state.token = sessionStorage.getItem(storageKey(state.apiBaseUrl, "token")) || ""; } catch { /* Memory-only authentication remains available. */ }
   elements.apiAddress.textContent = state.apiBaseUrl;
   elements.apiAddress.title = state.apiBaseUrl;
   const initialView = location.hash.slice(1);
-  navigate(["console", "runtime", "plugins"].includes(initialView) ? initialView : "console");
+  navigate(["console", "tasks", "runtime", "plugins"].includes(initialView) ? initialView : "console");
   await connect();
 }
 

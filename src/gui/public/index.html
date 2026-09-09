@@ -8,6 +8,7 @@
   <title>PosixLoom Console</title>
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="/app.css">
+  <link rel="stylesheet" href="/vendor/xterm/xterm.css">
 </head>
 <body>
   <div class="app-shell">
@@ -33,6 +34,10 @@
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m7 8 4 4-4 4M13 16h4"/></svg>
           <span>控制台</span>
         </button>
+        <button class="nav-item" type="button" data-view="tasks">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m4 6 2 2 3-3M12 7h8M4 13h5M12 13h8M4 19h5M12 19h8"/></svg>
+          <span>项目任务</span>
+        </button>
         <button class="nav-item" type="button" data-view="runtime">
           <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="4" width="16" height="16" rx="3"/><path d="M8 9h8M8 13h5M8 17h3"/></svg>
           <span>运行时</span>
@@ -56,17 +61,25 @@
           <div>
             <p class="eyebrow">WORKSPACE SHELL</p>
             <h1 id="consoleTitle">控制台</h1>
-            <p>在受控会话中执行命令，实时查看输出与执行路径。</p>
+            <p>运行命令、续接后台任务，保存会话与执行产物。</p>
           </div>
           <div class="session-control">
             <span class="session-icon" aria-hidden="true"></span>
-            <div><small>当前会话</small><strong id="sessionLabel">尚未创建</strong></div>
+            <div><label for="sessionSelect"><small>当前会话</small></label><select id="sessionSelect" aria-label="切换会话"><option value="">尚未创建</option></select><strong id="sessionLabel" hidden>尚未创建</strong></div>
             <button class="icon-button" id="newSessionButton" type="button" title="新建会话" aria-label="新建会话">
               <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
             </button>
           </div>
         </div>
 
+        <details class="panel session-tools">
+          <summary>会话快照 <span>保存、恢复与分叉</span></summary>
+          <div class="session-tool-content">
+            <div class="form-row"><label class="form-field">快照名称<input id="checkpointName" placeholder="例如：构建环境"></label><label class="form-field">保存的环境变量名（可选）<input id="checkpointEnvKeys" placeholder="例如：LANG, NODE_ENV" spellcheck="false"></label></div>
+            <div class="button-row"><button class="button secondary" id="saveCheckpointButton" type="button">保存快照</button><button class="button secondary" id="forkSessionButton" type="button">分叉当前会话</button><span class="subtle">默认仅保存工作目录；环境变量按名称选择。</span></div>
+            <div class="checkpoint-list" id="checkpointList"></div>
+          </div>
+        </details>
         <div class="console-grid">
           <section class="panel composer-panel">
             <div class="panel-header compact">
@@ -80,8 +93,9 @@
               <span class="prompt" aria-hidden="true">❯</span>
               <textarea id="commandInput" rows="5" spellcheck="false" aria-label="命令" placeholder="输入命令，例如 git status --short"></textarea>
             </div>
+            <details class="execution-options"><summary>执行选项</summary><div class="form-row"><label class="checkbox-field"><input id="interactiveMode" type="checkbox">交互终端（支持按键与全屏程序）</label><label class="form-field">归档产物路径（每行一个）<textarea id="artifactPaths" rows="2" placeholder="/workspace/reports/result.json" spellcheck="false"></textarea></label><label class="form-field compact-field">超时（毫秒）<input id="timeoutInput" type="number" min="1" placeholder="使用默认值"></label></div></details>
             <div class="composer-footer">
-              <span class="shortcut-hint"><kbd>Ctrl</kbd><span>+</span><kbd>Enter</kbd> 执行</span>
+              <span class="shortcut-hint"><kbd>Ctrl</kbd><span>+</span><kbd>Enter</kbd> 后台执行</span>
               <div class="button-row">
                 <button class="button secondary" id="explainButton" type="button">预览计划</button>
                 <button class="button danger" id="cancelButton" type="button" hidden>停止</button>
@@ -95,7 +109,7 @@
 
           <section class="panel terminal-panel">
             <div class="panel-header terminal-header">
-              <div class="terminal-title"><span class="terminal-lights" aria-hidden="true"><i></i><i></i><i></i></span><strong>输出</strong></div>
+              <div class="terminal-title"><span class="terminal-lights" aria-hidden="true"><i></i><i></i><i></i></span><strong>输出</strong><button class="text-button" id="outputModeButton" type="button" hidden>查看日志</button></div>
               <div class="terminal-meta">
                 <span class="route-chip" id="routeChip" hidden>—</span>
                 <span id="executionTime">就绪</span>
@@ -107,14 +121,30 @@
             <div class="terminal-scroll" id="terminalScroll">
               <pre class="terminal-output" id="terminalOutput" aria-live="polite"><span class="terminal-muted">PosixLoom 控制台已就绪。</span></pre>
             </div>
+            <div class="interactive-terminal" id="interactiveTerminal" aria-label="交互终端" hidden></div>
+            <form class="terminal-input-row" id="terminalInputForm" hidden><label class="sr-only" for="terminalInput">终端输入</label><input id="terminalInput" autocomplete="off" spellcheck="false" placeholder="向终端发送一行输入"><button class="button secondary" type="submit">发送</button><button class="text-button" id="terminalEofButton" type="button">发送 EOF</button><button class="text-button" id="terminalInterruptButton" type="button">Ctrl+C</button></form>
           </section>
         </div>
+        <section class="panel job-details" id="jobDetails" hidden>
+          <div class="panel-header"><div><p class="panel-kicker">RUN DETAILS</p><h2 id="jobTitle">执行详情</h2></div><div class="button-row"><span class="job-status" id="jobStatus"></span><button class="text-button" id="jobDiagnosticsButton" type="button">导出排障报告</button></div></div>
+          <p class="job-caption" id="jobCaption"></p><div class="step-list" id="jobSteps"></div><div class="artifact-list" id="jobArtifacts"></div>
+        </section>
+        <section class="panel history-panel">
+          <div class="panel-header"><div><p class="panel-kicker">EXECUTION HISTORY</p><h2>执行历史</h2></div><div class="button-row"><label class="checkbox-field"><input id="allHistory" type="checkbox">全部会话</label><button class="text-button" id="refreshHistoryButton" type="button">刷新</button></div></div>
+          <div class="job-list" id="jobList"><p class="list-empty">此会话还没有任务。</p></div>
+        </section>
+      </section>
+
+      <section class="view" id="view-tasks" aria-labelledby="tasksTitle">
+        <div class="page-heading"><div><p class="eyebrow">REUSABLE WORKFLOWS</p><h1 id="tasksTitle">项目任务</h1><p>将常用流程保存为参数化任务，逐步执行并归档结果。</p></div><button class="button secondary" id="refreshTasksButton" type="button">刷新任务</button></div>
+        <div class="task-layout"><section class="panel task-run-panel"><div class="panel-header"><h2>运行任务</h2></div><form id="taskRunForm" class="task-form"><label class="form-field">项目任务<select id="taskSelect"><option value="">选择任务</option></select></label><p class="subtle" id="taskDescription"></p><div id="taskParameters" class="parameter-fields"></div><div id="taskStepsPreview" class="step-list"></div><button class="button primary" id="runTaskButton" type="submit" disabled>运行任务</button></form></section>
+        <section class="panel task-manifest-panel"><div class="panel-header"><div><p class="panel-kicker">PROJECT MANIFEST</p><h2>编辑任务清单</h2></div><button class="text-button" id="taskExampleButton" type="button">载入示例</button></div><div class="task-form"><p class="subtle">保存到项目的任务清单。参数在 argv 中以独立参数传入。</p><label class="sr-only" for="taskManifest">任务清单 JSON</label><textarea id="taskManifest" rows="21" spellcheck="false" aria-describedby="taskManifestError"></textarea><p class="form-error" id="taskManifestError" role="alert"></p><div class="button-row"><button class="button primary" id="saveTasksButton" type="button">保存清单</button><span class="subtle" id="tasksLocation"></span></div></div></section></div>
       </section>
 
       <section class="view" id="view-runtime" aria-labelledby="runtimeTitle">
         <div class="page-heading">
           <div><p class="eyebrow">SYSTEM HEALTH</p><h1 id="runtimeTitle">运行时</h1><p>查看快照、执行后端、挂载点与诊断结果。</p></div>
-          <button class="button secondary" id="refreshRuntimeButton" type="button">刷新诊断</button>
+          <div class="button-row"><button class="button secondary" id="diagnosticsButton" type="button">导出排障报告</button><button class="button secondary" id="refreshRuntimeButton" type="button">刷新诊断</button></div>
         </div>
         <div class="metric-grid" id="runtimeMetrics">
           <article class="metric-card skeleton"></article><article class="metric-card skeleton"></article><article class="metric-card skeleton"></article><article class="metric-card skeleton"></article>
@@ -167,6 +197,8 @@
 
   <div class="toast" id="toast" role="status" aria-live="polite"></div>
   <noscript>PosixLoom GUI 需要 JavaScript 才能连接控制服务。</noscript>
+  <script src="/vendor/xterm/xterm.js"></script>
+  <script src="/vendor/xterm/addon-fit.js"></script>
   <script type="module" src="/app.js"></script>
 </body>
 </html>

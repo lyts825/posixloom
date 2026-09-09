@@ -32,6 +32,8 @@ CLI / Harness
 - 在执行前预览后端选择、参数翻译、路径决策与策略档案，不启动目标进程。
 - 以不可变 Runtime、组件锁文件、Ed25519 Feed 和事务切换实现可复现更新。
 - 提供可独立部署的浏览器 GUI 与带 Bearer 鉴权、CORS 白名单、NDJSON 流输出的远程 HTTP API。
+- 提供参数化项目任务、可断线续接的后台任务、按序号读取的持久输出和带哈希的产物归档。
+- 支持会话快照保存/恢复/分叉、GUI 多会话与执行历史、浏览器 ConPTY 交互终端和脱敏排障报告。
 - 提供声明式插件市场；插件安装只落盘经过校验的命令清单，不加载或执行第三方 JavaScript。
 - 以内置与自定义能力共用的 `RuntimePlugin` 协议组合命令流水线，支持依赖排序、优先级、事务激活和逆序清理。
 
@@ -152,6 +154,7 @@ npm run posixloom -- plugin run workspace-inspector git-status
 - [开发指南](docs/guides/development.md)：环境准备、常用命令、测试与故障排查。
 - [配置与诊断](docs/guides/configuration.md)：有效配置、运行时摘要与 trace 查询。
 - [GUI 与远程服务](docs/guides/gui-http.md)：分离部署、鉴权、CORS 与启动方式。
+- [任务工作台](docs/guides/task-workbench.md)：项目任务、后台执行、日志/产物、快照、浏览器终端与排障报告。
 - [插件市场](docs/guides/plugins.md)：清单模型、远程目录、安装和运行边界。
 - [一切皆插件架构](docs/guides/plugin-architecture.md)：微内核、扩展点、生命周期、示例与信任边界。
 - [发布与更新指南](docs/guides/release.md)：组件供应链、Runtime 组装、签名和验证。
@@ -162,7 +165,7 @@ npm run posixloom -- plugin run workspace-inspector git-status
 Windows Shell 需要已构建的 Native Host。同一 MSYS 安装的 Shell 会跨进程
 互斥执行以保护共享挂载，原生命令继续并发；详见[性能与资源边界](docs/guides/performance.md)。
 
-项目目前处于 `0.1.0` 开发阶段，目标平台为 Windows 10/11 x64。Session 仅在当前服务进程内保存，进程退出后不会恢复；配置中的历史字段 `session.persistAcrossRestart: true` 会被明确拒绝。HTTP 服务自身不终止 TLS，跨机器或公网使用时应置于 HTTPS 反向代理之后。市场插件是不会自动加载代码的声明式命令包；进程内 `RuntimePlugin` 只能由宿主显式注入，必须视为与宿主等权的可信代码。默认策略提供的是防误操作 Guardrail，不是针对恶意本地代码的 OS 级安全沙箱。发布前应执行完整门禁：
+项目目前处于 `0.1.0` 开发阶段，目标平台为 Windows 10/11 x64。活动 Session 在当前服务进程内保存；可显式保存 cwd 与选定环境变量的快照，在重启后恢复到新会话。历史字段 `session.persistAcrossRestart: true` 仍被拒绝。后台任务可在客户端断线后继续，服务关闭会取消任务；归档跨重启保留，意外退出遗留的任务标为 interrupted，不恢复进程或自动重跑。HTTP 服务自身不终止 TLS，跨机器或公网使用时应置于 HTTPS 反向代理之后。市场插件是不会自动加载代码的声明式命令包；进程内 `RuntimePlugin` 只能由宿主显式注入，必须视为与宿主等权的可信代码。默认策略提供的是防误操作 Guardrail，不是针对恶意本地代码的 OS 级安全沙箱。发布前应执行完整门禁：
 
 ```powershell
 npm run verify

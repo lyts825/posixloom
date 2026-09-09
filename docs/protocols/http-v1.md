@@ -47,7 +47,7 @@ Content-Type: application/json
 | `GET` | `/sessions/{id}` | 会话快照 |
 | `DELETE` | `/sessions/{id}` | 关闭会话 |
 
-会话不跨重启恢复，初始 cwd 必须是规范化、策略允许且真实存在的虚拟目录。
+活动会话不自动跨重启恢复；可通过 checkpoint 端点显式保存并恢复为新会话。初始 cwd 必须是规范化、策略允许且真实存在的虚拟目录。
 空闲会话按 `session.idleTimeoutMs` 过期，总量受 `session.maxSessions` 限制；达到
 上限时会回收最久未使用的非活动会话，所有会话都在活动时返回 `429`。
 执行中和排队中的会话（包括 isolated）不能关闭，返回 `409 SESSION_BUSY`。
@@ -74,7 +74,7 @@ Content-Type: application/json
 与 CLI/stdio 共用语义校验：text 与 argv JSON 各不超过 1 MiB UTF-8；argv 最多
 4096 项，每项不超过 32768 字节；envDelta JSON 另有 1 MiB 上限。环境变量名须匹配
 `[A-Za-z_][A-Za-z0-9_]*`，字符串不得含 NUL。timeoutMs 必须是 1..2147483647 的整数。
-HTTP 不支持 terminal，不能把它默默降级为普通管道。Schema 中的 x-maxUtf8Bytes
+本节的同步 execute/explain 端点不支持 terminal；交互执行通过新增 jobs 端点提供。Schema 中的 x-maxUtf8Bytes
 是服务端补充的字节限制，通用 JSON Schema 验证器还应按它检查 UTF-8 长度。
 
 默认一个 Runtime 最多同时执行 8 个请求，每客户端 4 个；队列总长 128、每客户端
@@ -132,6 +132,14 @@ Idempotency-Key: job-123-command-4
 错误及 NDJSON 事件。版本号为十进制字符串，输出为 Base64；NDJSON 响应 Schema
 描述每一行的事件而非整段文本。trace 和额外对象属性允许扩展，客户端应忽略未知字段。
 契约回归用实际 HTTP 响应覆盖成功、取消、截断、失败和只含完成事件的重放。
+
+## 任务工作台资源
+
+`/jobs` 提供客户端断线后继续运行的任务，输出归档可按序号续读；`/tasks` 管理项目
+参数清单，`/checkpoints` 与会话子资源提供显式保存、恢复和分叉。交互终端通过
+任务的 input/resize/eof 子资源控制。`/diagnostics` 导出白名单排障报告。
+完整请求、限制与恢复语义见[任务工作台](../guides/task-workbench.md)，所有端点也在
+`/openapi.json` 发布。它们使用与原有端点相同的 Bearer、Host、CORS 和请求大小检查。
 
 ## 可选扩展
 

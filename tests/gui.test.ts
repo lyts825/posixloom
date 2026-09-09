@@ -18,12 +18,16 @@ test("standalone GUI serves immutable assets and points at an external API", asy
   assert.deepEqual(configuration, { apiVersion: 1, apiBaseUrl, product: "PosixLoom" });
   const script = await fetch(`${gui.origin}/app.js`);
   assert.equal(script.headers.get("content-type"), "text/javascript; charset=utf-8");
-  assert.match(await script.text(), /application\/x-ndjson/);
+  assert.match(await script.text(), /\/api\/v1\/jobs/);
   const outputModule = await fetch(`${gui.origin}/console-output.js`);
   assert.equal(outputModule.status, 200);
   assert.equal(outputModule.headers.get("content-type"), "text/javascript; charset=utf-8");
   assert.match(await outputModule.text(), /export class TerminalBuffer/);
   assert.match(page, /id="latestOutputButton"/);
+  assert.match(page, /id="sessionSelect"/);
+  assert.match(page, /id="taskRunForm"/);
+  assert.match(page, /id="interactiveTerminal"/);
+  for (const route of ["/workbench.js", "/vendor/xterm/xterm.js", "/vendor/xterm/xterm.css", "/vendor/xterm/addon-fit.js"]) assert.equal((await fetch(`${gui.origin}${route}`)).status, 200, route);
   assert.equal((await fetch(`${gui.origin}/missing`)).status, 404);
   assert.equal((await fetch(`${gui.origin}/`, { method: "POST" })).status, 405);
 });

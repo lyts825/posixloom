@@ -333,6 +333,9 @@ export async function loadConfig(runRoot: string, options: { allowInvalidRuntime
     );
   }
   const merged = deepMerge(defaults, userConfig ?? {});
+  if (merged.jobs !== undefined && (!merged.jobs || typeof merged.jobs !== "object" || Array.isArray(merged.jobs))) {
+    throw new PosixLoomError("CONFIG_INVALID", "jobs must be an object", { name: "jobs" });
+  }
   for (const section of ["runtime", "mounts", "session", "process", "policy", "observability", "updates"] as const) {
     const value = merged[section];
     if (!value || typeof value !== "object" || Array.isArray(value)) {
@@ -369,6 +372,14 @@ export async function loadConfig(runRoot: string, options: { allowInvalidRuntime
       defaultStatePolicy: enumValue(merged.session?.defaultStatePolicy, ["isolated", "cwd-env"] as const, "cwd-env", "session.defaultStatePolicy"),
       maxSessions: positiveNumber(merged.session?.maxSessions, 1024, "session.maxSessions"),
       idleTimeoutMs: positiveNumber(merged.session?.idleTimeoutMs, 30 * 60 * 1000, "session.idleTimeoutMs"),
+    },
+    jobs: {
+      maxJobs: positiveNumber(merged.jobs?.maxJobs, 256, "jobs.maxJobs"),
+      maxActiveJobs: positiveNumber(merged.jobs?.maxActiveJobs, 32, "jobs.maxActiveJobs"),
+      maxLogBytes: positiveNumber(merged.jobs?.maxLogBytes, 64 * 1024 * 1024, "jobs.maxLogBytes"),
+      maxArtifactBytes: positiveNumber(merged.jobs?.maxArtifactBytes, 64 * 1024 * 1024, "jobs.maxArtifactBytes"),
+      maxTotalBytes: positiveNumber(merged.jobs?.maxTotalBytes, 512 * 1024 * 1024, "jobs.maxTotalBytes"),
+      retentionMs: positiveNumber(merged.jobs?.retentionMs, 7 * 24 * 60 * 60 * 1000, "jobs.retentionMs", { maximum: 2147483647 }),
     },
     // 进程默认约束：超时 30s、取消宽限 2s、输出 8 MiB、输出排空 5s、报告 1 MiB。
     process: {

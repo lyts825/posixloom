@@ -17,6 +17,14 @@
     "maxSessions": 1024,
     "idleTimeoutMs": 1800000
   },
+  "jobs": {
+    "maxJobs": 256,
+    "maxActiveJobs": 32,
+    "maxLogBytes": 67108864,
+    "maxArtifactBytes": 67108864,
+    "maxTotalBytes": 536870912,
+    "retentionMs": 604800000
+  },
   "process": {
     "defaultTimeoutMs": 30000,
     "cancelGraceMs": 2000,

@@ -55,6 +55,10 @@ export * from "./plugins/builtins.js";
 export * from "./core/control.js";
 export * from "./core/process.js";
 export * from "./core/service.js";
+export * from "./core/jobs.js";
+export * from "./core/tasks.js";
+export * from "./core/checkpoints.js";
+export * from "./core/diagnostics.js";
 // 可独立启动的远程 HTTP/JSON 适配器；不引用 GUI 或插件市场实现。
 export * from "./http/server.js";
 // 独立静态 GUI 服务；只接收 API URL，不引用控制服务或插件实现。

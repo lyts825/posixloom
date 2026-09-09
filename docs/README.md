@@ -6,6 +6,7 @@
 - [性能与资源边界](guides/performance.md)：可复现基线、执行配额、分阶段 trace 与快路径候选。
 - [优化实施与验收记录](guides/optimization-report.md)：本轮优化项、验证证据与外部发布门禁边界。
 - [GUI 与远程 HTTP](guides/gui-http.md)：独立组件、组合启动、鉴权、CORS 与远程部署。
+- [任务工作台](guides/task-workbench.md)：参数任务、后台续接、产物、会话快照、浏览器终端和排障报告。
 - [插件市场](guides/plugins.md)：声明式清单、目录发现、安装与显式运行。
 - [一切皆插件架构](guides/plugin-architecture.md)：运行时插件内核、扩展点、生命周期与安全边界。
 - [发布与更新指南](guides/release.md)：组件同步、Runtime 组装、签名和验证。

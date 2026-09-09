@@ -18,7 +18,7 @@
  */
 import { randomUUID } from "node:crypto";
 import { PosixLoomError } from "./errors.js";
-import { applyEnvDelta, initialSessionEnv, validateStatePatch } from "./env.js";
+import { applyEnvDelta, initialSessionEnv, normalizeEnv, validateStatePatch } from "./env.js";
 import type { SessionState, StatePatch, StatePolicy } from "./types.js";
 
 /**
@@ -97,7 +97,16 @@ export class SessionStateStore {
    *   宿主环境可移植子集（过滤 PATH 等后端控制键）
    * @returns 新会话的 sessionId
    */
-  create(cwd = "/workspace", exportedEnv = initialSessionEnv()): string {
+  create(cwd = "/workspace", exportedEnv?: Record<string, string>): string {
+    // Explicit restored/forked state obeys the same environment ownership rules
+    // as a state commit and starts at version zero.
+    if (exportedEnv !== undefined) {
+      for (const value of Object.values(exportedEnv)) {
+        if (typeof value !== "string" || value.includes("\0")) throw new PosixLoomError("STATE_PATCH_REJECTED", "Session environment requires NUL-free string values");
+      }
+      exportedEnv = normalizeEnv(exportedEnv);
+      validateStatePatch({ baseStateVersion: 0n, setEnv: exportedEnv, removeEnv: [] }, { version: 0n, cwd, exportedEnv: {} }, "cwd-env");
+    } else exportedEnv = initialSessionEnv();
     const now = this.now();
     this.pruneExpired(now);
     if (this.sessions.size >= this.maxSessions) {

@@ -22,6 +22,7 @@
  */
 import { existsSync } from "node:fs";
 import { parseExec, parseShell, terminalSize } from "./command-options.js";
+import { workbenchCommand } from "./workbench-commands.js";
 import { parseServeOptions, parseGuiOptions, urlHost, openBrowser, waitForNetworkServices, requiredOptionValue } from "./network-options.js";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -48,6 +49,7 @@ const appRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 
 /** 打印用法帮助到 stdout；不设置退出码，供 help 与未知命令两个分支共用。 */
 function printUsage(): void {
+  console.log("Task workbench:\n  posixloom task list|show|run <id> [--param name=value] [--json]\n  posixloom job list|show|events|cancel|delete [id] [--api-url url]\n  posixloom job submit --request job.json [--session id] [--api-url url]\n  posixloom checkpoint list|save|restore|fork|delete [id] [--env-key name] [--api-url url]\n  posixloom diagnostics [--job id] [--api-url url] [--output file]\n");
   console.log(`PosixLoom Runtime\n\nUsage:\n  posixloom exec [--dry-run] [--json] -- <program> [args...]\n  posixloom exec [--pty] [--cols n] [--rows n] [--cwd /path] [--isolated] [--timeout ms] -- <program> [args...]\n  posixloom shell [--dry-run] [--json] [--cwd /path] [--isolated] [--timeout ms] -c <script>\n  posixloom shell [--pty] [--cols n] [--rows n] [--cwd /path] [--isolated] [--timeout ms] -c <script>\n  posixloom shell [--cwd /path] [--isolated] [--timeout ms] --stdin\n  posixloom explain [--json] exec [options] -- <program> [args...]\n  posixloom explain [--json] shell [options] -c <script>\n  posixloom repl\n  posixloom serve --stdio\n  posixloom serve --http [--host host] [--port n] [--token token] [--cors-origin origin] [--marketplace url]\n  posixloom gui [--host host] [--port n] [--api-url url] [--api-host host] [--api-port n] [--token token] [--marketplace url] [--no-open]\n  posixloom plugin search [query] [--marketplace url] [--json]\n  posixloom plugin list|install <id>|uninstall <id>|run <id> <command> [--json]\n  posixloom config path|show|validate [--json]\n  posixloom runtime doctor|info [--json]\n  posixloom runtime update [--check] [--force] [--json]\n  posixloom runtime rollback [--json]\n  posixloom trace list|summary [--limit n] [--json]\n  posixloom version`);
 }
 
@@ -201,6 +203,10 @@ async function main(): Promise<void> {
     }
   }
   try {
+    if (["task", "job", "checkpoint", "diagnostics"].includes(args[0])) {
+      await workbenchCommand(runtime, args);
+      return;
+    }
     // runtime doctor：输出体检报告。--json 输出机器可读格式，否则逐项打印；
     // 存在异常项时以退出码 2 标记失败。
     if (args[0] === "runtime" && args[1] === "doctor") {
